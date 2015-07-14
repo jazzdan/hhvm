@@ -51,7 +51,7 @@ class IntlCalendar : public IntlError {
       c_IntlCalendar = Unit::lookupClass(s_IntlCalendar.get());
       assert(c_IntlCalendar);
     }
-    auto ret = ObjectData::newInstance(c_IntlCalendar);
+    Object ret{c_IntlCalendar};
     if (cal) {
       Native::data<IntlCalendar>(ret)->setCalendar(cal);
     }

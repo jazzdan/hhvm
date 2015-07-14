@@ -158,11 +158,14 @@ module Naming                               = struct
   let unset_cast                            = 2056 (* DONT MODIFY!!!! *)
   (* DEPRECATED let nullsafe_property_access = 2057 *)
   let illegal_TRAIT                         = 2058 (* DONT MODIFY!!!! *)
-  let shape_typehint                        = 2059 (* DONT MODIFY!!!! *)
+  (* DEPRECATED let shape_typehint          = 2059  *)
   let dynamic_new_in_strict_mode            = 2060 (* DONT MODIFY!!!! *)
   let invalid_type_access_root              = 2061 (* DONT MODIFY!!!! *)
   let duplicate_user_attribute              = 2062 (* DONT MODIFY!!!! *)
   let return_only_typehint                  = 2063 (* DONT MODIFY!!!! *)
+  let unexpected_type_arguments             = 2064 (* DONT MODIFY!!!! *)
+  let too_many_type_arguments               = 2065 (* DONT MODIFY!!!! *)
+  let classname_param                       = 2066 (* DONT MODIFY!!!! *)
 
   (* EXTEND HERE WITH NEW VALUES IF NEEDED *)
 end
@@ -197,6 +200,7 @@ module NastCheck                            = struct
   let typeconst_depends_on_external_tparam  = 3027 (* DONT MODIFY!!!! *)
   let typeconst_assigned_tparam             = 3028 (* DONT MODIFY!!!! *)
   let abstract_with_typeconst               = 3029 (* DONT MODIFY!!!! *)
+  let constructor_required                  = 3030 (* DONT MODIFY!!!! *)
 
   (* EXTEND HERE WITH NEW VALUES IF NEEDED *)
 end
@@ -217,7 +221,7 @@ module Typing                               = struct
   let cyclic_class_def                      = 4013 (* DONT MODIFY!!!! *)
   let cyclic_typedef                        = 4014 (* DONT MODIFY!!!! *)
   let discarded_awaitable                   = 4015 (* DONT MODIFY!!!! *)
-  let isset_empty_unset_in_strict           = 4016 (* DONT MODIFY!!!! *)
+  let isset_empty_in_strict                 = 4016 (* DONT MODIFY!!!! *)
   (* DEPRECATED dynamic_yield_private       = 4017 *)
   let enum_constant_type_bad                = 4018 (* DONT MODIFY!!!! *)
   let enum_switch_nonexhaustive             = 4019 (* DONT MODIFY!!!! *)
@@ -237,7 +241,7 @@ module Typing                               = struct
   let expecting_type_hint_suggest           = 4033 (* DONT MODIFY!!!! *)
   let extend_final                          = 4035 (* DONT MODIFY!!!! *)
   let field_kinds                           = 4036 (* DONT MODIFY!!!! *)
-  let field_missing                         = 4037 (* DONT MODIFY!!!! *)
+  (* DEPRECATED field_missing               = 4037 *)
   let format_string                         = 4038 (* DONT MODIFY!!!! *)
   let fun_arity_mismatch                    = 4039 (* DONT MODIFY!!!! *)
   let fun_too_few_args                      = 4040 (* DONT MODIFY!!!! *)
@@ -333,6 +337,13 @@ module Typing                               = struct
   let nullsafe_property_write_context       = 4132 (* DONT MODIFY!!!! *)
   let noreturn_usage                        = 4133 (* DONT MODIFY!!!! *)
   let this_lvalue                           = 4134 (* DONT MODIFY!!!! *)
+  let unset_nonidx_in_strict                = 4135 (* DONT MODIFY!!!! *)
+  let invalid_shape_field_name_empty        = 4136 (* DONT MODIFY!!!! *)
+  let invalid_shape_field_name_number       = 4137 (* DONT MODIFY!!!! *)
+  let shape_fields_unknown                  = 4138 (* DONT MODIFY!!!! *)
+  let invalid_shape_remove_key              = 4139 (* DONT MODIFY!!!! *)
+  let missing_optional_field                = 4140 (* DONT MODIFY!!!! *)
+  let shape_field_unset                     = 4141 (* DONT MODIFY!!!! *)
   (* EXTEND HERE WITH NEW VALUES IF NEEDED *)
 end
 
@@ -471,11 +482,6 @@ let primitive_invalid_alias pos used valid =
     an error. Use '"^valid^"' instead, to keep the codebase \
     consistent.")
 
-let shape_typehint pos =
-  add Naming.shape_typehint pos
-  "\"shape\" is an invalid type; you need to declare and use a specific shape \
-  type."
-
 let dynamic_new_in_strict_mode pos =
   add Naming.dynamic_new_in_strict_mode pos
   "Cannot use dynamic new in strict mode"
@@ -515,16 +521,20 @@ let this_hint_outside_class pos =
    add Naming.this_hint_outside_class pos
     "Cannot use \"this\" outside of a class"
 
-let this_must_be_return pos =
-  add Naming.this_must_be_return pos
-    "The type \"this\" can only be used as a return type, \
-     to instantiate a covariant type variable, \
-     or as a private non-static member variable"
+let this_type_forbidden pos =
+ add Naming.this_must_be_return pos
+    "The type \"this\" cannot be used as a constraint on a classes generic, \
+     or as the type of a static member variable"
 
 let lowercase_this pos type_ =
   add Naming.lowercase_this pos (
   "Invalid Hack type \""^type_^"\". Use \"this\" instead"
  )
+
+let classname_param pos =
+  add Naming.classname_param pos
+    ("Missing type parameter to classname; classname is entirely"
+     ^" meaningless without one")
 
 let tparam_with_tparam pos x =
   add Naming.tparam_with_tparam pos (
@@ -691,16 +701,26 @@ let no_construct_parent pos =
    ]
  )
 
-let not_initialized (p, c) =
-  if c = "parent::__construct" then no_construct_parent p else
-  add NastCheck.not_initialized p (
-  sl[
-  "The class member "; c;
-  " is not always properly initialized\n";
-  "Make sure you systematically set $this->"; c;
-  " when the method __construct is called\n";
-  "Alternatively, you can define the type as optional (?...)\n"
-])
+let constructor_required (pos, name) prop_names =
+  let name = Utils.strip_ns name in
+  let props_str = SSet.fold (fun x acc -> x^" "^acc) prop_names "" in
+  add NastCheck.constructor_required pos
+    ("Lacking __construct, class "^name^" does not initialize its private member(s): "^props_str)
+
+let not_initialized (pos, cname) prop_names =
+  let cname = Utils.strip_ns cname in
+  let props_str = SSet.fold (fun x acc -> x^" "^acc) prop_names "" in
+  let members, verb = if 1 == SSet.cardinal prop_names then "member", "is"
+    else "members", "are" in
+  let setters_str = SSet.fold (fun x acc -> "$this->"^x^" "^acc) prop_names "" in
+  add NastCheck.not_initialized pos (
+    sl[
+      "Class "; cname ; " does not initialize all of its members; ";
+      props_str; verb; " not always initialized.";
+      "\nMake sure you systematically set "; setters_str;
+      "when the method __construct is called.";
+      "\nAlternatively, you can define the "; members ;" as optional (?...)\n"
+    ])
 
 let call_before_init pos cv =
   add NastCheck.call_before_init pos (
@@ -860,7 +880,7 @@ let member_not_implemented member_name parent_pos pos defn_pos =
   let msg3 = defn_pos, "As defined here" in
   add_list Typing.member_not_implemented [msg1; msg2; msg3]
 
-let override parent_pos parent_name pos name (error: error) =
+let bad_decl_override parent_pos parent_name pos name (error: error) =
   let msg1 = pos, ("This object is of type "^(strip_ns name)) in
   let msg2 = parent_pos,
     ("It is incompatible with this object of type "^(strip_ns parent_name)^
@@ -928,6 +948,14 @@ let invalid_shape_field_name p =
   add Typing.invalid_shape_field_name p
     "Was expecting a constant string or class constant (for shape access)"
 
+let invalid_shape_field_name_empty p =
+  add Typing.invalid_shape_field_name_empty p
+    "A shape field name cannot be an empty string"
+
+let invalid_shape_field_name_number p =
+  add Typing.invalid_shape_field_name_number p
+    "A shape field name cannot start with numbers"
+
 let invalid_shape_field_type pos ty_pos ty trail =
   add_with_trail Typing.invalid_shape_field_type
     [pos, "A shape field name must be an int or string";
@@ -955,9 +983,40 @@ let shape_field_type_mismatch key_pos witness_pos key_ty witness_ty =
      witness_pos, "But expected " ^ witness_ty]
 
 let missing_field pos1 pos2 name =
-  add_list Typing.missing_field
-    [pos1, "The field '"^name^"' is missing";
-     pos2, "The field '"^name^"' is defined"]
+  add_list Typing.missing_field (
+    (pos1, "The field '"^name^"' is missing")::
+    [pos2, "The field '"^name^"' is defined"])
+
+let missing_optional_field pos1 pos2 name =
+  add_list Typing.missing_optional_field
+    (* We have the position of shape type that is marked as optional -
+     * explain why we can't omit it despite this.*)
+    (if pos2 <> Pos.none then (
+      (pos1, "The field '"^name^"' may be set to an unknown type. " ^
+              "Explicitly null out the field, or remove it " ^
+              "(with Shapes::removeKey(...))")::
+      [pos2, "The field '"^name^"' is defined as optional"])
+   else
+      [pos1, "The field '"^name^"' is missing"])
+
+let shape_fields_unknown pos1 pos2 =
+  add_list Typing.shape_fields_unknown
+    [pos1, "This is a shape type coming from a type annotation. Because of " ^
+            "structural subtyping it might have some other fields besides " ^
+            "those listed in its declaration.";
+     pos2, "It is incompatible with a shape created using \"shape\" "^
+           "constructor, which has all the fields known"]
+
+let shape_field_unset pos1 pos2 name =
+  add_list Typing.shape_field_unset (
+    [(pos1, "The field '"^name^"' was unset here");
+     (pos2, "The field '"^name^"' might be present in this shape because of " ^
+            "structural subtyping")]
+  )
+
+let invalid_shape_remove_key p =
+  add Typing.invalid_shape_remove_key p
+    "You can only unset fields of local variables"
 
 let explain_constraint p_inst pos name (error : error) =
   let inst_msg = "Some type constraint(s) here are violated" in
@@ -1057,6 +1116,14 @@ let return_only_typehint p kind =
   add Naming.return_only_typehint p
     ("The "^msg^" typehint can only be used to describe a function return type")
 
+let unexpected_type_arguments p =
+  add Naming.unexpected_type_arguments p
+    ("Type arguments are not expected for this type")
+
+let too_many_type_arguments p =
+  add Naming.too_many_type_arguments p
+    ("Too many type arguments for this type")
+
 let nullable_parameter pos =
   add Typing.nullable_parameter pos
     "Please add a ?, this argument can be null"
@@ -1123,11 +1190,14 @@ let self_outside_class pos =
   add Typing.self_outside_class pos
     "'self' is undefined outside of a class"
 
-let new_static_inconsistent new_pos (cpos, cname) =
+let new_inconsistent_construct new_pos (cpos, cname) kind =
   let name = Utils.strip_ns cname in
+  let preamble = match kind with
+    | `static -> "Can't use new static() for "^name
+    | `classname -> "Can't use new on classname<"^name^">"
+  in
   add_list Typing.new_static_inconsistent [
-    new_pos, "Can't use new static() for "^name^
-  "; __construct arguments are not \
+    new_pos, preamble^"; __construct arguments are not \
     guaranteed to be consistent in child classes";
     cpos, ("This declaration neither defines an abstract/final __construct"
            ^" nor uses <<__ConsistentConstruct>> attribute")]
@@ -1167,11 +1237,16 @@ let classname_abstract_call cname meth_name call_pos decl_pos =
     decl_pos, "Declaration is here"
   ]
 
-let isset_empty_unset_in_strict pos name =
+let isset_empty_in_strict pos name =
   let name = Utils.strip_ns name in
-  add Typing.isset_empty_unset_in_strict pos
+  add Typing.isset_empty_in_strict pos
     (name^" cannot be used in a completely type safe way and so is banned in "
      ^"strict mode")
+
+let unset_nonidx_in_strict pos msgs =
+  add_list Typing.unset_nonidx_in_strict
+    ([pos, "In strict mode, unset is banned except on array indexing"] @
+     msgs)
 
 let array_get_arity pos1 name pos2 =
   add_list Typing.array_get_arity [
@@ -1367,12 +1442,6 @@ let expected_tparam pos n =
   )
  )
 
-let field_missing k pos1 pos2 =
-  add_list Typing.field_missing [
-  pos2, "The field '"^k^"' is defined";
-  pos1, "The field '"^k^"' is missing";
-]
-
 let object_string pos1 pos2 =
   add_list Typing.object_string [
   pos1, "You cannot use this object as a string";
@@ -1398,6 +1467,14 @@ let this_final id pos2 (error: error) =
   let n = Utils.strip_ns (snd id) in
   let message1 = "Since "^n^" is not final" in
   let message2 = "this might not be a "^n in
+  let code, msgl = error in
+  add_list code (msgl @ [(fst id, message1); (pos2, message2)])
+
+let exact_class_final id pos2 (error: error) =
+  let n = Utils.strip_ns (snd id) in
+  let message1 = "This requires the late-bound type to be exactly "^n in
+  let message2 =
+    "Since " ^n^" is not final this might be an instance of a child class" in
   let code, msgl = error in
   add_list code (msgl @ [(fst id, message1); (pos2, message2)])
 
@@ -1483,6 +1560,7 @@ let declared_contravariant pos1 pos2 emsg =
  )
 
 let cyclic_typeconst pos sl =
+  let sl = List.map strip_ns sl in
   add Typing.cyclic_typeconst pos
     ("Cyclic type constant:\n  "^String.concat " -> " sl)
 
@@ -1653,7 +1731,7 @@ let to_string ((error_code, msgl) : Pos.absolute error_) : string =
 (* Try if errors. *)
 (*****************************************************************************)
 
-let try_ f1 f2 =
+let try_with_result f1 f2 =
   let error_list_copy = !error_list in
   let accumulate_errors_copy = !accumulate_errors in
   error_list := [];
@@ -1664,7 +1742,10 @@ let try_ f1 f2 =
   accumulate_errors := accumulate_errors_copy;
   match List.rev errors with
   | [] -> result
-  | l :: _ -> f2 l
+  | l :: _ -> f2 result l
+
+let try_ f1 f2 =
+  try_with_result f1 (fun _ l -> f2 l)
 
 let try_with_error f1 f2 =
   try_ f1 (fun err -> add_error err; f2())
@@ -1697,8 +1778,16 @@ let ignore_ f =
   snd (do_ f)
 
 let try_when f ~when_ ~do_ =
-  try_ f begin fun (error: error) ->
+  try_with_result f begin fun result (error: error) ->
     if when_()
     then do_ error
-    else add_error error
+    else add_error error;
+    result
   end
+
+(* Runs the first function that is expected to produce an error. If it doesn't
+ * then we run the second function we are given
+ *)
+let must_error f error_fun =
+  let had_no_errors = try_with_error (fun () -> f(); true) (fun _ -> false) in
+  if had_no_errors then error_fun();

@@ -483,7 +483,7 @@ and get_header env =
 
 and ignore_toplevel ~attr acc env terminate =
   match L.token env.file env.lb with
-  | x when terminate x ->
+  | x when terminate x || x = Teof ->
       L.back env.lb;
       acc
   | Tltlt ->
@@ -549,7 +549,7 @@ and ignore_toplevel ~attr acc env terminate =
 
 and toplevel acc env terminate =
   match L.token env.file env.lb with
-  | x when terminate x ->
+  | x when terminate x || x = Teof ->
       L.back env.lb;
       List.rev acc
   | Tsc ->
@@ -613,25 +613,11 @@ and toplevel_word ~attr env = function
       let fun_ = fun_ ~attr ~sync:FDeclSync env in
       [Fun fun_]
   | "newtype" ->
-      let id, tparaml, tconstraint, typedef = typedef env in
-      [Typedef {
-          t_id = id;
-          t_tparams = tparaml;
-          t_constraint = tconstraint;
-          t_kind = NewType typedef;
-          t_namespace = Namespace_env.empty;
-          t_mode = env.mode;
-      }]
+      let typedef_ = typedef ~attr ~is_abstract:true env in
+      [Typedef typedef_]
   | "type" ->
-      let id, tparaml, tconstraint, typedef = typedef env in
-      [Typedef {
-          t_id = id;
-          t_tparams = tparaml;
-          t_constraint = tconstraint;
-          t_kind = Alias typedef;
-          t_namespace = Namespace_env.empty;
-          t_mode = env.mode;
-      }]
+      let typedef_ = typedef ~attr ~is_abstract:false env in
+      [Typedef typedef_]
   | "namespace" ->
       let id, body = namespace env in
       [Namespace (id, body)]
@@ -761,7 +747,7 @@ and class_ ~attr ~final ~kind env =
   let cextends    =
     if kind = Ctrait then []
     else class_extends ~single:(kind <> Cinterface) env in
-  let cimplements = class_implements env in
+  let cimplements = class_implements kind env in
   let cbody       = class_body env in
   let result =
     { c_mode            = env.mode;
@@ -855,11 +841,16 @@ and class_extends ~single env =
       error_expect env "{";
       []
 
-and class_implements env =
+and class_implements kind env =
   match L.token env.file env.lb with
   | Tword ->
       (match Lexing.lexeme env.lb with
-      | "implements" -> class_extends_list env
+      | "implements" ->
+         let impl = class_extends_list env in
+         if kind = Cinterface then begin
+           error env "Expected: extends; Got implements"; []
+         end else
+           impl
       | "extends" -> L.back env.lb; []
       | s -> error env ("Expected: implements; Got: "^s); []
       )
@@ -990,6 +981,9 @@ and hint env =
       let e = hint env in
       Pos.btw start (fst e), Hoption e
   (* A<_> *)(* :XHPNAME *)
+  | Tword when Lexing.lexeme env.lb = "shape" ->
+      let pos = Pos.make env.file env.lb in
+      pos, Hshape (hint_shape_field_list env pos)
   | Tword | Tcolon when Lexing.lexeme env.lb <> "function" ->
       L.back env.lb;
       hint_apply_or_access env []
@@ -3480,6 +3474,11 @@ and shape_field_name env =
   match e with
   | String p -> SFlit p
   | Class_const (id, ps) -> SFclass_const (id, ps)
+  | String2 (_, _) ->
+     error env
+           ("Shape field names cannot be strings enclosed by double quotes."
+            ^" Use single quotes instead.");
+     SFlit (pos, "")
   | _ -> error_expect env "string literal or class constant";
     SFlit (pos, "")
 
@@ -3648,14 +3647,23 @@ and xhp_body pos name env =
 (* Typedefs *)
 (*****************************************************************************)
 
-and typedef env =
+and typedef ~attr ~is_abstract env =
   let id = identifier env in
   let tparams = class_params env in
   let tconstraint = typedef_constraint env in
   expect env Teq;
-  let td = typedef_body env in
+  let td = hint env in
   expect env Tsc;
-  id, tparams, tconstraint, td
+  let kind = if is_abstract then NewType td else Alias td in
+  {
+    t_id = id;
+    t_tparams = tparams;
+    t_constraint = tconstraint;
+    t_kind = kind;
+    t_user_attributes = attr;
+    t_namespace = Namespace_env.empty;
+    t_mode = env.mode;
+  }
 
 and typedef_constraint env =
   match L.token env.file env.lb with
@@ -3665,36 +3673,34 @@ and typedef_constraint env =
       L.back env.lb;
       None
 
-and typedef_body env =
+and hint_shape_field_list env shape_keyword_pos =
   match L.token env.file env.lb with
-  | Tword when Lexing.lexeme env.lb = "shape" ->
-      let pos = Pos.make env.file env.lb in
-      pos, Hshape (typedef_shape_field_list env)
-  | _ -> L.back env.lb; hint env
+  | Tlp -> hint_shape_field_list_remain env
+  | _ ->
+    L.back env.lb;
+    error_at env shape_keyword_pos "\"shape\" is an invalid type; you need to \
+    declare and use a specific shape type.";
+    []
 
-and typedef_shape_field_list env =
-  expect env Tlp;
-  typedef_shape_field_list_remain env
-
-and typedef_shape_field_list_remain env =
+and hint_shape_field_list_remain env =
   match L.token env.file env.lb with
   | Trp -> []
   | _ ->
       L.back env.lb;
       let error_state = !(env.errors) in
-      let fd = typedef_shape_field env in
+      let fd = hint_shape_field env in
       match L.token env.file env.lb with
       | Trp ->
           [fd]
       | Tcomma ->
           if !(env.errors) != error_state
           then [fd]
-          else fd :: typedef_shape_field_list_remain env
+          else fd :: hint_shape_field_list_remain env
       | _ ->
           error_expect env ")";
           [fd]
 
-and typedef_shape_field env =
+and hint_shape_field env =
   let name = shape_field_name env in
   expect env Tsarrow;
   let ty = hint env in
@@ -3722,7 +3728,7 @@ and namespace env =
     | _ -> L.back env.lb; Pos.make env.file env.lb, "" in
   match L.token env.file env.lb with
   | Tlcb ->
-      let body = tl [] env (fun x -> x = Trcb) in
+      let body = tl [] env (fun x -> x = Trcb || x = Teof) in
       expect env Trcb;
       id, body
   | Tsc when (snd id) = "" ->

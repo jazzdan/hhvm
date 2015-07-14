@@ -18,7 +18,7 @@
 
 #include "hphp/runtime/base/arch.h"
 #include "hphp/runtime/base/runtime-option.h"
-#include "hphp/runtime/ext/ext_generator.h"
+#include "hphp/runtime/ext/generator/ext_generator.h"
 #include "hphp/runtime/vm/bytecode.h"
 #include "hphp/runtime/vm/func.h"
 #include "hphp/runtime/vm/hhbc.h"
@@ -85,13 +85,22 @@ bool isCalleeInlinable(SrcKey callSK, const Func* callee) {
     return refuse("call is recursive");
   }
   if (callee->hasVariadicCaptureParam()) {
-    return refuse("callee has variadic capture");
+    if (callee->attrs() & AttrMayUseVV) {
+      return refuse("callee has variadic capture and MayUseVV");
+    }
+    // Refuse if the variadic parameter actually captures something.
+    auto pc = reinterpret_cast<const Op*>(callSK.pc());
+    auto const numArgs = getImm(pc, 0).u_IVA;
+    auto const numParams = callee->numParams();
+    if (numArgs >= numParams) {
+      return refuse("callee has variadic capture with non-empty value");
+    }
   }
   if (callee->numIterators() != 0) {
     return refuse("callee has iterators");
   }
-  if (callee->isMagic() || Func::isSpecial(callee->name())) {
-    return refuse("special or magic callee");
+  if (callee->isMagic()) {
+    return refuse("magic callee");
   }
   if (callee->isResumable()) {
     return refuse("callee is resumable");
@@ -99,7 +108,7 @@ bool isCalleeInlinable(SrcKey callSK, const Func* callee) {
   if (callee->maxStackCells() >= kStackCheckLeafPadding) {
     return refuse("function stack depth too deep");
   }
-  if (callee->isMethod() && callee->cls() == c_Generator::classof()) {
+  if (callee->isMethod() && callee->cls() == Generator::getClass()) {
     return refuse("generator member function");
   }
   return true;
@@ -127,7 +136,8 @@ bool checkNumArgs(SrcKey callSK, const Func* callee) {
   // as the gap can be filled in by DV funclets.
   for (auto i = numArgs; i < numParams; ++i) {
     auto const& param = callee->params()[i];
-    if (!param.hasDefaultValue()) {
+    if (!param.hasDefaultValue() &&
+        (i < numParams - 1 || !callee->hasVariadicCaptureParam())) {
       return refuse("callee called with too few arguments");
     }
   }
@@ -221,9 +231,29 @@ void InliningDecider::forbidInliningOf(const Func* callee) {
 
 bool InliningDecider::canInlineAt(SrcKey callSK, const Func* callee,
                                   const RegionDesc& region) const {
-  if (!RuntimeOption::RepoAuthoritative ||
-      !RuntimeOption::EvalHHIREnableGenTimeInlining) {
+  if (!callee || !RuntimeOption::EvalHHIREnableGenTimeInlining) {
     return false;
+  }
+
+  assert(!RuntimeOption::EvalJitEnableRenameFunction);
+  if (callee->cls()) {
+    if (!rds::isPersistentHandle(callee->cls()->classHandle())) {
+      // if the callee's class is not persistent, its still ok
+      // to use it if we're jitting into a method of a subclass
+      auto ctx = callSK.func()->cls();
+      if (!ctx || !ctx->classof(callee->cls())) {
+        return false;
+      }
+    }
+  } else {
+    if (!rds::isPersistentHandle(callee->funcHandle())) {
+      // if the callee isn't persistent, its still ok to
+      // use it if its defined at the top level in the same
+      // unit as the caller
+      if (callee->unit() != callSK.unit() || !callee->top()) {
+        return false;
+      }
+    }
   }
 
   // If inlining was disabled... don't inline.
@@ -268,8 +298,9 @@ bool isInlinableCPPBuiltin(const Func* f) {
 
   // The callee needs to be callable with FCallBuiltin, because NativeImpl
   // requires a frame.
-  if (f->attrs() & AttrNoFCallBuiltin ||
-      f->numParams() > Native::maxFCallBuiltinArgs() ||
+  if (!RuntimeOption::EvalEnableCallBuiltin ||
+      (f->attrs() & AttrNoFCallBuiltin) ||
+      (f->numParams() > Native::maxFCallBuiltinArgs()) ||
       !f->nativeFuncPtr()) {
     return false;
   }
@@ -293,12 +324,6 @@ bool isInlinableCPPBuiltin(const Func* f) {
 
   // For now, don't inline when we'd need to adjust ObjectData pointers.
   if (f->cls() && f->cls()->preClass()->builtinODOffset() != 0) {
-    return false;
-  }
-
-  // TODO: Static methods need to be passed their class, which we don't
-  // support yet. (t5360661)
-  if (f->isMethod() && (f->attrs() & AttrStatic)) {
     return false;
   }
 

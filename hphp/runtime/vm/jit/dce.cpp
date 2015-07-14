@@ -28,6 +28,7 @@
 #include "hphp/runtime/vm/jit/state-vector.h"
 #include "hphp/runtime/vm/jit/timer.h"
 #include "hphp/runtime/vm/jit/cfg.h"
+#include "hphp/runtime/vm/jit/check.h"
 
 namespace HPHP { namespace jit {
 namespace {
@@ -97,8 +98,17 @@ bool canDCE(IRInstruction* inst) {
   case LteDbl:
   case EqDbl:
   case NeqDbl:
+  case GtStr:
+  case GteStr:
+  case LtStr:
+  case LteStr:
+  case EqStr:
+  case NeqStr:
+  case SameStr:
+  case NSameStr:
   case InstanceOf:
   case InstanceOfIface:
+  case InstanceOfIfaceVtable:
   case ExtendsClass:
   case InstanceOfBitmask:
   case NInstanceOfBitmask:
@@ -125,8 +135,9 @@ bool canDCE(IRInstruction* inst) {
   case LdElem:
   case LdRef:
   case LdCtx:
-  case CastCtxThis:
   case LdCctx:
+  case LdClosure:
+  case CastCtxThis:
   case LdClsCtx:
   case LdClsCctx:
   case DefConst:
@@ -142,11 +153,13 @@ bool canDCE(IRInstruction* inst) {
   case LdClsMethodCacheFunc:
   case LdClsMethodCacheCls:
   case LdClsMethod:
+  case LdIfaceMethod:
   case LdPropAddr:
   case LdObjClass:
   case LdClsName:
   case LdFuncCachedSafe:
   case LdARFuncPtr:
+  case LdARNumParams:
   case LdFuncNumParams:
   case LdStrLen:
   case LdStaticLocCached:
@@ -158,7 +171,6 @@ bool canDCE(IRInstruction* inst) {
   case NewCol:
   case FreeActRec:
   case DefInlineFP:
-  case LdRetAddr:
   case Mov:
   case CountArray:
   case CountArrayFast:
@@ -169,6 +181,7 @@ bool canDCE(IRInstruction* inst) {
   case LdSwitchDblIndex:
   case LdSwitchStrIndex:
   case LdSSwitchDestFast:
+  case LdClosureCtx:
   case CreateSSWH:
   case LdContActRec:
   case LdContArValue:
@@ -186,6 +199,9 @@ bool canDCE(IRInstruction* inst) {
   case LdUnwinderValue:
   case LdColArray:
   case OrdStr:
+  case CheckRange:
+  case LdARInvName:
+  case PackMagicArgs:
     assertx(!inst->isControlFlow());
     return true;
 
@@ -205,7 +221,9 @@ bool canDCE(IRInstruction* inst) {
   case CheckStk:
   case AssertStk:
   case CastStk:
+  case CastMem:
   case CoerceStk:
+  case CoerceMem:
   case CoerceCellToBool:
   case CoerceCellToInt:
   case CoerceStrToInt:
@@ -242,7 +260,9 @@ bool canDCE(IRInstruction* inst) {
   case JmpNZero:
   case JmpSSwitchDest:
   case JmpSwitchDest:
+  case ProfileSwitchDest:
   case CheckSurpriseFlags:
+  case CheckSurpriseAndStack:
   case ReturnHook:
   case SuspendHookE:
   case SuspendHookR:
@@ -298,12 +318,13 @@ bool canDCE(IRInstruction* inst) {
   case RetCtrl:
   case AsyncRetCtrl:
   case StRetVal:
-  case ReleaseVVOrExit:
+  case ReleaseVVAndSkip:
   case GenericRetDecRefs:
   case StMem:
   case StElem:
   case StLoc:
   case StLocPseudoMain:
+  case StLocRange:
   case StRef:
   case EagerSyncVMRegs:
   case ReqBindJmp:
@@ -324,6 +345,7 @@ bool canDCE(IRInstruction* inst) {
   case VerifyRetFail:
   case RaiseUninitLoc:
   case RaiseUndefProp:
+  case RaiseMissingArg:
   case RaiseError:
   case RaiseWarning:
   case RaiseNotice:
@@ -352,10 +374,10 @@ bool canDCE(IRInstruction* inst) {
   case InterpOneCF:
   case OODeclExists:
   case StClosureCtx:
-  case StClosureFunc:
   case StClosureArg:
   case CreateCont:
   case CreateAFWH:
+  case CreateAFWHNoVV:
   case AFWHPrepareChild:
   case ContEnter:
   case ContPreNext:
@@ -444,9 +466,9 @@ bool canDCE(IRInstruction* inst) {
   case MapIsset:
   case IssetElem:
   case EmptyElem:
-  case CheckBounds:
   case ProfilePackedArray:
   case ProfileStructArray:
+  case ProfileObjClass:
   case CheckPackedArrayBounds:
   case LdStructArrayElem:
   case LdVectorSize:
@@ -461,8 +483,17 @@ bool canDCE(IRInstruction* inst) {
   case DbgTrashStk:
   case DbgTrashFrame:
   case DbgTrashMem:
-  case PredictLoc:
-  case PredictStk:
+  case EnterFrame:
+  case CheckStackOverflow:
+  case InitExtraArgs:
+  case InitCtx:
+  case CheckSurpriseFlagsEnter:
+  case CheckARMagicFlag:
+  case StARNumArgsAndFlags:
+  case StARInvName:
+  case ExitPlaceholder:
+  case ThrowOutOfBounds:
+  case MapIdx:
     return false;
   }
   not_reached();
@@ -763,11 +794,30 @@ void optimizeActRecs(const BlockList& blocks,
 
 } // anonymous namespace
 
-void eliminateDeadCode(IRUnit& unit) {
+void mandatoryDCE(IRUnit& unit) {
+  if (removeUnreachable(unit)) {
+    // Removing unreachable incoming edges can change types, so if we changed
+    // anything we have to reflow to maintain that IR invariant.
+    reflowTypes(unit);
+  }
+  assertx(checkEverything(unit));
+}
+
+void fullDCE(IRUnit& unit) {
+  if (!RuntimeOption::EvalHHIRDeadCodeElim) {
+    // This portion of DCE cannot be turned off, because it restores IR
+    // invariants, and callers of fullDCE are allowed to rely on it for that.
+    return mandatoryDCE(unit);
+  }
+
   Timer dceTimer(Timer::optimize_dce);
 
   // kill unreachable code and remove any traces that are now empty
   auto const blocks = prepareBlocks(unit);
+
+  // At this point, all IR invariants must hold, because we've restored the
+  // only one allowed to be violated before fullDCE in prepareBlocks.
+  assertx(checkEverything(unit));
 
   // mark the essential instructions and add them to the initial
   // work list; this will also mark reachable exit traces. All

@@ -41,7 +41,7 @@ StaticMemberExpression::StaticMemberExpression
   if (exp->is(KindOfSimpleVariable)) {
     SimpleVariablePtr s(dynamic_pointer_cast<SimpleVariable>(exp));
     m_exp = ExpressionPtr
-      (new ScalarExpression(getScope(), getLocation(),
+      (new ScalarExpression(getScope(), getRange(),
                             T_STRING, s->getName(), true));
 
   } else {
@@ -152,28 +152,6 @@ ExpressionPtr StaticMemberExpression::preOptimize(AnalysisResultConstPtr ar) {
   return ExpressionPtr();
 }
 
-/**
- * static_member can only be one of these two forms:
- *
- *   T::$member
- *   T::$$member or T::${$member}, where $member can be an arbitrary expression
- *   The former is represented by a ScalarExpression with value "member",
- *   the latter by the expression $member.
- */
-
-unsigned StaticMemberExpression::getCanonHash() const {
-  int64_t val = Expression::getCanonHash() +
-    hash_string_i_unsafe(m_className.c_str(), m_className.size());
-  return ~unsigned(val) ^ unsigned(val >> 32);
-}
-
-bool StaticMemberExpression::canonCompare(ExpressionPtr e) const {
-  if (!Expression::canonCompare(e)) return false;
-  StaticMemberExpressionPtr s =
-    static_pointer_cast<StaticMemberExpression>(e);
-  return m_className == s->m_className;
-}
-
 ///////////////////////////////////////////////////////////////////////////////
 
 void StaticMemberExpression::outputCodeModel(CodeGenerator &cg) {
@@ -188,7 +166,7 @@ void StaticMemberExpression::outputCodeModel(CodeGenerator &cg) {
     m_exp->outputCodeModel(cg);
   }
   cg.printPropertyHeader("sourceLocation");
-  cg.printLocation(this->getLocation());
+  cg.printLocation(this);
   cg.printObjectFooter();
 }
 

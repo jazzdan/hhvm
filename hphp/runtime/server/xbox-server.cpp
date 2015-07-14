@@ -348,7 +348,7 @@ public:
 
   CLASSNAME_IS("XboxTask");
   // overriding ResourceData
-  virtual const String& o_getClassNameHook() const { return classnameof(); }
+  const String& o_getClassNameHook() const override { return classnameof(); }
 
 private:
   XboxTransport *m_job;
@@ -366,7 +366,7 @@ Resource XboxServer::TaskStart(const String& msg, const String& reqInitDoc /* = 
          RuntimeOption::XboxServerThreadCount ||
          s_dispatcher->getQueuedJobs() <
          RuntimeOption::XboxServerMaxQueueLength)) {
-      auto task = makeSmartPtr<XboxTask>(msg, reqInitDoc);
+      auto task = req::make<XboxTask>(msg, reqInitDoc);
       XboxTransport *job = task->getJob();
       job->incRefCount(); // paired with worker's decRefCount()
 
@@ -392,8 +392,7 @@ Resource XboxServer::TaskStart(const String& msg, const String& reqInitDoc /* = 
      "reached maximum capacity" :
      "Cannot create new Xbox task because the Xbox is not enabled");
 
-  Object e = SystemLib::AllocExceptionObject(errMsg);
-  throw_exception(e);
+  throw_exception(SystemLib::AllocExceptionObject(errMsg));
   return Resource();
 }
 

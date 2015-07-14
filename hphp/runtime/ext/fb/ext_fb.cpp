@@ -44,10 +44,8 @@
 #include "hphp/runtime/base/string-util.h"
 #include "hphp/runtime/base/thread-info.h"
 #include "hphp/runtime/ext/std/ext_std_function.h"
-#include "hphp/runtime/ext/FBSerialize.h"
-#include "hphp/runtime/ext/mysql/ext_mysql.h"
-#include "hphp/runtime/ext/mysql/mysql_common.h"
-#include "hphp/runtime/ext/VariantController.h"
+#include "hphp/runtime/ext/fb/FBSerialize.h"
+#include "hphp/runtime/ext/fb/VariantController.h"
 #include "hphp/runtime/vm/unwind.h"
 
 #include "hphp/parser/parser.h"
@@ -250,10 +248,10 @@ enum FbCompactSerializeCode {
   FB_CS_MAX_CODE   = 16,
 };
 
-static_assert(FB_CS_MAX_CODE <= '0',
-  "FB_CS_MAX_CODE must be less than ASCII '0' or fb_compact_serialize() could "
-  "produce strings that when used as array keys could collide with integer "
-  "array keys. Assumption relevant to fb_compact_serialize_code() below");
+static_assert(FB_CS_MAX_CODE <= '$',
+  "FB_CS_MAX_CODE must be less than ASCII '$' or serialize_memoize_param() "
+  "could produce strings that when used as array keys could collide with  "
+  "keys it produces.");
 
 // 1 byte: 0<7 bits>
 const uint64_t kInt7Mask            = 0x7f;
@@ -406,9 +404,8 @@ static int fb_compact_serialize_variant(StringBuffer& sb,
                                         FBCompactSerializeBehavior behavior) {
   if (depth > 256) {
     if (behavior == FBCompactSerializeBehavior::MemoizeParam) {
-      Object e(SystemLib::AllocInvalidArgumentExceptionObject(
-        "Array depth exceeded"));
-      throw e;
+      SystemLib::throwInvalidArgumentExceptionObject(
+        "Array depth exceeded");
     }
 
     return 1;
@@ -469,10 +466,9 @@ static int fb_compact_serialize_variant(StringBuffer& sb,
           auto msg = folly::format(
             "Cannot serialize object of type {} because it does not implement "
             "HH\\IMemoizeParam",
-            obj->getClassName().data()).str();
+            obj->getClassName().asString()).str();
 
-          Object e(SystemLib::AllocInvalidArgumentExceptionObject(msg));
-          throw e;
+          SystemLib::throwInvalidArgumentExceptionObject(msg);
         }
 
         // Marker that shows that this was an obj so it doesn't collide with
@@ -499,8 +495,7 @@ static int fb_compact_serialize_variant(StringBuffer& sb,
   if (behavior == FBCompactSerializeBehavior::MemoizeParam) {
     auto msg = folly::format(
       "Cannot Serialize unexpected type {}", tname(var.getType()).c_str());
-    Object e(SystemLib::AllocInvalidArgumentExceptionObject(msg.str()));
-    throw e;
+    SystemLib::throwInvalidArgumentExceptionObject(msg.str());
   }
   return 1;
 }
@@ -667,9 +662,8 @@ int fb_compact_unserialize_from_buffer(
       }
 
       CHECK_ENOUGH(len, p, n);
-      StringData* sd = StringData::Make(buf + p, len, CopyString);
+      out = Variant::attach(StringData::Make(buf + p, len, CopyString));
       p += len;
-      out = sd;
       break;
     }
 
@@ -1066,14 +1060,14 @@ Array f_fb_call_user_func_safe(int _argc, const Variant& function,
 Variant f_fb_call_user_func_safe_return(int _argc, const Variant& function,
                                         const Variant& def,
                                         const Array& _argv /* = null_array */) {
-  if (HHVM_FN(is_callable)(function)) {
+  if (is_callable(function)) {
     return vm_call_user_func(function, _argv);
   }
   return def;
 }
 
 Array f_fb_call_user_func_array_safe(const Variant& function, const Array& params) {
-  if (HHVM_FN(is_callable)(function)) {
+  if (is_callable(function)) {
     return make_packed_array(true, vm_call_user_func(function, params));
   }
   return make_packed_array(false, uninit_null());

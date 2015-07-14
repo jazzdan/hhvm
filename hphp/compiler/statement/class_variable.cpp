@@ -25,6 +25,8 @@
 #include "hphp/compiler/expression/assignment_expression.h"
 #include "hphp/compiler/option.h"
 
+#include "hphp/runtime/base/comparisons.h"
+
 using namespace HPHP;
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -63,29 +65,38 @@ static bool isEquivRedecl(const std::string &name,
       symbol->isStatic()    != modif->isStatic())
     return false;
 
-  ExpressionPtr symDeclExp =
+  auto symDeclExp =
     dynamic_pointer_cast<Expression>(symbol->getDeclaration());
   if (!exp) return !symDeclExp;
-  return exp->equals(symDeclExp);
+  Variant v1, v2;
+  auto s1 = exp->getScalarValue(v1);
+  auto s2 = symDeclExp->getScalarValue(v2);
+  if (s1 != s2) return false;
+  if (s1) return same(v1, v2);
+  return exp->getText() == symDeclExp->getText();
 }
 
 void ClassVariable::onParseRecur(AnalysisResultConstPtr ar,
+                                 FileScopeRawPtr fs,
                                  ClassScopePtr scope) {
   ModifierExpressionPtr modifiers =
     scope->setModifiers(m_modifiers);
 
   if (m_modifiers->isAbstract()) {
-    m_modifiers->parseTimeFatal(Compiler::InvalidAttribute,
+    m_modifiers->parseTimeFatal(fs,
+                                Compiler::InvalidAttribute,
                                 "Properties cannot be declared abstract");
   }
 
   if (m_modifiers->isFinal()) {
-    m_modifiers->parseTimeFatal(Compiler::InvalidAttribute,
+    m_modifiers->parseTimeFatal(fs,
+                                Compiler::InvalidAttribute,
                                 "Properties cannot be declared final");
   }
 
   if (!m_modifiers->isStatic() && scope->isStaticUtil()) {
     m_modifiers->parseTimeFatal(
+      fs,
       Compiler::InvalidAttribute,
       "Class %s contains non-static property declaration and "
       "therefore cannot be declared 'abstract final'",
@@ -97,6 +108,7 @@ void ClassVariable::onParseRecur(AnalysisResultConstPtr ar,
        m_modifiers->isProtected() +
        m_modifiers->isPrivate()) > 1) {
     m_modifiers->parseTimeFatal(
+      fs,
       Compiler::InvalidAttribute,
       "%s: properties of %s",
       Strings::PICK_ACCESS_MODIFIER,
@@ -114,21 +126,23 @@ void ClassVariable::onParseRecur(AnalysisResultConstPtr ar,
       const std::string &name =
         dynamic_pointer_cast<SimpleVariable>(var)->getName();
       if (variables->isPresent(name)) {
-        exp->parseTimeFatal(Compiler::DeclaredVariableTwice,
+        exp->parseTimeFatal(fs,
+                            Compiler::DeclaredVariableTwice,
                             "Cannot redeclare %s::$%s",
                             scope->getOriginalName().c_str(), name.c_str());
       } else {
-        assignment->onParseRecur(ar, scope);
+        assignment->onParseRecur(ar, fs, scope);
       }
     } else {
       const std::string &name =
         dynamic_pointer_cast<SimpleVariable>(exp)->getName();
       if (variables->isPresent(name)) {
-        exp->parseTimeFatal(Compiler::DeclaredVariableTwice,
+        exp->parseTimeFatal(fs,
+                            Compiler::DeclaredVariableTwice,
                             "Cannot redeclare %s::$%s",
                             scope->getOriginalName().c_str(), name.c_str());
       } else {
-        variables->add(name, Type::Null, false, ar, exp, m_modifiers);
+        variables->add(name, false, ar, exp, m_modifiers);
       }
     }
   }
@@ -202,7 +216,7 @@ void ClassVariable::addTraitPropsToScope(AnalysisResultPtr ar,
       m_declaration->removeElement(i--);
     } else {
       if (prevScope != scope) { // Property is new or override, so add it
-        variables->add(name, Type::Variant, false, ar, exp, m_modifiers);
+        variables->add(name, false, ar, exp, m_modifiers);
         variables->getSymbol(name)->setValue(exp);
         variables->setClassInitVal(name, value);
         variables->markOverride(ar, name);
@@ -275,7 +289,7 @@ void ClassVariable::outputCodeModel(CodeGenerator &cg) {
   cg.printPropertyHeader("expressions");
   cg.printExpressionVector(m_declaration);
   cg.printPropertyHeader("sourceLocation");
-  cg.printLocation(this->getLocation());
+  cg.printLocation(this);
   cg.printObjectFooter();
 }
 

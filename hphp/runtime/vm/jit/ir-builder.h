@@ -82,12 +82,6 @@ struct IRBuilder {
   void setCurMarker(BCMarker);
 
   /*
-   * Called before we start lowering each bytecode instruction.  Right now all
-   * this does is cause an implicit exceptionStackBoundary.  See below.
-   */
-  void prepareForNextHHBC();
-
-  /*
    * Exception handling and IRBuilder.
    *
    * Normally HHBC opcodes that throw don't have any effects before they throw.
@@ -115,6 +109,7 @@ struct IRBuilder {
    * You can keep using them until we find time to remove them.
    */
   IRUnit& unit() const { return m_unit; }
+  FrameStateMgr& fs() { return m_state; }
   BCMarker curMarker() const { return m_curMarker; }
   const Func* curFunc() const { return m_state.func(); }
   FPInvOffset spOffset() { return m_state.spOffset(); }

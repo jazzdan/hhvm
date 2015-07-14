@@ -18,6 +18,7 @@
 
 #include "hphp/util/abi-cxx.h"
 #include "hphp/runtime/vm/runtime.h"
+#include "hphp/runtime/base/comparisons.h"
 #include "hphp/runtime/base/stats.h"
 #include "hphp/runtime/base/tv-conversions.h"
 #include "hphp/runtime/base/rds.h"
@@ -25,8 +26,8 @@
 #include "hphp/runtime/vm/jit/ir-opcode.h"
 #include "hphp/runtime/vm/jit/arg-group.h"
 #include "hphp/runtime/ext/asio/asio-blockable.h"
-#include "hphp/runtime/ext/asio/async-function-wait-handle.h"
-#include "hphp/runtime/ext/asio/static-wait-handle.h"
+#include "hphp/runtime/ext/asio/ext_async-function-wait-handle.h"
+#include "hphp/runtime/ext/asio/ext_static-wait-handle.h"
 #include "hphp/runtime/ext/array/ext_array.h"
 
 namespace HPHP { namespace jit { namespace NativeCalls {
@@ -55,6 +56,8 @@ auto constexpr SSA      = ArgType::SSA;
 auto constexpr TV       = ArgType::TV;
 
 using IFaceSupportFn = bool (*)(const StringData*);
+
+using StrCmpFn = bool (*)(const StringData*, const StringData*);
 
 }
 
@@ -144,21 +147,21 @@ static CallMap s_callMap {
                            {{TV, 0}}},
 
     {CoerceStrToInt,     coerceStrToIntHelper, DSSA, SSync,
-                           {{SSA, 0}, extra(&CoerceData::argNum),
-                            extra(&CoerceData::callee)}},
+                           {{SSA, 0}, extra(&FuncArgData::argNum),
+                            extra(&FuncArgData::func)}},
     {CoerceStrToDbl,     coerceStrToDblHelper, DSSA, SSync,
-                           {{SSA, 0}, extra(&CoerceData::argNum),
-                            extra(&CoerceData::callee)}},
+                           {{SSA, 0}, extra(&FuncArgData::argNum),
+                            extra(&FuncArgData::func)}},
 
     {CoerceCellToInt,    coerceCellToIntHelper, DSSA, SSync,
-                           {{TV, 0}, extra(&CoerceData::argNum),
-                            extra(&CoerceData::callee)}},
+                           {{TV, 0}, extra(&FuncArgData::argNum),
+                            extra(&FuncArgData::func)}},
     {CoerceCellToDbl,    coerceCellToDblHelper, DSSA, SSync,
-                           {{TV, 0}, extra(&CoerceData::argNum),
-                            extra(&CoerceData::callee)}},
+                           {{TV, 0}, extra(&FuncArgData::argNum),
+                            extra(&FuncArgData::func)}},
     {CoerceCellToBool,   coerceCellToBoolHelper, DSSA, SSync,
-                           {{TV, 0}, extra(&CoerceData::argNum),
-                            extra(&CoerceData::callee)}},
+                           {{TV, 0}, extra(&FuncArgData::argNum),
+                            extra(&FuncArgData::func)}},
 
     {ConcatStrStr,       concat_ss, DSSA, SSync, {{SSA, 0}, {SSA, 1}}},
     {ConcatStrInt,       concat_si, DSSA, SSync, {{SSA, 0}, {SSA, 1}}},
@@ -210,6 +213,7 @@ static CallMap s_callMap {
     {VerifyRetCallable,  VerifyRetTypeCallable, DNone, SSync, {{TV, 0}}},
     {VerifyRetFail,      VerifyRetTypeFail, DNone, SSync, {{TV, 0}}},
     {RaiseUninitLoc,     raiseUndefVariable, DNone, SSync, {{SSA, 0}}},
+    {RaiseError,         raise_error_sd, DNone, SSync, {{SSA, 0}}},
     {RaiseWarning,       raiseWarning, DNone, SSync, {{SSA, 0}}},
     {RaiseNotice,        raiseNotice, DNone, SSync, {{SSA, 0}}},
     {RaiseArrayIndexNotice,
@@ -218,7 +222,9 @@ static CallMap s_callMap {
                          raiseArrayKeyNotice, DNone, SSync, {{SSA, 0}}},
     {RaiseUndefProp,     raiseUndefProp, DNone, SSync,
                            {{SSA, 0}, {SSA, 1}}},
-    {RaiseError,         raise_error_sd, DNone, SSync, {{SSA, 0}}},
+    {RaiseMissingArg,    raiseMissingArgument, DNone, SSync,
+                           {extra(&FuncArgData::func),
+                            extra(&FuncArgData::argNum)}},
     {IncStatGrouped,     Stats::incStatGrouped, DNone, SNone,
                            {{SSA, 0}, {SSA, 1}, {SSA, 2}}},
     {ClosureStaticLocInit,
@@ -226,6 +232,26 @@ static CallMap s_callMap {
                            {{SSA, 0}, {SSA, 1}, {TV, 2}}},
     {GenericIdx,         genericIdx, DTV, SSync,
                           {{TV, 0}, {TV, 1}, {TV, 2}}},
+    {MapIdx,             mapIdx, DTV, SSync,
+                          {{SSA, 0}, {SSA, 1}, {TV, 2}}},
+
+    /* Type specialized comparison operators */
+    {GtStr,              static_cast<StrCmpFn>(more), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {GteStr,             static_cast<StrCmpFn>(moreEqual), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {LtStr,              static_cast<StrCmpFn>(less), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {LteStr,             static_cast<StrCmpFn>(lessEqual), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {EqStr,              static_cast<StrCmpFn>(equal), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {NeqStr,             static_cast<StrCmpFn>(nequal), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {SameStr,            static_cast<StrCmpFn>(same), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {NSameStr,           static_cast<StrCmpFn>(nsame), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
 
     /* Static prop helpers */
     {LdClsPropAddrOrNull,
@@ -248,11 +274,13 @@ static CallMap s_callMap {
                            {{SSA, 0}, {SSA, 1}, {SSA, 2}}},
 
     /* Generator support helpers */
-    {CreateCont,         &c_Generator::Create<false>, DSSA, SNone,
+    {CreateCont,         &Generator::Create<false>, DSSA, SNone,
                            {{SSA, 0}, {SSA, 1}, {SSA, 2}, {SSA, 3}}},
 
     /* Async function support helpers */
-    {CreateAFWH,         &c_AsyncFunctionWaitHandle::Create, DSSA, SNone,
+    {CreateAFWH,         &c_AsyncFunctionWaitHandle::Create<true>, DSSA, SNone,
+                           {{SSA, 0}, {SSA, 1}, {SSA, 2}, {SSA, 3}, {SSA, 4}}},
+    {CreateAFWHNoVV,     &c_AsyncFunctionWaitHandle::Create<false>, DSSA, SNone,
                            {{SSA, 0}, {SSA, 1}, {SSA, 2}, {SSA, 3}, {SSA, 4}}},
     {CreateSSWH,         &c_StaticWaitHandle::CreateSucceeded, DSSA, SNone,
                            {{TV, 0}}},
@@ -283,6 +311,7 @@ static CallMap s_callMap {
                  {{SSA, 0}, {TV, 1}, {TV, 2}, {SSA, 3}}},
     {SetWithRefNewElem, MInstrHelpers::setWithRefNewElem, DNone, SSync,
                  {{SSA, 0}, {TV, 1}, {SSA, 2}}},
+    {ThrowOutOfBounds, throwOOB, DNone, SSync, {{SSA, 0}}},
 
     /* instanceof checks */
     {InstanceOf, &Class::classof, DSSA, SNone, {{SSA, 0}, {SSA, 1}}},
@@ -316,9 +345,6 @@ static CallMap s_callMap {
 
     // count($mixed)
     {Count, &countHelper, DSSA, SSync, {{TV, 0}}},
-
-    // count($array)
-    {CountArray, &ArrayData::size, DSSA, SNone, {{SSA, 0}}},
 
     {GetMemoKey, getMemoKeyHelper, DTV, SSync, {{TV, 0}}},
 };

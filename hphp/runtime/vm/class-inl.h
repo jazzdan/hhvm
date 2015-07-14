@@ -56,16 +56,24 @@ inline const TypedValueAux& Class::PropInitVec::operator[](size_t i) const {
 ///////////////////////////////////////////////////////////////////////////////
 // Pre- and post-allocations.
 
-inline const LowClassPtr* Class::classVec() const {
+inline const LowPtr<Class>* Class::classVec() const {
   return m_classVec;
 }
 
-inline unsigned Class::classVecLen() const {
+inline Class::veclen_t Class::classVecLen() const {
   return m_classVecLen;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 // Ancestry.
+
+inline bool Class::classofNonIFace(const Class* cls) const {
+  assert(!(cls->attrs() & AttrInterface));
+  if (m_classVecLen >= cls->m_classVecLen) {
+    return (m_classVec[cls->m_classVecLen-1] == cls);
+  }
+  return false;
+}
 
 inline bool Class::classof(const Class* cls) const {
   // If `cls' is an interface, we can simply check to see if cls is in
@@ -80,10 +88,7 @@ inline bool Class::classof(const Class* cls) const {
     return this == cls ||
       m_interfaces.lookupDefault(cls->m_preClass->name(), nullptr) == cls;
   }
-  if (m_classVecLen >= cls->m_classVecLen) {
-    return (m_classVec[cls->m_classVecLen-1] == cls);
-  }
-  return false;
+  return classofNonIFace(cls);
 }
 
 inline bool Class::ifaceofDirect(const StringData* name) const {
@@ -172,12 +177,12 @@ inline size_t Class::numMethods() const {
 }
 
 inline Func* Class::getMethod(Slot idx) const {
-  auto funcVec = (LowFuncPtr*)this;
+  auto funcVec = (LowPtr<Func>*)this;
   return funcVec[-((int32_t)idx + 1)];
 }
 
 inline void Class::setMethod(Slot idx, Func* func) {
-  auto funcVec = (LowFuncPtr*)this;
+  auto funcVec = (LowPtr<Func>*)this;
   funcVec[-((int32_t)idx + 1)] = func;
 }
 
@@ -334,7 +339,7 @@ inline bool Class::callsCustomInstanceInit() const {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// Other methods.
+// JIT data.
 
 inline rds::Handle Class::classHandle() const {
   return m_cachedClass.handle();
@@ -353,9 +358,26 @@ inline void Class::setCached() {
   *m_cachedClass = this;
 }
 
+///////////////////////////////////////////////////////////////////////////////
+// Native data.
+
 inline const Native::NativeDataInfo* Class::getNativeDataInfo() const {
   return m_extra->m_nativeDataInfo;
 }
+
+///////////////////////////////////////////////////////////////////////////////
+// Closure subclasses.
+
+inline bool Class::isScopedClosure() const {
+  return m_scoped;
+}
+
+inline const Class::ScopedClonesMap& Class::scopedClones() const {
+  return m_extra->m_scopedClones;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Other methods.
 
 inline MaybeDataType Class::enumBaseTy() const {
   return m_enumBaseTy;

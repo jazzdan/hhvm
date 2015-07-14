@@ -28,7 +28,7 @@ if (LIBDL_INCLUDE_DIRS)
 endif()
 
 # boost checks
-find_package(Boost 1.51.0 COMPONENTS system program_options filesystem REQUIRED)
+find_package(Boost 1.51.0 COMPONENTS system program_options filesystem context REQUIRED)
 include_directories(${Boost_INCLUDE_DIRS})
 link_directories(${Boost_LIBRARY_DIRS})
 add_definitions("-DHAVE_BOOST1_49")
@@ -399,17 +399,6 @@ if (LINUX OR APPLE)
   FIND_LIBRARY (RESOLV_LIB resolv)
 endif()
 
-FIND_LIBRARY (BFD_LIB libbfd.a)
-FIND_LIBRARY (LIBIBERTY_LIB iberty)
-
-if (NOT BFD_LIB)
-  message(FATAL_ERROR "You need to install binutils")
-endif()
-
-if (NOT LIBIBERTY_LIB)
-  message(FATAL_ERROR "You need to install libiberty (usually bundled with binutils)")
-endif()
-
 if (FREEBSD)
   FIND_LIBRARY (EXECINFO_LIB execinfo)
   if (NOT EXECINFO_LIB)
@@ -496,9 +485,6 @@ macro(hphp_link target)
     target_link_libraries(${target} ${LIBINTL_LIBRARIES})
     target_link_libraries(${target} ${KERBEROS_LIB})
   endif()
-
-  target_link_libraries(${target} ${BFD_LIB})
-  target_link_libraries(${target} ${LIBIBERTY_LIB})
 
   if (${LIBPTHREAD_LIBRARIES})
     target_link_libraries(${target} ${LIBPTHREAD_LIBRARIES})

@@ -109,6 +109,7 @@ private:
   void emit(ldimmq& i);
   void emit(ldimml& i);
   void emit(ldimmb& i);
+  void emit(ldimmqs& i) { not_implemented(); }
   void emit(load& i);
   void emit(store& i);
   void emit(syncpoint& i);
@@ -127,6 +128,7 @@ private:
   void emit(cmpli& i) { a->Cmp(W(i.s1), i.s0.l()); }
   void emit(cmpq& i) { a->Cmp(X(i.s1), X(i.s0)); }
   void emit(cmpqi& i) { a->Cmp(X(i.s1), i.s0.l()); }
+  void emit(cmpqims& i) { not_implemented(); }
   void emit(decq& i) { a->Sub(X(i.d), X(i.s), 1LL, vixl::SetFlags); }
   void emit(incq& i) { a->Add(X(i.d), X(i.s), 1LL, vixl::SetFlags); }
   void emit(jcc& i);
@@ -388,7 +390,7 @@ void Vgen::emit(fallback& i) {
 
 void Vgen::emit(hcsync& i) {
   assertx(points[i.call]);
-  mcg->recordSyncPoint(points[i.call], i.fix.pcOffset, i.fix.spOffset);
+  mcg->recordSyncPoint(points[i.call], i.fix);
 }
 
 void Vgen::emit(hcnocatch& i) {
@@ -475,8 +477,7 @@ void Vgen::emit(store& i) {
 void Vgen::emit(syncpoint& i) {
   FTRACE(5, "IR recordSyncPoint: {} {} {}\n", a->frontier(),
          i.fix.pcOffset, i.fix.spOffset);
-  mcg->recordSyncPoint(a->frontier(), i.fix.pcOffset,
-                       i.fix.spOffset);
+  mcg->recordSyncPoint(a->frontier(), i.fix);
 }
 
 void Vgen::emit(jmp i) {
@@ -674,7 +675,8 @@ void finishARM(Vunit& unit, Vasm::AreaList& areas,
                const Abi& abi, AsmInfo* asmInfo) {
   optimizeExits(unit);
   lower(unit);
-  if (!unit.constants.empty()) {
+  simplify(unit);
+  if (!unit.constToReg.empty()) {
     foldImms<arm::ImmFolder>(unit);
   }
   lowerForARM(unit);

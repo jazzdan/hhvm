@@ -22,6 +22,7 @@
 
 #include "hphp/runtime/base/types.h"
 #include "hphp/runtime/vm/jit/abi-x64.h"
+#include "hphp/runtime/vm/jit/code-gen-cf.h"
 #include "hphp/runtime/vm/jit/code-gen-helpers.h"
 #include "hphp/runtime/vm/jit/cpp-call.h"
 #include "hphp/runtime/vm/jit/ir-opcode.h"
@@ -69,6 +70,35 @@ void emitTransCounterInc(Vout&);
  */
 Vreg emitDecRef(Vout& v, Vreg base);
 
+/*
+ * Assuming rData is the data pointer for a refcounted (but possibly static)
+ * value, emit a static check and DecRef, executing the code emitted by
+ * `destroy' if the count would go to zero.
+ */
+template<class Destroy>
+void emitDecRefWork(Vout& v, Vout& vcold, Vreg rData,
+                    Destroy destroy, bool unlikelyDestroy) {
+  auto const sf = v.makeReg();
+  v << cmplim{1, rData[FAST_REFCOUNT_OFFSET], sf};
+  ifThenElse(
+    v, vcold, CC_E, sf,
+    destroy,
+    [&] (Vout& v) {
+      /*
+       * If it's not static, actually reduce the reference count.  This does
+       * another branch using the same status flags from the cmplim above.
+       */
+      ifThen(
+        v, CC_NL, sf,
+        [&] (Vout& v) {
+          emitDecRef(v, rData);
+        }
+      );
+    },
+    unlikelyDestroy
+  );
+}
+
 void emitIncRef(Asm& as, PhysReg base);
 void emitIncRef(Vout& v, Vreg base);
 void emitIncRefCheckNonStatic(Asm& as, PhysReg base, DataType dtype);
@@ -94,17 +124,8 @@ void emitImmStoreq(Asm& as, Immed64 imm, MemoryRef ref);
 
 void emitRB(Vout& v, Trace::RingBufferType t, const char* msg);
 
-/*
- * Test the current thread's surprise flags for a nonzero value. Should be used
- * before a jnz to surprise handling code.
- */
-void emitTestSurpriseFlags(Asm& as, PhysReg rds);
-Vreg emitTestSurpriseFlags(Vout& v, Vreg rds);
-
-void emitCheckSurpriseFlagsEnter(Vout& main, Vout& cold, Vreg rds,
+void emitCheckSurpriseFlagsEnter(Vout& main, Vout& cold, Vreg fp, Vreg rds,
                                  Fixup fixup, Vlabel catchBlock);
-void emitCheckSurpriseFlagsEnter(CodeBlock& mainCode, CodeBlock& coldCode,
-                                 PhysReg rds, Fixup fixup);
 
 #ifdef USE_GCC_FAST_TLS
 
@@ -191,6 +212,8 @@ void emitCmpClass(Vout& v, Vreg sf, const Class* c, Vptr mem);
 void emitCmpClass(Vout& v, Vreg sf, Vreg reg, Vptr mem);
 void emitCmpClass(Vout& v, Vreg sf, Vreg reg1, Vreg reg2);
 
+void emitCmpVecLen(Vout& v, Vreg sf, Vptr mem, Immed val);
+
 void copyTV(Vout& v, Vloc src, Vloc dst, Type destType);
 void pack2(Vout& v, Vreg s0, Vreg s1, Vreg d0);
 
@@ -241,6 +264,10 @@ inline Vptr lookupDestructor(Vout& v, Vreg typeReg) {
   auto shiftedType = v.makeReg();
   v << shrli{kShiftDataTypeToDestrIndex, typeReg, shiftedType, v.makeReg()};
   return Vptr{Vreg{}, shiftedType, 8, safe_cast<int>(table)};
+}
+
+inline ptrdiff_t genOffset(bool isAsync) {
+  return isAsync ? AsyncGenerator::objectOff() : Generator::objectOff();
 }
 
 //////////////////////////////////////////////////////////////////////

@@ -25,7 +25,6 @@
 
 #include "hphp/runtime/vm/jit/state-vector.h"
 #include "hphp/runtime/vm/jit/type-source.h"
-#include "hphp/runtime/vm/jit/local-effects.h"
 #include "hphp/runtime/vm/jit/cfg.h"
 
 namespace HPHP {
@@ -145,6 +144,12 @@ struct SlotState {
    * it around in typeSrcs for guard relaxation.
    */
   TypeSourceSet typeSrcs;
+
+  /*
+   * Whether or not the local or stack element may have changed since
+   * the entry of the unit.  This is only used for post-conditions.
+   */
+  bool maybeChanged{false};
 };
 
 using LocalState = SlotState<false>;
@@ -240,7 +245,7 @@ struct FrameState {
  *
  *   - current function and bytecode offset
  */
-struct FrameStateMgr final : private LocalStateHook {
+struct FrameStateMgr final {
   explicit FrameStateMgr(BCMarker);
 
   FrameStateMgr(const FrameStateMgr&) = delete;
@@ -344,14 +349,18 @@ struct FrameStateMgr final : private LocalStateHook {
   void syncEvalStack();
 
   Type localType(uint32_t id) const;
+  bool localMaybeChanged(uint32_t id) const;
   Type predictedLocalType(uint32_t id) const;
   SSATmp* localValue(uint32_t id) const;
   TypeSourceSet localTypeSources(uint32_t id) const;
+  void refineLocalPredictedType(uint32_t id, Type type);
 
   Type stackType(IRSPOffset) const;
+  bool stackMaybeChanged(IRSPOffset) const;
   Type predictedStackType(IRSPOffset) const;
   SSATmp* stackValue(IRSPOffset) const;
   TypeSourceSet stackTypeSources(IRSPOffset) const;
+  void refineStackPredictedType(IRSPOffset, Type);
 
   /*
    * Call a function with const access to the LocalState& for each local we're
@@ -424,20 +433,18 @@ private:
     return const_cast<FrameStateMgr*>(this)->cur();
   }
 
-private: // LocalStateHook overrides
-  void setLocalValue(uint32_t id, SSATmp* value) override;
-  void refineLocalValues(SSATmp* oldVal, SSATmp* newVal) override;
-  void dropLocalRefsInnerTypes() override;
-  void killLocalsForCall(bool) override;
-  void refineLocalType(uint32_t id, Type type, TypeSource typeSrc) override;
-  void setLocalPredictedType(uint32_t id, Type type) override;
-  void refineLocalPredictedType(uint32_t id, Type type);
-  void refineStackPredictedType(IRSPOffset, Type);
-  void setLocalType(uint32_t id, Type type) override;
-  void setBoxedLocalPrediction(uint32_t id, Type type) override;
-  void updateLocalRefPredictions(SSATmp*, SSATmp*) override;
-  void setLocalTypeSource(uint32_t id, TypeSource typeSrc) override;
-  void clearLocals() override;
+private: // local tracking helpers
+  void setLocalValue(uint32_t id, SSATmp* value);
+  void refineLocalValues(SSATmp* oldVal, SSATmp* newVal);
+  void dropLocalRefsInnerTypes();
+  void killLocalsForCall(bool);
+  void refineLocalType(uint32_t id, Type type, TypeSource typeSrc);
+  void setLocalPredictedType(uint32_t id, Type type);
+  void setLocalType(uint32_t id, Type type);
+  void setBoxedLocalPrediction(uint32_t id, Type type);
+  void updateLocalRefPredictions(SSATmp*, SSATmp*);
+  void setLocalTypeSource(uint32_t id, TypeSource typeSrc);
+  void clearLocals();
 
 private: // stack tracking helpers
   void setStackValue(IRSPOffset, SSATmp*);

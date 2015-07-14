@@ -22,7 +22,7 @@
 #include "hphp/runtime/ext/extension.h"
 #include "hphp/runtime/base/zend-string.h"
 #include "hphp/runtime/base/zend-printf.h"
-#include "hphp/runtime/base/bstring.h"
+#include "hphp/util/bstring.h"
 #include <langinfo.h>
 
 namespace HPHP {
@@ -115,10 +115,6 @@ Variant HHVM_FUNCTION(substr_replace,
                       const Variant& replacement,
                       const Variant& start,
                       const Variant& length = 0x7FFFFFFF);
-Variant HHVM_FUNCTION(substr,
-                      const String& str,
-                      int start,
-                      int length = 0x7FFFFFFF);
 String HHVM_FUNCTION(str_pad,
                      const String& input,
                      int pad_length,

@@ -7,8 +7,6 @@
  * of patent rights can be found in the PATENTS file in the same directory.
  *
  *)
-open Utils
-open Typing_defs
 
 val with_expr_hook:
   (Nast.expr -> Typing_defs.locl Typing_defs.ty -> unit) -> (unit -> 'a) -> 'a
@@ -17,15 +15,15 @@ val debug_print_last_pos:
   'a -> unit
 
 val fun_decl:
-  TypecheckerOptions.t -> Nast.fun_ -> unit
+  Naming.env -> Nast.fun_ -> unit
 
 val gconst_decl:
   TypecheckerOptions.t -> Nast.gconst -> unit
 
 val fun_def:
-  Typing_env.env -> 'a -> Nast.fun_ -> unit
+  Typing_env.env -> Naming.env -> 'a -> Nast.fun_ -> unit
 val class_def:
-  Typing_env.env -> 'a -> Nast.class_ -> unit
+  Typing_env.env -> Naming.env -> 'a -> Nast.class_ -> unit
 val typedef_def:
   Typing_env.env -> Nast.typedef -> unit
 
@@ -46,12 +44,6 @@ val make_params:
 val type_param:
   Typing_env.env -> Nast.tparam ->
   Typing_env.env * Typing_defs.tparam
-
-val get_implements:
-  with_checks:bool ->
-  Typing_env.env ->
-  decl ty ->
-  Typing_env.env * (decl ty SMap.t * decl ty SMap.t)
 
 val get_self_from_c:
   Typing_env.env -> Nast.class_ ->

@@ -77,7 +77,6 @@ template<class F> void scanHeader(const Header* h, F& mark) {
     case HeaderKind::ResumableFrame:
     case HeaderKind::NativeData:
     case HeaderKind::Hole:
-    case HeaderKind::Debug:
       always_assert(false && "unexpected header in worklist");
       break;
   }
@@ -199,7 +198,7 @@ template<class F> void scanRoots(F& mark) {
 }
 
 template <typename T, typename F>
-void scan(const SmartPtr<T>& ptr, F& mark) {
+void scan(const req::ptr<T>& ptr, F& mark) {
   ptr->scan(mark);
 }
 

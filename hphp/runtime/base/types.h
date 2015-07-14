@@ -66,8 +66,6 @@ class Func;
 class VariableSerializer;
 class VariableUnserializer;
 
-using LowClassPtr  = LowPtr<Class>;
-using LowFuncPtr   = LowPtr<Func>;
 using LowStringPtr = LowPtr<const StringData>;
 
 ///////////////////////////////////////////////////////////////////////////////

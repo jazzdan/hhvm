@@ -24,52 +24,24 @@ module Dep = Typing_deps.Dep
  * very well isolated.
 *)
 
-(* Module used to represent serialized classes *)
-module Class = struct
-  type t = Typing_defs.class_type
-  let prefix = Prefix.make()
-end
-
-(* a function type *)
-module Fun = struct
-  type t = decl Typing_defs.fun_type
-  let prefix = Prefix.make()
-end
-
-module Typedef = struct
-
-  type visibility =
-    | Public
-    | Private
-
-  type tdef =
-    visibility * Typing_defs.tparam list * decl ty option * decl ty * Pos.t
-
-  type tdef_or_error =
-    | Error
-    | Ok of tdef
-
-  type t = tdef_or_error
-  let prefix = Prefix.make()
-end
-
-module GConst = struct
-  type t = decl ty
-  let prefix = Prefix.make()
-end
-
-module Funs = SharedMem.WithCache (String) (Fun)
-module Classes = SharedMem.WithCache (String) (Class)
-module Typedefs = SharedMem.WithCache (String) (Typedef)
-module GConsts = SharedMem.WithCache (String) (GConst)
+module Funs = Typing_heap.Funs
+module Classes = Typing_heap.Classes
+module Typedefs = Typing_heap.Typedefs
+module GConsts = Typing_heap.GConsts
 
 type fake_members = {
   last_call : Pos.t option;
   invalid   : SSet.t;
   valid     : SSet.t;
 }
-
-type local = locl ty list * locl ty
+(* Along with a type, each local variable has a expression id associated with
+ * it. This is used when generating expression dependent types for the 'this'
+ * type. The idea is that if two local variables have the same expression_id
+ * then they refer to the same late bound type, and thus have compatible
+ * 'this' types.
+ *)
+type expression_id = Ident.t
+type local = locl ty list * locl ty * expression_id
 type local_env = fake_members * local IMap.t
 
 type env = {
@@ -89,15 +61,14 @@ type env = {
 and genv = {
   tcopt   : TypecheckerOptions.t;
   mode    : FileInfo.mode;
-  return  : locl ty         ;
-  parent  : decl ty         ;
-  self_id : string     ;
-  self    : locl ty         ;
-  static  : bool       ;
-  is_constructor : bool;
+  return  : locl ty;
+  parent  : decl ty;
+  self_id : string;
+  self    : locl ty;
+  static  : bool;
   fun_kind : Ast.fun_kind;
   anons   : anon IMap.t;
-  droot   : Typing_deps.Dep.variant option  ;
+  droot   : Typing_deps.Dep.variant option;
   file    : Relative_path.t;
 }
 
@@ -152,16 +123,16 @@ let get_type_unsafe env x =
       env, (Reason.none, Tany)
   | Some ty -> env, ty
 
-let expand_type: type a. _ -> a ty -> _ * a ty =
-  fun env x ->
+let expand_type env x =
   match x with
   | _, Tvar x -> get_type env x
   | x -> env, x
 
 let expand_type_recorded env set ty =
   match ty with
-  | _, Tvar x -> begin
-    let env, ty = if ISet.mem x set then env, ty else expand_type env ty in
+  | r, Tvar x -> begin
+    let env, ty =
+      if ISet.mem x set then env, (r, Tany) else expand_type env ty in
     let set = ISet.add x set in
     env, set, ty
   end
@@ -212,14 +183,11 @@ let rec debug stack env (r, ty) =
       debug stack env y; o ">"
   | Tarray _ -> assert false
   | Tmixed -> o "mixed"
-  | Tabstract (x, argl, _)
-  | Tclass (x, argl) ->
-      Printf.printf "App %s" (snd x);
+  | Tabstract (AKnewtype (x, argl), _)
+  | Tclass ((_, x), argl) ->
+      Printf.printf "App %s" x;
       o "<"; List.iter (fun x -> debug stack env x; o ", ") argl;
       o ">"
-  | Taccess (root_ty, ids) ->
-      debug stack env root_ty;
-      o (List.fold_left (fun acc (_, sid) -> acc ^ "::" ^ sid) "" ids)
   | Tany -> o "X"
   | Tanon _ -> o "anonymous"
   | Tfun ft ->
@@ -235,32 +203,48 @@ let rec debug stack env (r, ty) =
       | Tbool -> o "Tbool"
       | Tfloat -> o "Tfloat"
       | Tstring -> o "Tstring"
+      | Tclassname s -> o "Tclassname<"; o s; o ">"
       | Tnum -> o "Tnum"
       | Tresource -> o "Tresource"
       | Tarraykey -> o "Tarraykey"
       | Tnoreturn -> o "Tnoreturn"
       )
-  | Tgeneric (s, x) ->
+  | Tabstract (AKgeneric(s, super), cstr_opt) ->
       o "generic ";
       o s;
-      (match x with
-      | None -> ()
-      | Some (Ast.Constraint_as, x) -> o " as <"; debug stack env x; o ">"
-      | Some (Ast.Constraint_super, x) ->
-          o " super <"; debug stack env x; o ">")
+      (match cstr_opt, super with
+      | None, None -> ()
+      | Some x, _ -> o " as <"; debug stack env x; o ">"
+      | _, Some x -> o " super <"; debug stack env x; o ">"
+      )
+  | Tabstract (ak, cstr) ->
+     o "[";  o (AbstractKind.to_string ak); o "]";
+     Option.iter cstr ~f:(debug stack env)
   | Tvar x ->
       let env, x = get_var env x in
       if ISet.mem x stack
-      then o (Ident.debug x)
+      then o (Ident.debug ~normalize:get_printable_tvar_id x)
       else
         let stack = ISet.add x stack in
         let _, y = get_var env x in
         o "["; o (string_of_int (get_printable_tvar_id y)); o "]";
         (match get_type env x with
-        | _, (_, Tany) -> o (Ident.debug x)
+        | _, (_, Tany) -> o (Ident.debug ~normalize:get_printable_tvar_id x)
         | _, ty -> debug stack env ty)
   | Tobject -> o "object"
-  | Tshape fdm -> o "shape(";
+  | Tshape (fields_known, fdm) ->
+      o "shape<";
+      begin match fields_known with
+        | FieldsFullyKnown -> o "FieldsFullyKnown";
+        | FieldsPartiallyKnown unset_fields -> begin
+            o "FieldsPartiallyKnown(unset fields:";
+              ShapeMap.iter begin fun k _ ->
+                o (get_shape_field_name k); o " "
+              end unset_fields;
+            o ")"
+          end
+      end;
+      o ">(";
       ShapeMap.iter begin fun k v ->
         o (get_shape_field_name k); o " => "; debug stack env v
       end fdm;
@@ -298,7 +282,6 @@ let empty tcopt file = {
     self_id = "";
     self    = Reason.none, Tany;
     static  = false;
-    is_constructor = false;
     parent  = Reason.none, Tany;
     fun_kind = Ast.FSync;
     anons   = IMap.empty;
@@ -311,7 +294,7 @@ let add_class x y =
   Classes.add x y
 
 let add_typedef x y =
-  Typedefs.add x (Typedef.Ok y)
+  Typedefs.add x (Typing_heap.Typedef.Ok y)
 
 let is_typedef x =
   match Typedefs.get x with
@@ -334,7 +317,7 @@ let get_enum_constraint x =
       | Some e -> e.te_constraint
 
 let add_typedef_error x =
-  Typedefs.add x Typedef.Error
+  Typedefs.add x Typing_heap.Typedef.Error
 
 (* Adds a new function (global) *)
 let add_fun x ft =
@@ -449,10 +432,10 @@ let with_return env f =
   let env = f env in
   set_return env ret
 
-let is_constructor env = env.genv.is_constructor
 let is_static env = env.genv.static
 let get_self env = env.genv.self
 let get_self_id env = env.genv.self_id
+let is_outside_class env = (env.genv.self_id = "")
 let get_parent env = env.genv.parent
 
 let get_fn_kind env = env.genv.fun_kind
@@ -514,11 +497,6 @@ let set_mode env mode =
 let set_root env root =
   let genv = env.genv in
   let genv = { genv with droot = Some root } in
-  { env with genv = genv }
-
-let set_is_constructor env =
-  let genv = env.genv in
-  let genv = { genv with is_constructor = true } in
   { env with genv = genv }
 
 let get_mode env = env.genv.mode
@@ -674,24 +652,25 @@ let rec unbind seen env ty =
 
 let unbind = unbind []
 
-(* We maintain 2 states for a local, all the types that the
- * local ever had (cf integrate in typing.ml), and the type
- * that the local currently has.
+(* We maintain 3 states for a local, all the types that the
+ * local ever had (cf integrate in typing.ml), the type
+ * that the local currently has, and an expression_id generated from
+ * the last assignment to this local.
  *)
 let set_local env x new_type =
   let fake_members, locals = env.lenv in
   let env, new_type = unbind env new_type in
-  let all_types =
+  let all_types, expr_id =
     match IMap.get x locals with
-    | None -> []
-    | Some (x, _) -> x
+    | None -> [], Ident.tmp()
+    | Some (x, _, y) -> x, y
   in
   let all_types =
     if List.exists (fun x -> x = new_type) all_types
     then all_types
     else new_type :: all_types
   in
-  let local = all_types, new_type in
+  let local = all_types, new_type, expr_id in
   let locals = IMap.add x local locals in
   let env = { env with lenv = fake_members, locals } in
   env
@@ -700,7 +679,21 @@ let get_local env x =
   let lcl = IMap.get x (snd env.lenv) in
   match lcl with
   | None -> env, (Reason.Rnone, Tany)
-  | Some (_, x) -> env, x
+  | Some (_, x, _) -> env, x
+
+let set_local_expr_id env x new_eid =
+  let fake_members, locals = env.lenv in
+  match IMap.get x locals with
+  | Some (all_types, type_, eid) when eid <> new_eid ->
+      let local = all_types, type_, new_eid in
+      let locals = IMap.add x local locals in
+      let env = { env with lenv = fake_members, locals } in
+      env
+  | _ -> env
+
+let get_local_expr_id env x =
+  let lcl = IMap.get x (snd env.lenv) in
+  Option.map lcl ~f:(fun (_, _, x) -> x)
 
 (*****************************************************************************)
 (* This function is called when we are about to type-check a block that will
@@ -734,7 +727,7 @@ let get_local env x =
 
 let freeze_local_env env =
   let (members, locals) = env.lenv in
-  let locals = IMap.map (fun (_, type_) -> [type_], type_) locals in
+  let locals = IMap.map (fun (_, type_, eid) -> [type_], type_, eid) locals in
   let lenv = members, locals in
   { env with lenv = lenv }
 

@@ -51,9 +51,6 @@ typedef hphp_hash_map<BlockScopeRawPtr, int,
 typedef hphp_hash_set<BlockScopeRawPtr,
                       smart_pointer_hash<BlockScopeRawPtr>
                       > BlockScopeRawPtrHashSet;
-typedef tbb::concurrent_hash_map<BlockScopeRawPtr, int,
-                                 smart_pointer_hash<BlockScopeRawPtr> >
-        ConcurrentBlockScopeRawPtrIntHashMap;
 
 typedef std::vector<BlockScopeRawPtr> BlockScopeRawPtrVec;
 typedef std::list<BlockScopeRawPtr>   BlockScopeRawPtrQueue;
@@ -63,8 +60,6 @@ typedef std::pair< BlockScopeRawPtr, int* >
         BlockScopeRawPtrFlagsPtrPair;
 typedef std::vector< std::pair< BlockScopeRawPtr, int* > >
         BlockScopeRawPtrFlagsPtrVec;
-
-typedef SimpleMutex InferTypesMutex;
 
 /**
  * Base class of ClassScope and FunctionScope.
@@ -81,49 +76,13 @@ public:
 
   enum UseKinds {
     /* Callers */
-    UseKindCallerInline   = 0x1,
     UseKindCallerParam    = 0x1 << 1,
     UseKindCallerReturn   = 0x1 << 2,
-    UseKindCaller         = (UseKindCallerInline |
-                             UseKindCallerParam  |
+    UseKindCaller         = (UseKindCallerParam  |
                              UseKindCallerReturn),
 
     /* Static references */
     UseKindStaticRef      = 0x1 << 3,
-
-    /* 16 bits of Non static references */
-    UseKindNonStaticRef0  = 0x1 << 4,
-    UseKindNonStaticRef1  = 0x1 << 5,
-    UseKindNonStaticRef2  = 0x1 << 6,
-    UseKindNonStaticRef3  = 0x1 << 7,
-    UseKindNonStaticRef4  = 0x1 << 8,
-    UseKindNonStaticRef5  = 0x1 << 9,
-    UseKindNonStaticRef6  = 0x1 << 10,
-    UseKindNonStaticRef7  = 0x1 << 11,
-    UseKindNonStaticRef8  = 0x1 << 12,
-    UseKindNonStaticRef9  = 0x1 << 13,
-    UseKindNonStaticRef10 = 0x1 << 14,
-    UseKindNonStaticRef11 = 0x1 << 15,
-    UseKindNonStaticRef12 = 0x1 << 16,
-    UseKindNonStaticRef13 = 0x1 << 17,
-    UseKindNonStaticRef14 = 0x1 << 18,
-    UseKindNonStaticRef15 = 0x1 << 19,
-    UseKindNonStaticRef   = (UseKindNonStaticRef0  |
-                             UseKindNonStaticRef1  |
-                             UseKindNonStaticRef2  |
-                             UseKindNonStaticRef3  |
-                             UseKindNonStaticRef4  |
-                             UseKindNonStaticRef5  |
-                             UseKindNonStaticRef6  |
-                             UseKindNonStaticRef7  |
-                             UseKindNonStaticRef8  |
-                             UseKindNonStaticRef9  |
-                             UseKindNonStaticRef10 |
-                             UseKindNonStaticRef11 |
-                             UseKindNonStaticRef12 |
-                             UseKindNonStaticRef13 |
-                             UseKindNonStaticRef14 |
-                             UseKindNonStaticRef15),
 
     /* Constants */
     UseKindConstRef       = 0x1 << 20,
@@ -135,19 +94,6 @@ public:
     UseKindAny            = (unsigned)-1
   };
 
-  /* Assert the size and bit-consecutiveness of UseKindNonStaticRef */
-  static_assert(BitCount<UseKindNonStaticRef>::value == 16,
-                "UseKindNonStaticRef should have 16 bits set");
-  static_assert(BitPhase<UseKindNonStaticRef>::value <= 2,
-                "UseKindNonStaticRef set bits should be consecutive");
-
-  static int GetNonStaticRefUseKind(unsigned int hash) {
-    int res = ((int)UseKindNonStaticRef0) << (hash % 16);
-    assert(res >= ((int)UseKindNonStaticRef0) &&
-           res <= ((int)UseKindNonStaticRef15));
-    return res;
-  }
-
   enum Marks {
     MarkWaitingInQueue,
     MarkProcessingDeps,
@@ -158,23 +104,13 @@ public:
     MarkProcessed
   };
 
-  class ScopeCompare {
-  public:
-    bool operator()(const BlockScopeRawPtr &p1,
-                    const BlockScopeRawPtr &p2) const {
-      return cmp(p1,p2) < 0;
-    }
-    int cmp(const BlockScopeRawPtr &p1, const BlockScopeRawPtr &p2) const;
-  };
-  typedef std::set<BlockScopeRawPtr, ScopeCompare> BlockScopeSet;
-  friend class ScopeCompare;
-
+  BlockScope(const BlockScope&) = delete;
+  BlockScope& operator=(const BlockScope&) = delete;
   BlockScope(const std::string &name, const std::string &docComment,
              StatementPtr stmt, KindOf kind);
   virtual ~BlockScope() {}
   bool is(KindOf kind) const { return kind == m_kind;}
-  const std::string &getName() const { return m_name;}
-  void setName(const std::string name) { m_name = name;}
+  const std::string &getScopeName() const { return m_scopeName;}
   virtual bool isBuiltin() const { return false; }
   StatementPtr getStmt() const { return m_stmt;}
   VariableTableConstPtr getVariables() const { return m_variables;}
@@ -252,23 +188,7 @@ public:
 
   void clearUpdated() { m_updated = 0; }
   void addUpdates(int f);
-  void announceUpdates(int f);
   int getUpdated() const { return m_updated; }
-
-  void setInTypeInference(bool inTypeInference) {
-    m_inTypeInference = inTypeInference;
-  }
-  bool inTypeInference() const { return m_inTypeInference; }
-
-  void setInVisitScopes(bool inVisitScopes) {
-    m_inVisitScopes = inVisitScopes;
-  }
-  bool inVisitScopes() const { return m_inVisitScopes; }
-
-  void setNeedsReschedule(bool needsReschedule) {
-    m_needsReschedule = needsReschedule;
-  }
-  bool needsReschedule() const { return m_needsReschedule; }
 
   void setRescheduleFlags(int rescheduleFlags) {
     m_rescheduleFlags = rescheduleFlags;
@@ -279,7 +199,6 @@ public:
   int getEffectsTag() const { return m_effectsTag; }
 
   Mutex &getMutex() { return m_mutex; }
-  InferTypesMutex &getInferTypesMutex() { return m_inferTypesMutex; }
 
   void setNumDepsToWaitFor(int n) {
     assert(n >= 0);
@@ -296,35 +215,13 @@ public:
     return --m_numDepsToWaitFor;
   }
 
-  inline void assertNumDepsSanity() const {
-#ifdef HPHP_DETAILED_TYPE_INF_ASSERT
-    int waiting = 0;
-    const BlockScopeRawPtrFlagsPtrVec &deps = getDeps();
-    for (BlockScopeRawPtrFlagsPtrVec::const_iterator it = deps.begin(),
-         end = deps.end(); it != end; ++it) {
-      const BlockScopeRawPtrFlagsPtrPair &p(*it);
-      int m = p.first->getMark();
-      if (m == MarkWaiting ||
-          m == MarkReady   ||
-          m == MarkProcessing) {
-        waiting++;
-      } else {
-        assert(m == MarkProcessed);
-      }
-    }
-    // >= b/c of cycles
-    assert(waiting >= getNumDepsToWaitFor());
-#endif /* HPHP_DETAILED_TYPE_INF_ASSERT */
-  }
-
   void setForceRerun(bool v) { m_forceRerun = v; }
   bool forceRerun() const { return m_forceRerun; }
 
   int selfUser() const { return m_selfUser; }
 
 protected:
-  std::string m_originalName;
-  std::string m_name;
+  std::string m_scopeName;
   int m_attributeClassInfo;
   std::string m_docComment;
   StatementPtr m_stmt;
@@ -335,7 +232,6 @@ protected:
 
   int m_loopNestedLevel;
   ModifierExpressionPtr m_modifiers;
-  StatementListPtr m_includes;
   int m_pass;
   int m_updated;
   int m_runId;
@@ -347,13 +243,8 @@ private:
   int m_effectsTag;
   int m_numDepsToWaitFor;
   Mutex m_mutex;
-  InferTypesMutex m_inferTypesMutex;
   bool m_forceRerun;      /* do we need to be re-run (allows deps to run during
                            * re-schedule) */
-  bool m_inTypeInference; /* are we in AnalysisResult::inferTypes() */
-  bool m_inVisitScopes;   /* are we in visitScope() */
-  bool m_needsReschedule; /* do we need to be re-scheduled (does not allow deps
-                           * to run during re-schedule)  */
   int  m_rescheduleFlags; /* who do we need to run after a re-schedule */
   int  m_selfUser;
 public:

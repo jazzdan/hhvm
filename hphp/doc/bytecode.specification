@@ -1111,11 +1111,10 @@ AddNewElemV    [C V]  ->  [C:Arr]
 
   If $2 is not an array, this instruction throws a fatal error.
 
-NewCol <coll type> <num elems>    []  ->  [C:Obj]
+NewCol <coll type>    []  ->  [C:Obj]
 
-  New collection. Creates a new collection of type %1 with an initial capacity
-  sufficient to hold the number of elements specified by %2, and pushes the
-  collection onto the stack.
+  New collection. Creates a empty new collection of type %1, and pushes it
+  onto the stack.
 
 ColFromArray <coll type>    [C:Arr]  ->  [C:Obj]
 
@@ -1466,11 +1465,12 @@ JmpNZ <rel offset>    [C]  ->  []
 
 Switch <offset vector> <base> <bounded>    [C]  ->  []
 
-  Switch over integer case values. If bounded == 0, the implementation will
-  assume that $1 is an integer in the range [0, length(vector)) and
-  unconditionally transfer control to the location specified by vector[$1].
-  Undefined behavior will result if $1 is not an integer inside this range. If
-  bounded != 0, the following rules take over:
+  Switch over integer case values. If bounded == SwitchKind::Unbounded, the
+  implementation will assume that $1 is an integer in the range [0,
+  length(vector)) and unconditionally transfer control to the location
+  specified by vector[$1].  Undefined behavior will result if $1 is not an
+  integer inside this range. If bounded == SwitchKind::Bounded, the following
+  rules take over:
 
   For a bounded Switch, the last two elements of the offset vector are special:
   they represent the first non-zero case and the default case, respectively.
@@ -1546,16 +1546,16 @@ CGetL3 <local variable id>    [<F2>:<T2> <F1>:<T1>]  ->  [C <F2>:<T1> <F1>:<T1>]
   instruction gets the value of the local variable, pushes it onto the stack as
   a cell, then pushes $2 onto the stack, and then pushes $1 onto the stack.
 
+  If the local variable given by %1 is not defined, this instruction raises a
+  warning, pushes null onto the stack, then pushes $2 onto the stack, and then
+  pushes $1 onto the stack.
+
 CUGetL <local variable id>    []  ->  [C|U]
 
   Get local as cell or uninit. If the local variable given by %1 is defined,
   this instruction gets the value of the local variable and pushes it onto the
   stack as a cell. If the local variable is not defined, this instruction pushes
   uninit onto the stack.
-
-  If the local variable given by %1 is not defined, this instruction raises a
-  warning, pushes null onto the stack, then pushes $2 onto the stack, and then
-  pushes $1 onto the stack.
 
 PushL <local variable id>    []  ->  [C]
 
@@ -4227,11 +4227,21 @@ ContCurrent    []  ->  [C]
 15. Async functions
 -------------------
 
+WHResult [C:Obj] -> [C]
+
+  If $1 is not a subclass of WaitHandle, raises a fatal error. If $1 succeeded,
+  this instruction pushes the result value from the WaitHandle. If $1 failed,
+  this instruction throws the exception stored in the WaitHandle. If $1 is not
+  finished, throws an Exception.
+
 Await  <number of iterators>   [C]  ->  [C]
 
   This instruction may only appear in bodies of async functions. Awaits
   a WaitHandle provided by $1, suspending the execution if the WaitHandle
   was not yet ready.
+
+  The $1 argument is allowed to be a legacy user space Awaitable, in which case
+  a ->getWaitHandle() method is called first to obtain a WaitHandle object.
 
   If $1 is not a subclass of WaitHandle, raises a fatal error. If $1 succeeded,
   this instruction pushes the result value from the WaitHandle. If $1 failed,

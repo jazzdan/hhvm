@@ -18,7 +18,6 @@
 
 #include <stdio.h>
 #include <assert.h>
-#include <string.h>
 
 #include <cstdint>
 #include <string>
@@ -59,6 +58,7 @@ std::string     kindFilter      = "all";
 uint32_t        selectedFuncId  = INVALID_ID;
 TCA             minAddr         = 0;
 TCA             maxAddr         = (TCA)-1;
+uint32_t        annotationsVerbosity = 2;
 
 std::vector<uint32_t>    transSortSrc;
 
@@ -81,7 +81,9 @@ void error(const std::string& msg) {
   exit(1);
 }
 
-void warnTooFew(std::string name, uint32_t requested, uint32_t available) {
+void warnTooFew(const std::string& name,
+                uint32_t requested,
+                uint32_t available) {
   fprintf(stderr,
           "Requested top %u %s, but there are only %u available.\n",
           requested,
@@ -129,6 +131,9 @@ void usage() {
          "list of valid opcodes.\n"
          "    -i              : reports inclusive stats by including helpers "
          "(perf data must include call graph information)\n"
+         "    -n <level>      : level of verbosity for annotations. Use 0 for "
+         "no annotations, 1 - for inline, 2 - to print all annotations "
+         "including from a file (default: 2).\n"
          "    -v <PERCENTAGE> : sets the minimum percentage to <PERCENTAGE> "
          "when printing the top helpers (implies -i). The lower the percentage,"
          " the more helpers that will show up.\n"
@@ -155,7 +160,7 @@ void printValidEventTypes() {
 void parseOptions(int argc, char *argv[]) {
   int c;
   opterr = 0;
-  while ((c = getopt (argc, argv, "hc:d:f:g:ip:st:u:T:o:e:bB:v:k:a:A:"))
+  while ((c = getopt (argc, argv, "hc:d:f:g:ip:st:u:T:o:e:bB:v:k:a:A:n:"))
          != -1) {
     switch (c) {
       case 'A':
@@ -249,6 +254,12 @@ void parseOptions(int argc, char *argv[]) {
         break;
       case 'i':
         inclusiveStats = true;
+        break;
+      case 'n':
+        if (sscanf(optarg, "%u", &annotationsVerbosity) != 1) {
+          usage();
+          exit(1);
+        }
         break;
       case 'v':
         verboseStats = true;
@@ -730,6 +741,8 @@ int main(int argc, char *argv[]) {
   g_repo = new RepoWrapper(g_transData->getRepoSchema(), configFile);
 
   loadProfData();
+
+  g_transData->setAnnotationsVerbosity(annotationsVerbosity);
 
   if (nTopFuncs) {
     if (nTopFuncs > NFUNCS) {

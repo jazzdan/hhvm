@@ -28,14 +28,13 @@ enum class HeaderKind : uint8_t {
   Vector, Map, Set, Pair, ImmVector, ImmMap, ImmSet,
   ResumableFrame, // ResumableNode followed by Frame, Resumable, ObjectData
   NativeData, // a NativeData header preceding an HNI ObjectData
-  SmallMalloc, // small smart_malloc'd block
-  BigMalloc, // big smart_malloc'd block
+  SmallMalloc, // small req::malloc'd block
+  BigMalloc, // big req::malloc'd block
   BigObj, // big size-tracked object (valid header follows BigNode)
   Free, // small block in a FreeList
   Hole, // wasted space not in any freelist
-  Debug // a DebugHeader
 };
-const unsigned NumHeaderKinds = unsigned(HeaderKind::Debug) + 1;
+const unsigned NumHeaderKinds = unsigned(HeaderKind::Hole) + 1;
 
 /*
  * RefCount type for m_count field in refcounted objects
@@ -54,6 +53,7 @@ template<class T = uint16_t> struct HeaderWord {
         struct {
           T aux;
           HeaderKind kind;
+          uint8_t smallSizeClass:6;
           mutable uint8_t mark:1;
           mutable uint8_t cmark:1;
         };
@@ -72,8 +72,9 @@ template<class T = uint16_t> struct HeaderWord {
         uint64_t(count) << 32;
   }
 
-  void init(T aux, HeaderKind kind, RefCount count) {
+  void init(T aux, HeaderKind kind, RefCount count, uint32_t sizeClass = 0) {
     q = static_cast<uint32_t>(kind) << (8 * offsetof(HeaderWord, kind)) |
+        sizeClass << 24 |
         static_cast<uint16_t>(aux) |
         uint64_t(count) << 32;
     static_assert(sizeof(T) == 2, "header layout requres 2-byte aux");
@@ -90,8 +91,11 @@ constexpr auto FAST_REFCOUNT_OFFSET = HeaderOffset +
                                       offsetof(HeaderWord<>, count);
 
 inline bool isObjectKind(HeaderKind k) {
-  return uint8_t(k) >= uint8_t(HeaderKind::Object) &&
-         uint8_t(k) <= uint8_t(HeaderKind::ImmSet);
+  return k >= HeaderKind::Object && k <= HeaderKind::ImmSet;
+}
+
+inline bool isArrayKind(HeaderKind k) {
+  return k >= HeaderKind::Packed && k <= HeaderKind::Proxy;
 }
 
 enum class CollectionType : uint8_t { // Subset of possible HeaderKind values

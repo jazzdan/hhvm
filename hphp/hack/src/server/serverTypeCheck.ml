@@ -264,13 +264,15 @@ let type_check genv env =
   let errorl', failed_check = Hh_logger.measure "Type-check" begin fun () ->
     let to_recheck = Relative_path.Set.union to_recheck env.failed_check in
     let fast = reparse fast files_info to_recheck in
-  let tcopt = (ServerConfig.typechecker_options genv.config) in
-    Typing_check_service.go tcopt genv.workers fast
+    ServerCheckpoint.process_updates fast;
+    Typing_check_service.go genv.workers env.nenv fast
   end in
 
   let errorl = List.rev (List.rev_append errorl' errorl) in
 
   Hh_logger.log "Total: %f\n%!" ((Unix.gettimeofday ()) -. start_t);
+  let total_rechecked_count = Relative_path.Set.cardinal to_recheck in
+  HackEventLogger.recheck_once_end start_t total_rechecked_count;
 
   (* Done, that's the new environment *)
   { files_info = files_info;

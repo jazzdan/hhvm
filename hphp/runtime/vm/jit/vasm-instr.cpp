@@ -44,6 +44,7 @@ bool isBlockEnd(const Vinstr& inst) {
     case Vinstr::svcreq:
     // control flow
     case Vinstr::jcc:
+    case Vinstr::jcci:
     case Vinstr::jmp:
     case Vinstr::jmpr:
     case Vinstr::jmpm:
@@ -58,6 +59,7 @@ bool isBlockEnd(const Vinstr& inst) {
     case Vinstr::ret:
     case Vinstr::vretm:
     case Vinstr::vret:
+    case Vinstr::leavetc:
     case Vinstr::fallthru:
     // arm specific
     case Vinstr::hcunwind:

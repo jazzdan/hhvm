@@ -33,10 +33,13 @@ TRACE_SET_MOD(hhir);
 using Trace::Indent;
 
 bool shouldHHIRRelaxGuards() {
+  assert(!(RuntimeOption::EvalHHIRRelaxGuards &&
+           RuntimeOption::EvalHHIRConstrictGuards));
   return RuntimeOption::EvalHHIRRelaxGuards &&
-    (RuntimeOption::EvalJitRegionSelector == "tracelet" ||
-     RuntimeOption::EvalJitRegionSelector == "method" ||
-     mcg->tx().mode() == TransKind::Optimize);
+    // TODO (#5792564): Guard relaxation doesn't work with loops.
+    // TODO (#6599498): Guard relaxation is broken in wholecfg mode.
+    (mcg->tx().mode() != TransKind::Optimize ||
+     RuntimeOption::EvalJitPGORegionSelector == "hottrace");
 }
 
 /* For each possible dest type, determine if its type might relax. */
@@ -319,8 +322,7 @@ Type relaxType(Type t, TypeConstraint tc) {
   always_assert_flog(t <= TGen && t != TBottom, "t = {}", t);
   if (tc.category == DataTypeGeneric) return TGen;
   auto const relaxed =
-    (t & TCell) <= TBottom ? TBottom
-                                     : relaxCell(t & TCell, tc);
+    (t & TCell) <= TBottom ? TBottom : relaxCell(t & TCell, tc);
   return t <= TCell ? relaxed : relaxed | TBoxedInitCell;
 }
 

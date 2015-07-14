@@ -28,6 +28,8 @@ bool isInlining(const IRGS& env) {
 }
 
 /*
+ * Attempts to begin inlining, and returns whether or not it successed.
+ *
  * When doing gen-time inlining, we set up a series of IR instructions
  * that looks like this:
  *
@@ -48,7 +50,7 @@ bool isInlining(const IRGS& env) {
  * In DCE we attempt to remove the InlineReturn and DefInlineFP instructions if
  * they aren't needed.
  */
-void beginInlining(IRGS& env,
+bool beginInlining(IRGS& env,
                    unsigned numParams,
                    const Func* target,
                    Offset returnBcOffset) {
@@ -75,12 +77,9 @@ void beginInlining(IRGS& env,
     "FPI stack pointer and callee stack pointer didn't match in beginInlining"
   );
 
-  always_assert_flog(
-    env.fpiStack.top().spillFrame != nullptr,
-    "Couldn't find SpillFrame for inlined call on sp {}."
-    " Was the FPush instruction interpreted?",
-    *calleeSP->inst()
-  );
+  // This can only happen if the code is unreachable, in which case
+  // the FPush* can punt if it gets a TBottom.
+  if (env.fpiStack.top().spillFrame == nullptr) return false;
 
   auto const sframe = env.fpiStack.top().spillFrame;
 
@@ -108,17 +107,25 @@ void beginInlining(IRGS& env,
   for (unsigned i = 0; i < numParams; ++i) {
     stLocRaw(env, i, calleeFP, params[i]);
   }
-  for (unsigned i = numParams; i < target->numLocals(); ++i) {
+  const bool hasVariadicArg = target->hasVariadicCaptureParam();
+  for (unsigned i = numParams; i < target->numLocals() - hasVariadicArg; ++i) {
     /*
      * Here we need to be generating hopefully-dead stores to initialize
      * non-parameter locals to KindOfUninit in case we have to leave the trace.
      */
     stLocRaw(env, i, calleeFP, cns(env, TUninit));
   }
+  if (hasVariadicArg) {
+    auto argNum = target->numLocals() - 1;
+    always_assert(numParams <= argNum);
+    stLocRaw(env, argNum, calleeFP, cns(env, staticEmptyArray()));
+  }
 
   env.fpiActiveStack.push(std::make_pair(env.fpiStack.top().returnSP,
                                          env.fpiStack.top().returnSPOff));
   env.fpiStack.pop();
+
+  return true;
 }
 
 void endInlinedCommon(IRGS& env) {
@@ -156,8 +163,8 @@ void endInlinedCommon(IRGS& env) {
   FTRACE(1, "]]] end inlining: {}\n", curFunc(env)->fullName()->data());
 }
 
-void retFromInlined(IRGS& env, Type type) {
-  auto const retVal = pop(env, type, DataTypeGeneric);
+void retFromInlined(IRGS& env) {
+  auto const retVal = pop(env, DataTypeGeneric);
   endInlinedCommon(env);
   push(env, retVal);
 }

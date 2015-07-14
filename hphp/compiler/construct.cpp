@@ -37,29 +37,28 @@ using namespace HPHP;
 
 ///////////////////////////////////////////////////////////////////////////////
 
-Construct::Construct(BlockScopePtr scope, LocationPtr loc, KindOf kindOf)
+Construct::Construct(BlockScopePtr scope,
+                     const Location::Range& r, KindOf kindOf)
   : m_blockScope(scope)
   , m_flagsVal(0)
+  , m_r(r)
   , m_kindOf(kindOf)
-  , m_loc(loc)
   , m_containedEffects(0)
   , m_effectsTag(0)
 {
 }
 
-void Construct::resetScope(BlockScopeRawPtr scope, bool resetOrigScope) {
+void Construct::copyLocationTo(ConstructPtr other) {
+  always_assert(other->getFileScope() == getFileScope());
+  other->m_r = m_r;
+}
+
+void Construct::resetScope(BlockScopeRawPtr scope) {
   setBlockScope(scope);
-  if (resetOrigScope) {
-    ExpressionPtr expr =
-      dynamic_pointer_cast<Expression>(shared_from_this());
-    if (expr) {
-      expr->setOriginalScope(scope);
-    }
-  }
   for (int i = 0, n = getKidCount(); i < n; i++) {
     if (ConstructPtr kid = getNthKid(i)) {
       if (FunctionWalker::SkipRecurse(kid)) continue;
-      kid->resetScope(scope, resetOrigScope);
+      kid->resetScope(scope);
     }
   }
 }
@@ -114,38 +113,37 @@ bool LocalEffectsContainer::hasLocalEffect(Construct::Effect effect) const {
 
 ExpressionPtr Construct::makeConstant(AnalysisResultConstPtr ar,
                                       const std::string &value) const {
-  return Expression::MakeConstant(ar, getScope(), getLocation(), value);
+  return Expression::MakeConstant(ar, getScope(), getRange(), value);
 }
 
 ExpressionPtr Construct::makeScalarExpression(AnalysisResultConstPtr ar,
                                                const Variant &value) const {
-  return Expression::MakeScalarExpression(ar, getScope(), getLocation(), value);
+  return Expression::MakeScalarExpression(ar, getScope(),
+                                          getRange(), value);
 }
 
-std::string Construct::getText(bool useCache /* = false */,
-                               bool translate /* = false */,
-                               AnalysisResultPtr ar
+std::string Construct::getText(AnalysisResultPtr ar
                                /* = AnalysisResultPtr() */) {
-  std::string &text = m_text;
-  if (useCache && !text.empty()) return text;
   std::ostringstream o;
   CodeGenerator cg(&o, CodeGenerator::PickledPHP);
-  cg.translatePredefined(translate);
+  cg.translatePredefined(false);
   outputPHP(cg, ar);
-  text = o.str();
-  return text;
+  return o.str();
 }
 
 void Construct::serialize(JSON::CodeError::OutputStream &out) const {
   JSON::CodeError::ListStream ls(out);
-  ls << m_loc->file << m_loc->line0 << m_loc->char0 <<
-                       m_loc->line1 << m_loc->char1;
+  auto scope = getFileScope();
+  ls <<
+    scope->getName() <<
+    m_r.line0 << m_r.char0 <<
+    m_r.line1 << m_r.char1;
   ls.done();
 }
 
 void Construct::printSource(CodeGenerator &cg) {
-  if (m_loc) {
-    cg_printf("/* SRC: %s line %d */\n", m_loc->file, m_loc->line0);
+  if (auto scope = getFileScope()) {
+    cg_printf("/* SRC: %s line %d */\n", scope->getName().c_str(), m_r.line0);
   }
 }
 
@@ -165,8 +163,6 @@ void Construct::dumpNode(int spc) {
   std::string scontext = "";
   std::string value = "";
   std::string type_info = "";
-  unsigned id = 0;
-  ExpressionPtr idPtr = ExpressionPtr();
   int ef = 0;
 
   if (isStatement()) {
@@ -178,8 +174,6 @@ void Construct::dumpNode(int spc) {
   } else {
     assert(isExpression());
     Expression *e = static_cast<Expression*>(this);
-    id = e->getCanonID();
-    idPtr = e->getCanonLVal();
 
     ef = e->getLocalEffects();
 
@@ -187,7 +181,7 @@ void Construct::dumpNode(int spc) {
     name = Expression::nameOfKind(etype);
     switch (etype) {
       case Expression::KindOfSimpleFunctionCall:
-        value = static_cast<SimpleFunctionCall*>(e)->getName();
+        value = static_cast<SimpleFunctionCall*>(e)->getOriginalName();
         break;
       case Expression::KindOfSimpleVariable:
         value = static_cast<SimpleVariable*>(e)->getName();
@@ -264,16 +258,6 @@ void Construct::dumpNode(int spc) {
     }
 
     type = (int)etype;
-
-    if (e->getActualType()) {
-      type_info = e->getActualType()->toString();
-      if (e->getExpectedType()) {
-        type_info += ":" + e->getExpectedType()->toString();
-      } else {
-        type_info += ":";
-      }
-      type_info = "{" + type_info + "} ";
-    }
   }
 
   int s = spc;
@@ -287,14 +271,6 @@ void Construct::dumpNode(int spc) {
             << std::setw(10) << (int64_t)this << std::dec;
 
   std::cout << " " << name << "(" << type << ") ";
-  if (id) {
-    std::cout << "id=" << id << " ";
-  }
-  if (idPtr) {
-    std::cout << "idp=0x" <<
-      std::hex << std::setfill('0') << std::setw(10) <<
-      (int64_t)idPtr.get() << " ";
-  }
 
   if (value != "") {
     std::cout << "[" << value << "] ";
@@ -355,12 +331,12 @@ void Construct::dumpNode(int spc) {
     noremoved = " (NoRemove)";
   }
 
-  std::cout << type_info << nkid << scontext << sef
+  std::cout << nkid << scontext << sef
     << localtered << refstr << objstr << noremoved;
-  if (m_loc) {
-    std::cout << " " << m_loc->file << ":"
-      << "[" << m_loc->line0 << "@" << m_loc->char0 << ", "
-      << m_loc->line1 << "@" << m_loc->char1 << "]";
+  if (auto scope = getFileScope()) {
+    std::cout << " " << scope->getName() << ":"
+      << "[" << m_r.line0 << "@" << m_r.char0 << ", "
+      << m_r.line1 << "@" << m_r.char1 << "]";
   }
   std::cout << "\n";
 }
@@ -377,7 +353,7 @@ public:
   }
   int before(ConstructRawPtr cp) {
     int ret = m_functionOnly ? FunctionWalker::before(cp) : WalkContinue;
-    cp->dumpNode(m_spc, m_ar);
+    cp->dumpNode(m_spc);
     m_spc += 2;
     m_showEnds = false;
     return ret;
@@ -391,7 +367,7 @@ public:
         s -= n;
       }
       std::cout << "<<";
-      cp->dumpNode(0, m_ar);
+      cp->dumpNode(0);
     }
     m_spc -= 2;
     // HACK: dump the closure function as a "child" of the
@@ -423,7 +399,8 @@ void Construct::dump(int spc, AnalysisResultConstPtr ar, bool functionOnly,
   cd.walk(state, endBefore, endAfter);
 }
 
-void Construct::parseTimeFatal(Compiler::ErrorType err, const char *fmt, ...) {
+void Construct::parseTimeFatal(FileScopeRawPtr fs,
+                               Compiler::ErrorType err, const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
   string msg;
@@ -431,7 +408,8 @@ void Construct::parseTimeFatal(Compiler::ErrorType err, const char *fmt, ...) {
   va_end(ap);
 
   if (err != Compiler::NoError) Compiler::Error(err, shared_from_this());
-  throw ParseTimeFatalException(m_loc->file, m_loc->line0, "%s", msg.c_str());
+  throw ParseTimeFatalException(fs->getName(), m_r.line0,
+                                "%s", msg.c_str());
 }
 
 void Construct::analysisTimeFatal(Compiler::ErrorType err,
@@ -444,6 +422,6 @@ void Construct::analysisTimeFatal(Compiler::ErrorType err,
 
   assert(err != Compiler::NoError);
   Compiler::Error(err, shared_from_this());
-  throw AnalysisTimeFatalException(m_loc->file, m_loc->line0,
+  throw AnalysisTimeFatalException(getFileScope()->getName(), m_r.line0,
                                    "%s [analysis]", msg.c_str());
 }

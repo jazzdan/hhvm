@@ -69,8 +69,8 @@ inline bool equal(const Variant& v1, const Object& v2) {
   return cellEqual(*v1.asCell(), v2.get());
 }
 inline bool equal(const Variant& v1, const Resource& v2) {
-  if (!v2.get()) return cellEqual(*v1.asCell(), false);
-  return cellEqual(*v1.asCell(), v2.get());
+  if (!v2) return cellEqual(*v1.asCell(), false);
+  return cellEqual(*v1.asCell(), deref<ResourceData>(v2));
 }
 inline bool equal(const Variant& v1, const Variant& v2) {
   return tvEqual(*v1.asTypedValue(), *v2.asTypedValue());
@@ -105,8 +105,8 @@ inline bool less(const Variant& v1, const Object& v2) {
   return cellLess(*v1.asCell(), v2.get());
 }
 inline bool less(const Variant& v1, const Resource& v2) {
-  if (!v2.get()) return cellLess(*v1.asCell(), false);
-  return cellLess(*v1.asCell(), v2.get());
+  if (!v2) return cellLess(*v1.asCell(), false);
+  return cellLess(*v1.asCell(), deref<ResourceData>(v2));
 }
 inline bool less(const Variant& v1, const Variant& v2) {
   return tvLess(*v1.asTypedValue(), *v2.asTypedValue());
@@ -141,8 +141,8 @@ inline bool more(const Variant& v1, const Object& v2) {
   return cellGreater(*v1.asCell(), v2.get());
 }
 inline bool more(const Variant& v1, const Resource& v2) {
-  if (!v2.get()) return cellGreater(*v1.asCell(), false);
-  return cellGreater(*v1.asCell(), v2.get());
+  if (!v2) return cellGreater(*v1.asCell(), false);
+  return cellGreater(*v1.asCell(), deref<ResourceData>(v2));
 }
 inline bool more(const Variant& v1, const Variant& v2) {
   return tvGreater(*v1.asTypedValue(), *v2.asTypedValue());
@@ -429,6 +429,10 @@ inline bool same(const StringData *v1, const Variant& v2) {
   return same(v2, v1);
 }
 
+inline bool nsame(const StringData* v1, const StringData* v2) {
+  return !same(v1, v2);
+}
+
 inline bool equal(const StringData *v1, bool    v2) { return equal(v2, v1); }
 inline bool equal(const StringData *v1, int     v2) { return equal(v2, v1); }
 inline bool equal(const StringData *v1, int64_t v2) { return equal(v2, v1); }
@@ -458,13 +462,17 @@ inline bool equal(const StringData *v1, const Object& v2) {
   return equal(v1, v2.toString());
 }
 inline bool equal(const StringData *v1, const Resource& v2) {
-  if (v1 == nullptr || v2.get() == nullptr) {
+  if (!v1 || !v2) {
     return equal(toBoolean(v1), v2.toBoolean());
   }
   return false;
 }
 inline bool equal(const StringData *v1, const Variant& v2) {
   return equal(v2, v1);
+}
+
+inline bool nequal(const StringData* v1, const StringData* v2) {
+  return !equal(v1, v2);
 }
 
 inline bool less(const StringData *v1, bool    v2) { return more(v2, v1); }
@@ -494,14 +502,20 @@ inline bool less(const StringData *v1, const Object& v2) {
   if (!v2->hasToString()) return true;
   return less(v1, v2.toString());
 }
-inline bool less(const StringData *v1, const Resource& v2) {
-  if (v1 == nullptr || v2.get() == nullptr) {
+inline bool less(const StringData *v1, const Resource& v2)  {
+  if (!v1 || !v2) {
     return less(toBoolean(v1), v2.toBoolean());
   }
   return true;
 }
 inline bool less(const StringData *v1, const Variant& v2) {
   return more(v2, v1);
+}
+
+inline bool lessEqual(const StringData* v1, const StringData* v2) {
+  if (v1 == v2 || v1 == nullptr) return true;
+  if (v2 == nullptr) return v1->empty();
+  return v1->compare(v2) <= 0;
 }
 
 inline bool more(const StringData *v1, bool    v2) { return less(v2, v1); }
@@ -531,14 +545,18 @@ inline bool more(const StringData *v1, const Object& v2) {
   if (!v2->hasToString()) return false;
   return more(v1, v2.toString());
 }
-inline bool more(const StringData *v1, const Resource& v2) {
-  if (v1 == nullptr || v2.get() == nullptr) {
+inline bool more(const StringData *v1, const Resource& v2)  {
+  if (!v1 || !v2) {
     return more(toBoolean(v1), v2.toBoolean());
   }
   return false;
 }
 inline bool more(const StringData *v1, const Variant& v2) {
   return less(v2, v1);
+}
+
+inline bool moreEqual(const StringData* v1, const StringData* v2) {
+  return lessEqual(v2, v1);
 }
 
 ///////////////////////////////////////////////////////////////////////////////

@@ -11,6 +11,7 @@
 
 open Utils
 open Typing_defs
+open Typing_dependent_type
 
 module Env = Typing_env
 module TUtils = Typing_utils
@@ -96,7 +97,15 @@ let rec localize_with_env ~ety_env env (dty: decl ty) =
   | r, Tthis ->
      let ty = match ety_env.this_ty with
        | Reason.Rnone, ty -> r, ty
-       | reason, ty -> Reason.Rinstantiate (reason, "this", r), ty in
+       | Reason.Rexpr_dep_type (_, pos, s), ty ->
+           Reason.Rexpr_dep_type (r, pos, s), ty
+       | reason, ty when ety_env.from_class <> None -> reason, ty
+       | reason, ty ->
+           Reason.Rinstantiate (reason, SN.Typehints.this, r), ty in
+     let ty =
+       match ety_env.from_class with
+       | Some cid -> ExprDepTy.make env cid ty
+       | _ -> ty in
      env, (ety_env, ty)
   | r, Tarray (ty1, ty2) ->
       let env, ty1 = opt (localize ~ety_env) env ty1 in
@@ -114,18 +123,25 @@ let rec localize_with_env ~ety_env env (dty: decl ty) =
          in
          env, (ety_env, (Reason.Rinstantiate (fst x_ty, x, r), snd x_ty))
       | None ->
-         let env, cstr_opt =
-           match cstr_opt with
-           | None -> env, None
-           | Some (ck, ty) ->
-              let env, ty = localize ~ety_env env ty in
-              env, Some (ck, ty)
-         in
-         env, (ety_env, (r, Tgeneric (x, cstr_opt)))
+         (match cstr_opt with
+         | None ->
+             env, (ety_env, (r, Tabstract (AKgeneric (x, None), None)))
+         | Some (Ast.Constraint_as, ty) ->
+             let env, ty = localize ~ety_env env ty in
+             env, (ety_env, (r, Tabstract (AKgeneric (x, None), Some ty)))
+         | Some (Ast.Constraint_super, ty) ->
+             let env, ty = localize ~ety_env env ty in
+             env, (ety_env, (r, Tabstract (AKgeneric (x, Some ty), None)))
+         )
      )
   | r, Toption ty ->
-     let env, ty = localize ~ety_env env ty in
-     env, (ety_env, (r, Toption ty))
+      let env, ty = localize ~ety_env env ty in
+      let ty_ =
+        if TUtils.is_option env ty then
+          snd ty
+        else
+          Toption ty in
+      env, (ety_env, (r, ty_))
   | r, Tfun ft ->
      let env, ft = localize_ft ~ety_env env ft in
      env, (ety_env, (r, Tfun ft))
@@ -139,23 +155,35 @@ let rec localize_with_env ~ety_env env (dty: decl ty) =
      let env, tyl = lfold (localize ~ety_env) env tyl in
      env, (ety_env, (r, Ttuple tyl))
   | r, Taccess (root_ty, ids) ->
-     let env, root_ty = localize ~ety_env env root_ty in
-     env, (ety_env, (r, Taccess (root_ty, ids)))
-  | r, Tshape tym ->
+      let env, root_ty = localize ~ety_env env root_ty in
+      TUtils.expand_typeconst ety_env env r root_ty ids
+  | r, Tshape (fields_known, tym) ->
      let env, tym = ShapeMap.map_env (localize ~ety_env) env tym in
-     env, (ety_env, (r, Tshape tym))
+     env, (ety_env, (r, Tshape (fields_known, tym)))
 
 and localize ~ety_env env ty =
   let env, (_, ty) = localize_with_env ~ety_env env ty in
   env, ty
 
-and localize_ft ~ety_env env ft =
-  let ety_env = {
-    ety_env with
-    substs = List.fold_left begin fun subst (_, (_, x), _) ->
+(* For the majority of cases when we localize a function type we instantiate
+ * the function's type parameters to be a Tunresolved wrapped in a Tvar so the
+ * type can grow. There is ONLY ONE case where we do not do this, in
+ * Typing_subtype.subtype_method. See the comment for that function for why
+ * this is necessary.
+ *)
+and localize_ft ?(instantiate_tparams=true) ~ety_env env ft =
+  (* Set the instantiated type parameter to initially point to unresolved, so
+   * that it can grow and eventually be a subtype of something like "mixed".
+   *)
+  let env, substs =
+    if instantiate_tparams
+    then let env, tvarl = lfold TUtils.unresolved_tparam env ft.ft_tparams in
+         let ft_subst = TSubst.make ft.ft_tparams tvarl in
+         env, SMap.union ft_subst ety_env.substs
+    else env, List.fold_left begin fun subst (_, (_, x), _) ->
       SMap.remove x subst
-    end ety_env.substs ft.ft_tparams;
-  } in
+    end ety_env.substs ft.ft_tparams in
+  let ety_env = {ety_env with substs = substs} in
   let names, params = List.split ft.ft_params in
   let env, params = lfold (localize ~ety_env) env params in
   let env, arity = match ft.ft_arity with
@@ -176,9 +204,10 @@ let localize_phase ~ety_env env phase_ty =
 
 let env_with_self env =
   {
-    typedef_expansions = [];
+    type_expansions = [];
     substs = SMap.empty;
     this_ty = Reason.none, TUtils.this_of (Env.get_self env);
+    from_class = None;
   }
 
 (* Performs no substitutions of generics and initializes Tthis to

@@ -200,11 +200,30 @@ function verify_hhbc() {
   return bin_root().'/verify.hhbc';
 }
 
-function read_file($file) {
-  return file_exists($file) ?
-         str_replace('__DIR__', dirname($file),
-           preg_replace('/\s+/', ' ', (file_get_contents($file))))
-         : "";
+function read_opts_file($file) {
+  if (!file_exists($file)) {
+    return "";
+  }
+
+  $fp = fopen($file, "r");
+
+  $contents = "";
+  while ($line = fgets($fp)) {
+    // Compress out white space
+    $line = preg_replace('/\s+/', ' ', $line);
+
+    // Discard simple line oriented ; and # comments to end of line
+    // Comments at end of line (after payload) are not allowed.
+    $line = preg_replace('/^ *;.*$/', ' ', $line);
+    $line = preg_replace('/^ *#.*$/', ' ', $line);
+
+    // Substitute in the directory name
+    $line = str_replace('__DIR__', dirname($file), $line);
+
+    $contents .= $line;
+  }
+  fclose($fp);
+  return $contents;
 }
 
 // http://stackoverflow.com/questions/2637945/
@@ -406,13 +425,35 @@ function find_tests($files, array $options = null) {
   return $tests;
 }
 
-function list_tests() {
-  foreach (find_tests(array('all')) as $test) {
-    foreach (array('-m interp', '-m jit') as $mode) {
-      foreach (array('', '-r') as $repo) {
-        print implode(' ', array_filter(array($mode, $repo, $test)))."\n";
-      }
-    }
+function list_tests($files, $options) {
+  $args = array();
+  $mode = idx($options, 'mode', '');
+  switch ($mode) {
+    case '':
+    case 'jit':
+      $args[] = '-m jit';
+      break;
+    case 'interp';
+      $args[] = '-m interp';
+      break;
+    default:
+      throw new Exception("Unsupported mode for listing tests: ".$mode);
+  }
+
+  if (isset($options['repo'])) {
+    $args[] = '-r';
+  }
+
+  if (isset($options['relocate'])) {
+    $args[] = '--relocate';
+    $args[] = $options['relocate'];
+  }
+
+  foreach (find_tests($files, $options) as $test) {
+    print Status::jsonEncode(array(
+      'args' => implode(' ', $args),
+      'name' => $test,
+    ))."\n";
   }
 }
 
@@ -536,22 +577,31 @@ function hhvm_cmd($options, $test, $test_run = null) {
     find_test_ext($test, 'ini'),
     $hdf,
     find_debug_config($test, 'hphpd.ini'),
-    read_file(find_test_ext($test, 'opts')),
+    read_opts_file(find_test_ext($test, 'opts')),
     '--file',
     escapeshellarg($test_run)
   );
 
+  // Special support for tests that require a path to the current
+  // test directory for things like prepend_file and append_file
+  // testing
   if (file_exists($test.'.ini')) {
-    file_put_contents($test_ini = tempnam('/tmp', $test).'.ini',
-                      str_replace('{PWD}', dirname($test),
-                                  file_get_contents($test.'.ini')));
-    $cmd .= " -c $test_ini";
+    $contents = file_get_contents($test.'.ini');
+    if (strpos($contents, '{PWD}') !== false) {
+      $test_ini = tempnam('/tmp', $test).'.ini';
+      file_put_contents($test_ini,
+                        str_replace('{PWD}', dirname($test), $contents));
+      $cmd .= " -c $test_ini";
+    }
   }
   if ($hdf !== "") {
-    file_put_contents($test_hdf = tempnam('/tmp', $test).$hdf_suffix,
-                      str_replace('{PWD}', dirname($test),
-                                  file_get_contents($test.$hdf_suffix)));
-    $cmd .= " -c $test_hdf";
+    $contents = file_get_contents($test.$hdf_suffix);
+    if (strpos($contents, '{PWD}') !== false) {
+      $test_hdf = tempnam('/tmp', $test).$hdf_suffix;
+      file_put_contents($test_hdf,
+                        str_replace('{PWD}', dirname($test), $contents));
+      $cmd .= " -c $test_hdf";
+    }
   }
 
   if (isset($options['repo'])) {
@@ -581,7 +631,7 @@ function hphp_cmd($options, $test) {
     '--hphp',
     '--config',
     find_file($test, 'hphp_config.ini'),
-    read_file("$test.hphp_opts"),
+    read_opts_file("$test.hphp_opts"),
     "-thhbc -l0 -k1 -o \"$test.repo\" \"$test\"",
   ));
 }
@@ -592,7 +642,7 @@ function hhbbc_cmd($options, $test) {
     '--hhbbc',
     '--no-logging',
     '--parallel-num-threads=1',
-    read_file("$test.hhbbc_opts"),
+    read_opts_file("$test.hhbbc_opts"),
     "-o \"$test.repo/hhvm.hhbbc\" \"$test.repo/hhvm.hhbc\"",
   ));
 }
@@ -1191,7 +1241,7 @@ function run_config_server($options, $test) {
 
 function run_config_cli($options, $test, $hhvm, $hhvm_env) {
   if (isset($options['log'])) {
-    $hhvm_env['TRACE'] = 'printir:2';
+    $hhvm_env['TRACE'] = 'printir:1';
     $hhvm_env['HPHP_TRACE_FILE'] = $test . '.log';
   }
 
@@ -1893,7 +1943,7 @@ function main($argv) {
     error(help());
   }
   if (isset($options['list-tests'])) {
-    error(list_tests());
+    error(list_tests($files, $options));
   }
 
   $tests = find_tests($files, $options);

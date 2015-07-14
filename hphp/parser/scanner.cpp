@@ -132,11 +132,11 @@ Scanner::Scanner(const char *source, int len, int type,
 }
 
 void Scanner::computeMd5() {
-  auto startpos = m_stream->tellg();
+  size_t startpos = m_stream->tellg();
   always_assert(startpos != -1 &&
                 startpos <= std::numeric_limits<int32_t>::max());
   m_stream->seekg(0, std::ios::end);
-  auto length = m_stream->tellg();
+  size_t length = m_stream->tellg();
   always_assert(length != -1 &&
                 length <= std::numeric_limits<int32_t>::max());
   m_stream->seekg(0, std::ios::beg);
@@ -645,7 +645,7 @@ void Scanner::warn(const char* fmt, ...) {
   va_end(ap);
 
   Logger::Warning("%s: %s (Line: %d, Char %d)", msg.c_str(),
-                  m_filename.c_str(), m_loc->line0, m_loc->char0);
+                  m_filename.c_str(), m_loc->r.line0, m_loc->r.char0);
 }
 
 void Scanner::incLoc(const char *rawText, int rawLeng, int type) {
@@ -661,12 +661,12 @@ void Scanner::incLoc(const char *rawText, int rawLeng, int type) {
     case Start:
       break; // scanner set to (1, 1, 1, 1) already
     case NoLineFeed:
-      m_loc->line0 = m_loc->line1;
-      m_loc->char0 = m_loc->char1 + 1;
+      m_loc->r.line0 = m_loc->r.line1;
+      m_loc->r.char0 = m_loc->r.char1 + 1;
       break;
     case HadLineFeed:
-      m_loc->line0 = m_loc->line1 + 1;
-      m_loc->char0 = 1;
+      m_loc->r.line0 = m_loc->r.line1 + 1;
+      m_loc->r.char0 = 1;
       break;
   }
   const char *p = rawText;
@@ -675,11 +675,11 @@ void Scanner::incLoc(const char *rawText, int rawLeng, int type) {
       case Start:
         break; // scanner set to (1, 1, 1, 1) already
       case NoLineFeed:
-        m_loc->char1++;
+        m_loc->r.char1++;
         break;
       case HadLineFeed:
-        m_loc->line1++;
-        m_loc->char1 = 1;
+        m_loc->r.line1++;
+        m_loc->r.char1 = 1;
         break;
     }
     m_state = (*p++ == '\n' ? HadLineFeed : NoLineFeed);
@@ -776,7 +776,7 @@ std::string Scanner::escape(const char *str, int len, char quote_type) const {
                 auto loc = getLocation();
                 return ParseTimeFatalException(
                   loc->file,
-                  loc->line0,
+                  loc->r.line0,
                   "%s", msg);
               };
               if (!valid) {

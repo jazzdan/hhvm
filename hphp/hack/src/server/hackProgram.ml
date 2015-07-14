@@ -14,8 +14,6 @@ open ServerEnv
 module Server = ServerFunctors
 
 module Program : Server.SERVER_PROGRAM = struct
-  module EventLogger = EventLogger
-
   let name = "hh_server"
 
   let config_filename_ =
@@ -45,8 +43,8 @@ module Program : Server.SERVER_PROGRAM = struct
     )
 
   let make_next_files dir =
-    let php_next_files = Find.make_next_files_php dir in
-    let js_next_files = Find.make_next_files_js ~filter:(fun _ -> true) dir in
+    let php_next_files = Find.make_next_files FindUtils.is_php dir in
+    let js_next_files = Find.make_next_files FindUtils.is_js dir in
     fun () -> php_next_files () @ js_next_files ()
 
   let stamp_file = Tmp.get_dir() ^ "/stamp"
@@ -71,7 +69,7 @@ module Program : Server.SERVER_PROGRAM = struct
   let init genv env =
     let module RP = Relative_path in
     let root = ServerArgs.root genv.options in
-    let hhi_root = Path.make (Hhi.get_hhi_root ()) in
+    let hhi_root = Hhi.get_hhi_root () in
     let next_files_hhi =
       compose (rev_rev_map (RP.create RP.Hhi)) (make_next_files hhi_root) in
     let next_files_root = compose
@@ -99,7 +97,7 @@ module Program : Server.SERVER_PROGRAM = struct
     Relative_path.relativize_set Relative_path.Root updates
 
   let should_recheck update =
-    Find.is_php_path (Relative_path.suffix update)
+    FindUtils.is_php (Relative_path.suffix update)
 
   let recheck genv old_env typecheck_updates =
     if Relative_path.Set.is_empty typecheck_updates then old_env else begin

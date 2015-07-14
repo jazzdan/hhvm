@@ -65,6 +65,16 @@ const PrologueCallersVec& PrologueCallersRec::guardCallers() const {
   return m_guardCallers;
 }
 
+void PrologueCallersRec::removeMainCaller(TCA caller) {
+  auto pos = std::find(m_mainCallers.begin(), m_mainCallers.end(), caller);
+  if (pos != m_mainCallers.end()) m_mainCallers.erase(pos);
+}
+
+void PrologueCallersRec::removeGuardCaller(TCA caller) {
+  auto pos = std::find(m_guardCallers.begin(), m_guardCallers.end(), caller);
+  if (pos != m_mainCallers.end()) m_guardCallers.erase(pos);
+}
+
 void PrologueCallersRec::addMainCaller(TCA caller) {
   m_mainCallers.push_back(caller);
 }
@@ -316,6 +326,10 @@ void ProfData::setOptimized(SrcKey sk) {
   m_optimizedSKs.insert(sk);
 }
 
+void ProfData::clearOptimized(SrcKey sk) {
+  m_optimizedSKs.erase(sk);
+}
+
 void ProfData::setOptimized(FuncId funcId) {
   m_optimizedFuncs.insert(funcId);
 }
@@ -343,8 +357,8 @@ TransID ProfData::addTransProfile(const RegionDescPtr&  region,
   DEBUG_ONLY size_t nBlocks = region->blocks().size();
   assertx(nBlocks == 1 || (nBlocks > 1 && region->entry()->inlinedCallee()));
   region->renumberBlock(region->entry()->id(), transId);
-
-  region->blocks().back()->setPostConditions(pconds);
+  for (auto& b : region->blocks()) b->setProfTransID(transId);
+  region->blocks().back()->setPostConds(pconds);
   auto const startSk = region->start();
   m_transRecs.emplace_back(new ProfTransRec(transId,
                                             TransKind::Profile,

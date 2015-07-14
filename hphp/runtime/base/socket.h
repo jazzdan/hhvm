@@ -21,6 +21,9 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 
+#ifdef SOCKET_ERROR
+# undef SOCKET_ERROR
+#endif
 #define SOCKET_ERROR(sock, msg, errn)                                 \
   sock->setError(errn);                                               \
   if (errn != EAGAIN && errn != EWOULDBLOCK && errn != EINPROGRESS) { \
@@ -65,13 +68,13 @@ struct Socket : File {
   const String& o_getClassNameHook() const override { return classnameof(); }
 
   // implementing File
-  virtual bool open(const String& filename, const String& mode);
-  virtual bool close();
-  virtual int64_t readImpl(char *buffer, int64_t length);
-  virtual int64_t writeImpl(const char *buffer, int64_t length);
-  virtual bool eof();
-  virtual Array getMetaData();
-  virtual int64_t tell();
+  bool open(const String& filename, const String& mode) override;
+  bool close() override;
+  int64_t readImpl(char *buffer, int64_t length) override;
+  int64_t writeImpl(const char *buffer, int64_t length) override;
+  bool eof() override;
+  Array getMetaData() override;
+  int64_t tell() override;
 
   // check if the socket is still open
   virtual bool checkLiveness();

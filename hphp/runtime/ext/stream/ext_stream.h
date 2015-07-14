@@ -96,20 +96,19 @@ namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 // stream context
 
-class StreamContext : public ResourceData {
-public:
+struct StreamContext final : ResourceData {
   DECLARE_RESOURCE_ALLOCATION_NO_SWEEP(StreamContext);
 
   CLASSNAME_IS("stream-context")
-  // overriding ResourceData
-  virtual const String& o_getClassNameHook() const { return classnameof(); }
+  const String& o_getClassNameHook() const override { return classnameof(); }
 
   StreamContext(const Array& options, const Array& params)
     : m_options(options), m_params(params) {
   }
 
   static bool validateOptions(const Variant& options);
-  void setOption(const String& wrapper, const String& option, const Variant& value);
+  void setOption(const String& wrapper, const String& option,
+                 const Variant& value);
   void mergeOptions(const Array& options);
   Array getOptions() const;
   static bool validateParams(const Variant& params);
@@ -241,6 +240,12 @@ Variant HHVM_FUNCTION(stream_socket_client,
                       double timeout = -1.0,
                       int flags = 0,
                       const Variant& context = null_variant);
+
+bool HHVM_FUNCTION(stream_socket_enable_crypto,
+                   const Resource& socket,
+                   bool enable,
+                   int cryptotype,
+                   const Variant& sessionstream);
 
 Variant HHVM_FUNCTION(stream_socket_get_name,
                       const Resource& handle,

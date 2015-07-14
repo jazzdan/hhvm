@@ -93,13 +93,20 @@ struct Variant : private TypedValue {
   /* implicit */ Variant(uint64_t  v) noexcept {
     m_type = KindOfInt64; m_data.num = v;
   }
-
   /* implicit */ Variant(double    v) noexcept {
     m_type = KindOfDouble; m_data.dbl = v;
   }
 
-  /* implicit */ Variant(const char* v);
-  /* implicit */ Variant(const std::string &v);
+  /* implicit */ Variant(const char* v) {
+    m_type = KindOfString;
+    m_data.pstr = StringData::Make(v);
+  }
+  /* implicit */ Variant(const std::string &v) {
+    m_type = KindOfString;
+    StringData *s = StringData::Make(v.c_str(), v.size(), CopyString);
+    assert(s);
+    m_data.pstr = s;
+  }
   /* implicit */ Variant(const StaticString &v) noexcept {
     m_type = KindOfStaticString;
     StringData *s = v.get();
@@ -107,34 +114,66 @@ struct Variant : private TypedValue {
     m_data.pstr = s;
   }
 
-  /* implicit */ Variant(const String& v) noexcept;
-  /* implicit */ Variant(const Array& v) noexcept;
-  /* implicit */ Variant(const Object& v) noexcept;
-  /* implicit */ Variant(const Resource& v) noexcept;
+  /* implicit */ Variant(const String& v) noexcept : Variant(v.get()) {}
+  /* implicit */ Variant(const Array& v) noexcept : Variant(v.get()) { }
+  /* implicit */ Variant(const Object& v) noexcept : Variant(v.get()) {}
+  /* implicit */ Variant(const Resource& v) noexcept
+  : Variant(deref<ResourceData>(v)) {}
   /* implicit */ Variant(StringData* v) noexcept;
-  /* implicit */ Variant(ArrayData* v) noexcept;
-  /* implicit */ Variant(ObjectData* v) noexcept;
-  /* implicit */ Variant(ResourceData* v) noexcept;
-  /* implicit */ Variant(RefData* r) noexcept;
+  /* implicit */ Variant(ArrayData* v) noexcept {
+    if (v) {
+      m_type = KindOfArray;
+      m_data.parr = v;
+      v->incRefCount();
+    } else {
+      m_type = KindOfNull;
+    }
+  }
+  /* implicit */ Variant(ObjectData* v) noexcept {
+    if (v) {
+      m_type = KindOfObject;
+      m_data.pobj = v;
+      v->incRefCount();
+    } else {
+      m_type = KindOfNull;
+    }
+  }
+  /* implicit */ Variant(RefData* r) noexcept {
+    if (r) {
+      m_type = KindOfRef;
+      m_data.pref = r;
+      r->incRefCount();
+    } else {
+      m_type = KindOfNull;
+    }
+  }
 
   template <typename T>
-  explicit Variant(const SmartPtr<T>& ptr) : Variant(ptr.get()) { }
+  explicit Variant(const req::ptr<T>& ptr) : Variant(ptr.get()) { }
   template <typename T>
-  explicit Variant(SmartPtr<T>&& ptr) noexcept
+  explicit Variant(req::ptr<T>&& ptr) noexcept
     : Variant(ptr.detach(), Attach{}) { }
 
   /*
-   * Creation constructor from ArrayInit that avoids a null check.
+   * Creation constructor from ArrayInit that avoids a null check and an
+   * inc-ref.
    */
   explicit Variant(ArrayData* ad, ArrayInitCtor) noexcept {
     m_type = KindOfArray;
     m_data.parr = ad;
-    ad->incRefCount();
   }
 
   // for static strings only
   enum class StaticStrInit {};
-  explicit Variant(const StringData *v, StaticStrInit) noexcept;
+  explicit Variant(const StringData *v, StaticStrInit) noexcept {
+    if (v) {
+      assert(v->isStatic());
+      m_data.pstr = const_cast<StringData*>(v);
+      m_type = KindOfStaticString;
+    } else {
+      m_type = KindOfNull;
+    }
+  }
 
   // These are prohibited, but declared just to prevent accidentally
   // calling the bool constructor just because we had a pointer to
@@ -238,11 +277,11 @@ struct Variant : private TypedValue {
 
   // Move ctor for resources
   /* implicit */ Variant(Resource&& v) noexcept {
-    ResourceData *pres = v.get();
+    ResourceData* pres = deref<ResourceData>(v);
     if (pres) {
       m_type = KindOfResource;
       m_data.pres = pres;
-      v.detach();
+      detach<ResourceData>(std::move(v));
     } else {
       m_type = KindOfNull;
     }
@@ -282,7 +321,7 @@ struct Variant : private TypedValue {
   //////////////////////////////////////////////////////////////////////
 
   /*
-   * During sweeping, smart resources are not allowed to be decref'd
+   * During sweeping, request-allocated things are not allowed to be decref'd
    * or manipulated.  This function is used to cause a Variant to go
    * into a state where its destructor will have no effects on the
    * request local heap, in cases where sweepable objects can't
@@ -315,6 +354,22 @@ struct Variant : private TypedValue {
    * strong reference to arr, we still keep the reference.
    */
   Variant& setWithRef(const Variant& v) noexcept;
+
+  static Variant attach(StringData* var) noexcept {
+    return Variant{var, Attach{}};
+  }
+  static Variant attach(ArrayData* var) noexcept {
+    return Variant{var, Attach{}};
+  }
+  static Variant attach(ObjectData* var) noexcept {
+    return Variant{var, Attach{}};
+  }
+  static Variant attach(ResourceData* var) noexcept {
+    return Variant{var, Attach{}};
+  }
+  static Variant attach(RefData* var) noexcept {
+    return Variant{var, Attach{}};
+  }
 
 ///////////////////////////////////////////////////////////////////////////////
 // int64
@@ -560,13 +615,17 @@ struct Variant : private TypedValue {
   Variant &assign(const Variant& v) noexcept;
   Variant &assignRef(Variant& v) noexcept;
 
-  Variant &operator=(const StaticString &v) {
-    set(v);
-    return *this;
-  }
-
-  template<typename T> Variant &operator=(const T &v) {
-    set(v);
+  // Generic assignment operator. Forward argument (preserving rvalue-ness and
+  // lvalue-ness) to the appropriate set function, as long as its not a Variant.
+  template <typename T>
+  typename std::enable_if<
+    !std::is_same<Variant,
+                 typename std::remove_reference<
+                   typename std::remove_cv<T>::type
+                   >::type
+                 >::value, Variant&>::type
+  operator=(T&& v) {
+    set(std::forward<T>(v));
     return *this;
   }
 
@@ -776,10 +835,6 @@ struct Variant : private TypedValue {
         m_data.pref->var()->m_data.pobj) :
       (m_type <= KindOfNull ? nullptr : m_data.pobj);
   }
-  ResourceData* getResourceData() const {
-    assert(is(KindOfResource));
-    return m_type == KindOfRef ? m_data.pref->var()->m_data.pres : m_data.pres;
-  }
   Variant *getRefData() const {
     assert(m_type == KindOfRef);
     return m_data.pref->var();
@@ -823,6 +878,11 @@ struct Variant : private TypedValue {
   Ref* asRef() { PromoteToRef(*this); return this; }
 
  private:
+  ResourceData* getResourceData() const {
+    assert(is(KindOfResource));
+    return m_type == KindOfRef ? m_data.pref->var()->m_data.pres : m_data.pres;
+  }
+
   ResourceData* detachResourceData() {
     assert(is(KindOfResource));
     if (LIKELY(m_type == KindOfResource)) {
@@ -869,16 +929,61 @@ struct Variant : private TypedValue {
     ObjectData*
   >::type detach(Variant&& v) { return v.detachObjectData(); }
 
+  explicit Variant(ResourceData* v) noexcept {
+    if (v) {
+      m_type = KindOfResource;
+      m_data.pres = v;
+      v->incRefCount();
+    } else {
+      m_type = KindOfNull;
+    }
+  }
+
   /*
    * This set of constructors act like the normal constructors for the
    * given types except that they do not increment the reference count
-   * of the passed value.  They are used for the SmartPtr move constructor.
+   * of the passed value.  They are used for the req::ptr move constructor.
    */
-  Variant(StringData* var, Attach) noexcept;
-  Variant(ArrayData* var, Attach) noexcept;
-  Variant(ObjectData* var, Attach) noexcept;
-  Variant(ResourceData* var, Attach) noexcept;
-  Variant(RefData* var, Attach) noexcept;
+  Variant(StringData* var, Attach) noexcept {
+    if (var) {
+      m_type = var->isStatic() ? KindOfStaticString : KindOfString;
+      m_data.pstr = var;
+    } else {
+      m_type = KindOfNull;
+    }
+  }
+  Variant(ArrayData* var, Attach) noexcept {
+    if (var) {
+      m_type = KindOfArray;
+      m_data.parr = var;
+    } else {
+      m_type = KindOfNull;
+    }
+  }
+  Variant(ObjectData* var, Attach) noexcept {
+    if (var) {
+      m_type = KindOfObject;
+      m_data.pobj = var;
+    } else {
+      m_type = KindOfNull;
+    }
+  }
+  Variant(ResourceData* var, Attach) noexcept {
+    if (var) {
+      m_type = KindOfResource;
+      m_data.pres = var;
+    } else {
+      m_type = KindOfNull;
+    }
+  }
+  Variant(RefData* var, Attach) noexcept {
+    if (var) {
+      m_type = KindOfRef;
+      m_data.pref = var;
+    } else {
+      m_type = KindOfNull;
+    }
+  }
 
   bool isPrimitive() const { return !IS_REFCOUNTED_TYPE(m_type); }
   bool isObjectConvertable() {
@@ -905,16 +1010,31 @@ struct Variant : private TypedValue {
   void set(const ObjectData  *v) = delete;
   void set(const ResourceData  *v) = delete;
 
-  void set(const String& v) { return set(v.get()); }
+  void set(const String& v) noexcept { return set(v.get()); }
   void set(const StaticString & v) noexcept;
-  void set(const Array& v) { return set(v.get()); }
-  void set(const Object& v) { return set(v.get()); }
-  void set(const Resource& v) { return set(v.get()); }
+  void set(const Array& v) noexcept { return set(v.get()); }
+  void set(const Object& v) noexcept { return set(v.get()); }
+  void set(const Resource& v) noexcept { set(deref<ResourceData>(v)); }
+
+  void set(String&& v) noexcept { return steal(v.detach()); }
+  void set(Array&& v) noexcept { return steal(v.detach()); }
+  void set(Object&& v) noexcept { return steal(v.detach()); }
+  void set(Resource&& v) noexcept { steal(detach<ResourceData>(std::move(v))); }
 
   template<typename T>
-  void set(const SmartPtr<T> &v) {
+  void set(const req::ptr<T> &v) noexcept {
     return set(v.get());
   }
+
+  template <typename T>
+  void set(req::ptr<T>&& v) noexcept {
+    return steal(v.detach());
+  }
+
+  void steal(StringData* v) noexcept;
+  void steal(ArrayData* v) noexcept;
+  void steal(ObjectData* v) noexcept;
+  void steal(ResourceData* v) noexcept;
 
   static ALWAYS_INLINE
   void AssignValHelper(Variant *self, const Variant *other) {
@@ -1136,7 +1256,9 @@ public:
     m_data.pstr = const_cast<StringData*>(v);
   }
   explicit VarNR(ArrayData *v);
+  explicit VarNR(const ArrayData*) = delete;
   explicit VarNR(ObjectData *v);
+  explicit VarNR(const ObjectData*) = delete;
 
   VarNR(const VarNR &v) : TypedValueAux(v) {}
 
@@ -1277,12 +1399,12 @@ ALWAYS_INLINE Variant empty_string_variant() {
 }
 
 template <typename T>
-inline Variant toVariant(const SmartPtr<T>& p) {
+inline Variant toVariant(const req::ptr<T>& p) {
   return p ? Variant(p) : Variant(false);
 }
 
 template <typename T>
-inline Variant toVariant(SmartPtr<T>&& p) {
+inline Variant toVariant(req::ptr<T>&& p) {
   return p ? Variant(std::move(p)) : Variant(false);
 }
 
@@ -1294,26 +1416,6 @@ inline bool is_null(const Variant& v) {
 template <typename T>
 inline bool isa_non_null(const Variant& v) {
   return v.isa<T>();
-}
-
-template <typename T>
-typename std::enable_if<
-  std::is_base_of<ResourceData,T>::value,
-  const char*
->::type getClassNameCstr(const Variant& v) {
-  if(v.isResource()) {
-    return getClassNameCstr(v.toCResRef().get());
-  }
-  return tname(v.getType()).c_str();
-}
-
-template <typename T>
-typename std::enable_if<std::is_base_of<ObjectData,T>::value,const char*>::type
-getClassNameCstr(const Variant& v) {
-  if(v.isObject()) {
-    return getClassNameCstr(v.toCObjRef().get());
-  }
-  return tname(v.getType()).c_str();
 }
 
 //////////////////////////////////////////////////////////////////////

@@ -13,9 +13,9 @@ if (FOLLY_IFUNC)
 endif()
 
 if (LINUX OR FREEBSD)
-  set(CMAKE_REQUIRED_LIBRARIES rt pthread)
+  set(CMAKE_REQUIRED_LIBRARIES rt ${LIBPTHREAD_LIBRARIES})
 else()
-  set(CMAKE_REQUIRED_LIBRARIES pthread)
+  set(CMAKE_REQUIRED_LIBRARIES ${LIBPTHREAD_LIBRARIES})
 endif()
 
 include(CheckFunctionExists)
@@ -43,4 +43,8 @@ endif()
 if(CYGWIN)
 # cygwin has c99 issues with cxx compiler and headers
   add_definitions("-D_GLIBCXX_USE_C99_DYNAMIC")
+endif()
+
+if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
+  add_definitions("-DFOLLY_USE_LIBCPP=1")
 endif()

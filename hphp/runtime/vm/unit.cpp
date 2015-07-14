@@ -521,7 +521,7 @@ void Unit::loadFunc(const Func *func) {
     Debug::DebugInfo::recordDataMap(
       (char*)(intptr_t)ne->m_cachedFunc.handle(),
       (char*)(intptr_t)ne->m_cachedFunc.handle() + sizeof(void*),
-      folly::format("rds+Func-{}", func->name()->data()).str());
+      folly::format("rds+Func-{}", func->name()).str());
   }
 }
 
@@ -674,31 +674,20 @@ Class* Unit::defClass(const PreClass* preClass,
     newClass->setClassHandle(nameList->m_cachedClass);
     newClass.get()->incAtomicCount();
 
-    if (InstanceBits::initFlag.load(std::memory_order_acquire)) {
-      // If the instance bitmap has already been set up, we can just
-      // initialize our new class's bits and add ourselves to the class
-      // list normally.
-      newClass->setInstanceBits();
-      nameList->pushClass(newClass.get());
-    } else {
-      // Otherwise, we have to grab the read lock. If the map has been
-      // initialized since we checked, initialize the bits normally. If not,
-      // we must add the new class to the class list before dropping the lock
-      // to ensure its bits are initialized when the time comes.
-      ReadLock l(InstanceBits::lock);
-      if (InstanceBits::initFlag.load(std::memory_order_acquire)) {
-        newClass->setInstanceBits();
-      }
-      nameList->pushClass(newClass.get());
-    }
+    InstanceBits::ifInitElse(
+      [&] { newClass->setInstanceBits();
+            nameList->pushClass(newClass.get()); },
+      [&] { nameList->pushClass(newClass.get()); }
+    );
+
     if (RuntimeOption::EvalPerfDataMap) {
       Debug::DebugInfo::recordDataMap(
         newClass.get(), newClass.get() + 1,
-        folly::format("Class-{}", preClass->name()->data()).str());
+        folly::format("Class-{}", preClass->name()).str());
       Debug::DebugInfo::recordDataMap(
         (char*)(intptr_t)nameList->m_cachedClass.handle(),
         (char*)(intptr_t)nameList->m_cachedClass.handle() + sizeof(void*),
-        folly::format("rds+Class-{}", preClass->name()->data()).str());
+        folly::format("rds+Class-{}", preClass->name()).str());
     }
     /*
      * call setCached after adding to the class list, otherwise the
@@ -1038,7 +1027,7 @@ void Unit::initialMerge() {
 
   if (RuntimeOption::EvalPerfDataMap) {
     Debug::DebugInfo::recordDataMap(
-      this, this + 1, folly::format("Unit-{}", m_filepath->data()).str());
+      this, this + 1, folly::format("Unit-{}", m_filepath.get()).str());
   }
   int state = 0;
   bool needsCompact = false;
@@ -1750,50 +1739,6 @@ bool Unit::parseFatal(const StringData*& msg, int& line) const {
 
   auto kind_char = *pc;
   return kind_char == static_cast<uint8_t>(FatalOp::Parse);
-}
-
-
-///////////////////////////////////////////////////////////////////////////////
-
-AllClasses::AllClasses()
-  : m_next(NamedEntity::table()->begin())
-  , m_end(NamedEntity::table()->end())
-  , m_current(m_next != m_end ? m_next->second.clsList() : nullptr) {
-  if (!empty()) skip();
-}
-
-void AllClasses::skip() {
-  if (!m_current) {
-    assert(!empty());
-    ++m_next;
-    while (!empty()) {
-      m_current = m_next->second.clsList();
-      if (m_current) break;
-      ++m_next;
-    }
-  }
-  assert(empty() || front());
-}
-
-void AllClasses::next() {
-  m_current = m_current->m_nextClass;
-  skip();
-}
-
-bool AllClasses::empty() const {
-  return m_next == m_end;
-}
-
-Class* AllClasses::front() const {
-  assert(!empty());
-  assert(m_current);
-  return m_current;
-}
-
-Class* AllClasses::popFront() {
-  Class* cls = front();
-  next();
-  return cls;
 }
 
 ///////////////////////////////////////////////////////////////////////////////

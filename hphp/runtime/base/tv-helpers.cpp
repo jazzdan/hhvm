@@ -375,7 +375,6 @@ void tvCastToStringInPlace(TypedValue* tv) {
     not_reached();
   } while (0);
 
-  s->incRefCount();
   tv->m_data.pstr = s;
   tv->m_type = KindOfString;
   return;
@@ -391,51 +390,44 @@ StringData* tvCastToString(const TypedValue* tv) {
     tv = tv->m_data.pref->tv();
   }
 
-  StringData* s;
+  switch (tv->m_type) {
+    case KindOfUninit:
+    case KindOfNull:
+      return staticEmptyString();
 
-  do {
-    switch (tv->m_type) {
-      case KindOfUninit:
-      case KindOfNull:
-        return staticEmptyString();
+    case KindOfBoolean:
+      return tv->m_data.num ? s_1.get() : staticEmptyString();
 
-      case KindOfBoolean:
-        return tv->m_data.num ? s_1.get() : staticEmptyString();
+    case KindOfInt64:
+      return buildStringData(tv->m_data.num);
 
-      case KindOfInt64:
-        s = buildStringData(tv->m_data.num);
-        continue;
+    case KindOfDouble:
+      return buildStringData(tv->m_data.dbl);
 
-      case KindOfDouble:
-        s = buildStringData(tv->m_data.dbl);
-        continue;
+    case KindOfStaticString:
+      return tv->m_data.pstr;
 
-      case KindOfStaticString:
-        return tv->m_data.pstr;
-
-      case KindOfString:
-        s = tv->m_data.pstr;
-        continue;
-
-      case KindOfArray:
-        raise_notice("Array to string conversion");
-        return array_string.get();
-
-      case KindOfObject:
-        return tv->m_data.pobj->invokeToString().detach();
-
-      case KindOfResource:
-        return tv->m_data.pres->o_toString().detach();
-
-      case KindOfRef:
-      case KindOfClass:
-        break;
+    case KindOfString: {
+      auto s = tv->m_data.pstr;
+      s->incRefCount();
+      return s;
     }
-    not_reached();
-  } while (0);
 
-  s->incRefCount();
-  return s;
+    case KindOfArray:
+      raise_notice("Array to string conversion");
+      return array_string.get();
+
+    case KindOfObject:
+      return tv->m_data.pobj->invokeToString().detach();
+
+    case KindOfResource:
+      return tv->m_data.pres->o_toString().detach();
+
+    case KindOfRef:
+    case KindOfClass:
+      not_reached();
+  }
+  not_reached();
 }
 
 void tvCastToArrayInPlace(TypedValue* tv) {
@@ -482,9 +474,10 @@ void tvCastToArrayInPlace(TypedValue* tv) {
     not_reached();
   } while (0);
 
+  assert(a->isStatic() || a->hasExactlyOneRef());
+
   tv->m_data.parr = a;
   tv->m_type = KindOfArray;
-  tv->m_data.parr->incRefCount();
 }
 
 void tvCastToObjectInPlace(TypedValue* tv) {
@@ -496,7 +489,7 @@ void tvCastToObjectInPlace(TypedValue* tv) {
     switch (tv->m_type) {
       case KindOfUninit:
       case KindOfNull:
-        o = SystemLib::AllocStdClassObject();
+        o = SystemLib::AllocStdClassObject().detach();
         continue;
 
       case KindOfBoolean:
@@ -504,12 +497,12 @@ void tvCastToObjectInPlace(TypedValue* tv) {
       case KindOfDouble:
       case KindOfStaticString:
       case KindOfResource:
-        o = SystemLib::AllocStdClassObject();
+        o = SystemLib::AllocStdClassObject().detach();
         o->o_set(s_scalar, tvAsVariant(tv));
         continue;
 
       case KindOfString:
-        o = SystemLib::AllocStdClassObject();
+        o = SystemLib::AllocStdClassObject().detach();
         o->o_set(s_scalar, tvAsVariant(tv));
         tvDecRefStr(tv);
         continue;
@@ -531,7 +524,6 @@ void tvCastToObjectInPlace(TypedValue* tv) {
 
   tv->m_data.pobj = o;
   tv->m_type = KindOfObject;
-  tv->m_data.pobj->incRefCount();
 }
 
 void tvCastToNullableObjectInPlace(TypedValue* tv) {
@@ -573,7 +565,6 @@ void tvCastToResourceInPlace(TypedValue* tv) {
 
   tv->m_type = KindOfResource;
   tv->m_data.pres = newres<DummyResource>();
-  tv->m_data.pres->incRefCount();
 }
 
 bool tvCoerceParamToBooleanInPlace(TypedValue* tv) {
@@ -695,12 +686,13 @@ bool tvCoerceParamToArrayInPlace(TypedValue* tv) {
       return true;
 
     case KindOfObject:
-      tvAsVariant(tv) = tv->m_data.pobj->toArray();
-      return true;
-
+      if (LIKELY(tv->m_data.pobj->isCollection())) {
+        tvAsVariant(tv) = tv->m_data.pobj->toArray();
+        return true;
+      }
+      return false;
     case KindOfResource:
-      tvAsVariant(tv) = tv->m_data.pres->o_toArray();
-      return true;
+      return false;
 
     case KindOfRef:
     case KindOfClass:
@@ -764,7 +756,7 @@ TVCoercionException::TVCoercionException(const Func* func,
         folly::format("Unable to coerce param {} to {}() "
                       "from {} to {}",
                       arg_num,
-                      func->name()->data(),
+                      func->name(),
                       actual,
                       expected).str())
 {

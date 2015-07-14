@@ -35,7 +35,7 @@ public:
   virtual ~ZipFile();
 
   // overriding ResourceData
-  const String& o_getClassNameHook() const { return classnameof(); }
+  const String& o_getClassNameHook() const override { return classnameof(); }
 
   bool open(const String& filename, const String& mode) override;
   bool close() override;
@@ -63,8 +63,8 @@ public:
 
 private:
   gzFile m_gzFile;
-  SmartPtr<File> m_innerFile;
-  SmartPtr<File> m_tempFile;
+  req::ptr<File> m_innerFile;
+  req::ptr<File> m_tempFile;
 
   bool closeImpl();
 };

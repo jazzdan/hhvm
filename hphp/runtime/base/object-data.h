@@ -21,7 +21,7 @@
 #include "hphp/runtime/base/memory-manager.h"
 #include "hphp/runtime/base/types.h"
 #include "hphp/runtime/base/classname-is.h"
-#include "hphp/runtime/base/smart-ptr.h"
+#include "hphp/runtime/base/req-ptr.h"
 
 #include "hphp/runtime/vm/class.h"
 #include "hphp/runtime/vm/hhbc.h"
@@ -98,6 +98,7 @@ struct ObjectData {
   static void resetMaxId();
 
   explicit ObjectData(Class*);
+  explicit ObjectData(Class*, uint16_t flags, HeaderKind = HeaderKind::Object);
   ~ObjectData();
 
   // Disallow copy construction and assignemt
@@ -105,12 +106,13 @@ struct ObjectData {
   ObjectData& operator=(const ObjectData&) = delete;
 
  protected:
-  explicit ObjectData(Class*, uint16_t flags, HeaderKind = HeaderKind::Object);
-
- private:
   enum class NoInit {};
 
-  explicit ObjectData(Class*, NoInit);
+  explicit ObjectData(Class*, NoInit) noexcept;
+  explicit ObjectData(Class* cls,
+                      uint16_t flags,
+                      HeaderKind kind,
+                      NoInit) noexcept;
 
  public:
   void setStatic() const;
@@ -125,29 +127,31 @@ struct ObjectData {
 
  public:
 
-  // Call newInstance() to instantiate a PHP object
+  // Call newInstance() to instantiate a PHP object. The initial ref-count will
+  // be greater than zero. Since this gives you a raw pointer, it is your
+  // responsibility to manage the ref-count yourself. Whenever possible, prefer
+  // using the Object class instead, which takes care of this for you.
   static ObjectData* newInstance(Class*);
 
   /*
-   * Given a Class that is assumed to be a concrete, regular (not a
-   * trait or interface), pure PHP class, and an allocation size,
-   * return a new, uninitialized object of that class.
+   * Given a Class that is assumed to be a concrete, regular (not a trait or
+   * interface), pure PHP class, and an allocation size, return a new,
+   * uninitialized object of that class. These are meant to be called from the
+   * JIT.
    *
-   * newInstanceRaw should be called only when size <= kMaxSmartSize,
+   * newInstanceRaw should be called only when size <= kMaxSmallSize,
    * otherwise use newInstanceRawBig.
+   *
+   * The initial ref-count will be set to one.
    */
   static ObjectData* newInstanceRaw(Class*, uint32_t);
   static ObjectData* newInstanceRawBig(Class*, size_t);
 
- private:
-  void instanceInit(Class*);
-
- public:
-  static void DeleteObject(ObjectData*);
-
   void release() noexcept;
+  void releaseNoObjDestructCheck() noexcept;
 
   Class* getVMClass() const;
+  void setVMClass(Class* cls);
   StrNR getClassName() const;
   int getId() const;
 
@@ -177,6 +181,7 @@ struct ObjectData {
   CollectionType collectionType() const; // asserts(isCollection())
 
   bool getAttribute(Attribute) const;
+  uint16_t getAttributes() const;
   void setAttribute(Attribute);
 
   bool noDestruct() const;
@@ -195,15 +200,6 @@ struct ObjectData {
   Array toArray(bool pubOnly = false) const;
 
   /*
-   * Call this object's destructor, if it has one. The object's refcount must
-   * be be 0 or 1 on entry to this function.
-   *
-   * Returns true iff the object should be deleted (meaning it wasn't
-   * resurrected in the destructor).
-   */
-  bool destruct();
-
-  /*
    * Call this object's destructor, if it has one. No restrictions are placed
    * on the object's refcount, since this is used on objects still alive at
    * request shutdown.
@@ -211,13 +207,27 @@ struct ObjectData {
   void destructForExit();
 
  private:
-  template<bool forExit> bool destructImpl();
+  void instanceInit(Class*);
+  bool destructImpl();
+  Variant* realPropImpl(const String& s, int flags, const String& context,
+                        bool copyDynArray);
  public:
 
-  Array o_toIterArray(const String& context, bool getRef = false);
+  enum IterMode { EraseRefs, CreateRefs, PreserveRefs };
+  /*
+   * Create an array of object properties suitable for iteration.
+   *
+   * EraseRefs    - array should contain unboxed properties
+   * CreateRefs   - array should contain boxed properties
+   * PreserveRefs - reffiness of properties should be preserved in returned
+   *                array
+   */
+  Array o_toIterArray(const String& context, IterMode mode);
 
   Variant* o_realProp(const String& s, int flags,
                       const String& context = null_string);
+  const Variant* o_realProp(const String& s, int flags,
+                            const String& context = null_string) const;
 
   Variant o_get(const String& s, bool error = true,
                 const String& context = null_string);
@@ -313,6 +323,9 @@ struct ObjectData {
 
   PropLookup<TypedValue*> getProp(const Class*, const StringData*);
   PropLookup<const TypedValue*> getProp(const Class*, const StringData*) const;
+
+  PropLookup<TypedValue*> getPropImpl(const Class*, const StringData*,
+                                      bool copyDynArray);
 
  private:
   template <bool warn, bool define>
@@ -418,11 +431,11 @@ private:
 
 private:
 #ifdef USE_LOWPTR
-  LowClassPtr m_cls;
+  LowPtr<Class> m_cls;
   int o_id; // Numeric identifier of this object (used for var_dump())
   HeaderWord<uint16_t> m_hdr; // m_hdr.aux stores Attributes
 #else
-  LowClassPtr m_cls;
+  LowPtr<Class> m_cls;
   HeaderWord<uint16_t> m_hdr; // m_hdr.aux stores Attributes
   int o_id; // Numeric identifier of this object (used for var_dump())
 #endif
@@ -466,21 +479,18 @@ struct ExtObjectDataFlags : ObjectData {
   }
 
 protected:
+  explicit ExtObjectDataFlags(HPHP::Class* cb,
+                              HeaderKind kind,
+                              NoInit ni) noexcept
+  : ObjectData(cb, Flags | ObjectData::IsCppBuiltin, kind, ni)
+  {
+    assert(!getVMClass()->callsCustomInstanceInit());
+  }
+
   ~ExtObjectDataFlags() {}
 };
 
 using ExtObjectData = ExtObjectDataFlags<ObjectData::IsCppBuiltin>;
-
-template<class T, class... Args> T* newobj(Args&&... args) {
-  static_assert(std::is_convertible<T*,ObjectData*>::value, "");
-  auto const mem = MM().smartMallocSize(sizeof(T));
-  try {
-    return new (mem) T(std::forward<Args>(args)...);
-  } catch (...) {
-    MM().smartFreeSize(mem, sizeof(T));
-    throw;
-  }
-}
 
 #define DECLARE_CLASS_NO_SWEEP(originalName)                           \
   public:                                                              \
@@ -488,22 +498,32 @@ template<class T, class... Args> T* newobj(Args&&... args) {
   template <typename F> friend void scan(const c_##originalName&, F&); \
   friend ObjectData* new_##originalName##_Instance(Class*);            \
   friend void delete_##originalName(ObjectData*, const Class*);        \
-  static inline HPHP::LowClassPtr& classof() {                         \
-    static HPHP::LowClassPtr result;                                   \
-    return result;                                                     \
+  static HPHP::LowPtr<Class> s_classOf;                                  \
+  static inline HPHP::LowPtr<Class>& classof() {                         \
+    return s_classOf;                                                  \
   }
 
-#define IMPLEMENT_CLASS_NO_SWEEP(cls)
+#define IMPLEMENT_CLASS_NO_SWEEP(cls)                                  \
+  HPHP::LowPtr<Class> c_##cls::s_classOf;
+
+namespace req {
 
 template<class T, class... Args>
 typename std::enable_if<
   std::is_convertible<T*, ObjectData*>::value,
-  SmartPtr<T>
->::type makeSmartPtr(Args&&... args) {
-  using UnownedAndNonNull = typename SmartPtr<T>::UnownedAndNonNull;
-  return SmartPtr<T>(newobj<T>(std::forward<Args>(args)...),
-                     UnownedAndNonNull{});
+  req::ptr<T>
+>::type make(Args&&... args) {
+  auto const mem = MM().mallocSmallSize(sizeof(T));
+  try {
+    auto t = new (mem) T(std::forward<Args>(args)...);
+    assert(t->hasExactlyOneRef());
+    return req::ptr<T>::attach(t);
+  } catch (...) {
+    MM().freeSmallSize(mem, sizeof(T));
+    throw;
+  }
 }
+} // namespace req
 
 ///////////////////////////////////////////////////////////////////////////////
 }

@@ -20,6 +20,7 @@
 #include "hphp/runtime/vm/jit/abi-arm.h"
 #include "hphp/runtime/vm/jit/arg-group.h"
 #include "hphp/runtime/vm/jit/back-end-arm.h"
+#include "hphp/runtime/vm/jit/code-gen-cf.h"
 #include "hphp/runtime/vm/jit/code-gen-helpers-arm.h"
 #include "hphp/runtime/vm/jit/native-calls.h"
 #include "hphp/runtime/vm/jit/punt.h"
@@ -34,8 +35,8 @@
 #include "hphp/runtime/vm/jit/vasm-instr.h"
 #include "hphp/runtime/vm/jit/vasm-reg.h"
 
-#include "hphp/runtime/ext/ext_collections.h"
-#include "hphp/runtime/ext/ext_generator.h"
+#include "hphp/runtime/ext/collections/ext_collections-idl.h"
+#include "hphp/runtime/ext/generator/ext_generator.h"
 
 #include <folly/Optional.h>
 
@@ -53,13 +54,12 @@ NOOP_OPCODE(DefConst)
 NOOP_OPCODE(DefFP)
 NOOP_OPCODE(AssertLoc)
 NOOP_OPCODE(Nop)
+NOOP_OPCODE(ExitPlaceholder)
 NOOP_OPCODE(DefLabel)
 NOOP_OPCODE(EndGuards)
 NOOP_OPCODE(HintLocInner)
 NOOP_OPCODE(HintStkInner)
 NOOP_OPCODE(DbgTraceCall)
-NOOP_OPCODE(PredictLoc);
-NOOP_OPCODE(PredictStk);
 
 // When implemented this shouldn't be a nop, but there's no reason to make us
 // punt on everything until then.
@@ -124,6 +124,7 @@ CALL_OPCODE(ConcatStr4);
 
 CALL_OPCODE(CreateCont)
 CALL_OPCODE(CreateAFWH)
+CALL_OPCODE(CreateAFWHNoVV)
 CALL_OPCODE(CreateSSWH)
 CALL_OPCODE(AFWHPrepareChild)
 CALL_OPCODE(ABCUnblock)
@@ -155,6 +156,7 @@ CALL_OPCODE(VerifyRetCallable)
 CALL_OPCODE(VerifyRetFail)
 CALL_OPCODE(RaiseUninitLoc)
 CALL_OPCODE(RaiseUndefProp)
+CALL_OPCODE(RaiseMissingArg)
 CALL_OPCODE(RaiseError)
 CALL_OPCODE(RaiseWarning)
 CALL_OPCODE(RaiseNotice)
@@ -179,6 +181,7 @@ CALL_OPCODE(SetNewElemArray)
 CALL_OPCODE(BindNewElem)
 CALL_OPCODE(VectorIsset)
 CALL_OPCODE(PairIsset)
+CALL_OPCODE(ThrowOutOfBounds)
 
 CALL_OPCODE(InstanceOfIface)
 CALL_OPCODE(InterfaceSupportsArr)
@@ -213,6 +216,8 @@ DELEGATE_OPCODE(CheckNonNull)
 DELEGATE_OPCODE(AssertNonNull)
 DELEGATE_OPCODE(AssertStk)
 DELEGATE_OPCODE(AssertType)
+DELEGATE_OPCODE(LdARFuncPtr)
+DELEGATE_OPCODE(LdARNumParams)
 
 DELEGATE_OPCODE(CheckStk)
 DELEGATE_OPCODE(CheckType)
@@ -255,6 +260,7 @@ void cgPunt(const char* file, int line, const char* func, uint32_t bcOff,
 
 //////////////////////////////////////////////////////////////////////
 PUNT_OPCODE(ArrayIdx)
+PUNT_OPCODE(MapIdx)
 PUNT_OPCODE(CountArray)
 PUNT_OPCODE(LdColArray)
 
@@ -277,10 +283,13 @@ PUNT_OPCODE(ConvBoolToStr)
 
 PUNT_OPCODE(ProfilePackedArray)
 PUNT_OPCODE(ProfileStructArray)
+PUNT_OPCODE(ProfileObjClass)
 PUNT_OPCODE(CheckTypeMem)
 PUNT_OPCODE(CheckLoc)
 PUNT_OPCODE(CastStk)
+PUNT_OPCODE(CastMem)
 PUNT_OPCODE(CoerceStk)
+PUNT_OPCODE(CoerceMem)
 PUNT_OPCODE(UnwindCheckSideExit)
 PUNT_OPCODE(LdUnwinderValue)
 PUNT_OPCODE(AddDbl)
@@ -309,6 +318,14 @@ PUNT_OPCODE(LtDbl)
 PUNT_OPCODE(LteDbl)
 PUNT_OPCODE(EqDbl)
 PUNT_OPCODE(NeqDbl)
+PUNT_OPCODE(GtStr)
+PUNT_OPCODE(GteStr)
+PUNT_OPCODE(LtStr)
+PUNT_OPCODE(LteStr)
+PUNT_OPCODE(EqStr)
+PUNT_OPCODE(NeqStr)
+PUNT_OPCODE(SameStr)
+PUNT_OPCODE(NSameStr)
 PUNT_OPCODE(LtX)
 PUNT_OPCODE(GtX)
 PUNT_OPCODE(GteX)
@@ -328,11 +345,11 @@ PUNT_OPCODE(JmpZero)
 PUNT_OPCODE(JmpNZero)
 PUNT_OPCODE(JmpSSwitchDest)
 PUNT_OPCODE(CheckSurpriseFlags)
-PUNT_OPCODE(ReleaseVVOrExit)
+PUNT_OPCODE(ReleaseVVAndSkip)
 PUNT_OPCODE(CheckInit)
 PUNT_OPCODE(CheckInitMem)
 PUNT_OPCODE(CheckCold)
-PUNT_OPCODE(CheckBounds)
+PUNT_OPCODE(CheckRange)
 PUNT_OPCODE(LdVectorSize)
 PUNT_OPCODE(CheckPackedArrayBounds)
 PUNT_OPCODE(VectorHasImmCopy)
@@ -350,12 +367,12 @@ PUNT_OPCODE(CheckRefInner)
 PUNT_OPCODE(LdStructArrayElem)
 PUNT_OPCODE(LdRef)
 PUNT_OPCODE(LdLocPseudoMain)
-PUNT_OPCODE(LdRetAddr)
 PUNT_OPCODE(ConvClsToCctx)
 PUNT_OPCODE(CheckCtxThis)
 PUNT_OPCODE(CastCtxThis)
 PUNT_OPCODE(LdCtx)
 PUNT_OPCODE(LdCctx)
+PUNT_OPCODE(LdClosure)
 PUNT_OPCODE(LdCls)
 PUNT_OPCODE(LdClsCached)
 PUNT_OPCODE(LdClsCachedSafe)
@@ -377,6 +394,8 @@ PUNT_OPCODE(LookupClsMethodFCache)
 PUNT_OPCODE(GetCtxFwdCallDyn);
 PUNT_OPCODE(GetCtxFwdCall)
 PUNT_OPCODE(LdClsMethod)
+PUNT_OPCODE(LdIfaceMethod)
+PUNT_OPCODE(InstanceOfIfaceVtable)
 PUNT_OPCODE(LdPropAddr)
 PUNT_OPCODE(LdObjMethod)
 PUNT_OPCODE(LdObjInvoke)
@@ -394,9 +413,9 @@ PUNT_OPCODE(CheckInitProps)
 PUNT_OPCODE(CheckInitSProps)
 PUNT_OPCODE(NewInstanceRaw)
 PUNT_OPCODE(InitObjProps)
-PUNT_OPCODE(StClosureFunc)
-PUNT_OPCODE(StClosureArg)
+PUNT_OPCODE(LdClosureCtx)
 PUNT_OPCODE(StClosureCtx)
+PUNT_OPCODE(StClosureArg)
 PUNT_OPCODE(NewStructArray)
 PUNT_OPCODE(FreeActRec)
 PUNT_OPCODE(CallArray)
@@ -404,6 +423,7 @@ PUNT_OPCODE(NativeImpl)
 PUNT_OPCODE(RetCtrl)
 PUNT_OPCODE(AsyncRetCtrl)
 PUNT_OPCODE(StRetVal)
+PUNT_OPCODE(StLocRange)
 PUNT_OPCODE(StMem)
 PUNT_OPCODE(StRef)
 PUNT_OPCODE(StElem)
@@ -512,22 +532,22 @@ PUNT_OPCODE(LdContResumeAddr)
 PUNT_OPCODE(ContArIncIdx)
 PUNT_OPCODE(StContArState)
 PUNT_OPCODE(OrdStr)
+PUNT_OPCODE(EnterFrame)
+PUNT_OPCODE(CheckStackOverflow)
+PUNT_OPCODE(InitExtraArgs)
+PUNT_OPCODE(InitCtx)
+PUNT_OPCODE(CheckSurpriseFlagsEnter)
+PUNT_OPCODE(CheckARMagicFlag)
+PUNT_OPCODE(StARNumArgsAndFlags)
+PUNT_OPCODE(LdARInvName)
+PUNT_OPCODE(StARInvName)
+PUNT_OPCODE(PackMagicArgs)
+PUNT_OPCODE(ProfileSwitchDest)
+PUNT_OPCODE(CheckSurpriseAndStack)
 
 #undef PUNT_OPCODE
 
 //////////////////////////////////////////////////////////////////////
-
-// copy of ifThen in mc-generator-internal.h
-template <class Then>
-void ifThen(Vout& v, ConditionCode cc, Vreg sf, Then thenBlock) {
-  auto then = v.makeBlock();
-  auto done = v.makeBlock();
-  v << jcc{cc, sf, {done, then}};
-  v = then;
-  thenBlock(v);
-  if (!v.closed()) v << jmp{done};
-  v = done;
-}
 
 template <class Then>
 void ifZero(Vout& v, unsigned bit, Vreg r, Then thenBlock) {
@@ -556,23 +576,6 @@ Vreg condZero(Vout& v, Vreg r, Vreg dst, T t, F f) {
   v = done;
   v << phidef{v.makeTuple(VregList{dst})};
   return dst;
-}
-
-// copy of ifThenElse from code-gen-x64.cpp
-template <class Then, class Else>
-void ifThenElse(Vout& v, ConditionCode cc, Vreg sf, Then thenBlock,
-                Else elseBlock) {
-  auto thenLabel = v.makeBlock();
-  auto elseLabel = v.makeBlock();
-  auto done = v.makeBlock();
-  v << jcc{cc, sf, {elseLabel, thenLabel}};
-  v = thenLabel;
-  thenBlock(v);
-  if (!v.closed()) v << jmp{done};
-  v = elseLabel;
-  elseBlock(v);
-  if (!v.closed()) v << jmp{done};
-  v = done;
 }
 
 Vloc CodeGenerator::srcLoc(unsigned i) const {
@@ -1034,7 +1037,7 @@ void CodeGenerator::cgCallBuiltin(IRInstruction* inst) {
 
   auto callArgs = argGroup();
   if (isBuiltinByRef(funcReturnType)) {
-    if (isSmartPtrRef(funcReturnType)) {
+    if (isReqPtrRef(funcReturnType)) {
       // first arg is pointer to storage for the return value
       returnOffset += TVOFF(m_data);
     }
@@ -1048,7 +1051,7 @@ void CodeGenerator::cgCallBuiltin(IRInstruction* inst) {
   }
   for (auto i = uint32_t{0}; i < numArgs; ++i, ++srcNum) {
     auto const& pi = func->params()[i];
-    if (TVOFF(m_data) && isSmartPtrRef(pi.builtinType)) {
+    if (TVOFF(m_data) && isReqPtrRef(pi.builtinType)) {
       callArgs.addr(srcLoc(srcNum).reg(), TVOFF(m_data));
     } else {
       callArgs.ssa(srcNum);
@@ -1074,7 +1077,7 @@ void CodeGenerator::cgCallBuiltin(IRInstruction* inst) {
 
   if (returnType.isReferenceType()) {
     // this should use some kind of cmov
-    assertx(isBuiltinByRef(funcReturnType) && isSmartPtrRef(funcReturnType));
+    assertx(isBuiltinByRef(funcReturnType) && isReqPtrRef(funcReturnType));
     v << load{mis[returnOffset + TVOFF(m_data)], dst};
     if (dstType.isValid()) {
       condZero(v, dst, dstType, [&](Vout& v) {
@@ -1089,7 +1092,7 @@ void CodeGenerator::cgCallBuiltin(IRInstruction* inst) {
   if (returnType <= TCell || returnType <= TBoxedCell) {
     // this should use some kind of cmov
     static_assert(KindOfUninit == 0, "KindOfUninit must be 0 for test");
-    assertx(isBuiltinByRef(funcReturnType) && !isSmartPtrRef(funcReturnType));
+    assertx(isBuiltinByRef(funcReturnType) && !isReqPtrRef(funcReturnType));
     auto tmp_dst_type = v.makeReg();
     v << load{mis[returnOffset + TVOFF(m_data)], dst};
     if (dstType.isValid()) {
@@ -1233,13 +1236,6 @@ void CodeGenerator::cgLdFuncNumParams(IRInstruction* inst) {
   // auto tmp = v.makeReg();
   // v << loadl{src, tmp};
   // v << shrli{1, tmp, dst, v.makeReg()};
-}
-
-void CodeGenerator::cgLdARFuncPtr(IRInstruction* inst) {
-  auto dst     = dstLoc(0).reg();
-  auto base    = srcLoc(0).reg();
-  auto offset  = cellsToBytes(inst->extra<LdARFuncPtr>()->offset);
-  vmain() << load{base[offset + AROFF(m_func)], dst};
 }
 
 void CodeGenerator::cgLdFuncCached(IRInstruction* inst) {

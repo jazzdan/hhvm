@@ -22,6 +22,7 @@
 #include "hphp/runtime/base/types.h"
 #include "hphp/runtime/vm/jit/back-end.h"
 #include "hphp/runtime/vm/jit/code-gen-x64.h"
+#include "hphp/runtime/vm/jit/code-gen-cf.h"
 #include "hphp/runtime/vm/jit/ir-opcode.h"
 #include "hphp/runtime/vm/jit/mc-generator-internal.h"
 #include "hphp/runtime/vm/jit/mc-generator.h"
@@ -218,7 +219,7 @@ void emitLea(Asm& as, MemoryRef mr, PhysReg dst) {
 
 Vreg emitLdObjClass(Vout& v, Vreg objReg, Vreg dstReg) {
   emitLdLowPtr(v, objReg[ObjectData::getVMClassOffset()],
-               dstReg, sizeof(LowClassPtr));
+               dstReg, sizeof(LowPtr<Class>));
   return dstReg;
 }
 
@@ -260,13 +261,14 @@ void emitCall(Vout& v, CppCall target, RegSet args) {
     return;
   case CppCall::Kind::ArrayVirt: {
     auto const addr = reinterpret_cast<intptr_t>(target.arrayTable());
-    always_assert_flog(
-      deltaFits(addr, sz::dword),
-      "deltaFits on ArrayData vtable calls needs to be checked before "
-      "emitting them"
-    );
     v << loadzbl{rdi[HeaderKindOffset], eax};
-    v << callm{baseless(rax*8 + addr), args};
+    if (deltaFits(addr, sz::dword)) {
+      v << callm{baseless(rax*8 + addr), args};
+    } else {
+      auto const base = v.makeReg();
+      v << ldimmq{addr, base};
+      v << callm{Vptr{base, rax, 8, 0}, args};
+    }
     static_assert(sizeof(HeaderKind) == 1, "");
     return;
   }
@@ -310,51 +312,22 @@ void emitRB(Vout& v, Trace::RingBufferType t, const char* msg) {
              v.makeTuple({})};
 }
 
-void emitTestSurpriseFlags(Asm& a, PhysReg rds) {
-  static_assert(LastSurpriseFlag <= std::numeric_limits<uint32_t>::max(),
-                "Codegen assumes a SurpriseFlag fits in a 32-bit int");
-  a.cmpl(0, rds[rds::kSurpriseFlagsOff]);
-}
-
-Vreg emitTestSurpriseFlags(Vout& v, Vreg rds) {
-  static_assert(LastSurpriseFlag <= std::numeric_limits<uint32_t>::max(),
-                "Codegen assumes a SurpriseFlag fits in a 32-bit int");
-  auto const sf = v.makeReg();
-  v << cmplim{0, rds[rds::kSurpriseFlagsOff], sf};
-  return sf;
-}
-
-void emitCheckSurpriseFlagsEnter(CodeBlock& mainCode, CodeBlock& coldCode,
-                                 PhysReg rds, Fixup fixup) {
-  // warning: keep this in sync with the vasm version below.
-  Asm a { mainCode };
-  Asm acold { coldCode };
-
-  emitTestSurpriseFlags(a, rds);
-  a.  jnz(coldCode.frontier());
-
-  acold.  movq  (rVmFp, argNumToRegName[0]);
-  emitCall(acold, mcg->tx().uniqueStubs.functionEnterHelper, argSet(1));
-  mcg->recordSyncPoint(acold.frontier(), fixup.pcOffset, fixup.spOffset);
-  acold.  jmp   (a.frontier());
-}
-
-void emitCheckSurpriseFlagsEnter(Vout& v, Vout& vcold, Vreg rds, Fixup fixup,
-                                 Vlabel catchBlock) {
-  // warning: keep this in sync with the x64 version above.
+void emitCheckSurpriseFlagsEnter(Vout& v, Vout& vcold, Vreg fp, Vreg rds,
+                                 Fixup fixup, Vlabel catchBlock) {
   auto cold = vcold.makeBlock();
   auto done = v.makeBlock();
-  auto const sf = emitTestSurpriseFlags(v, rds);
-  v << jcc{CC_NZ, sf, {done, cold}};
-  v = done;
 
-  auto helper = (void(*)())mcg->tx().uniqueStubs.functionEnterHelper;
+  auto const sf = v.makeReg();
+  v << cmpqm{fp, rds[rds::kSurpriseFlagsOff], sf};
+  v << jcc{CC_NBE, sf, {done, cold}};
+
+  v = done;
   vcold = cold;
-  vcold << vinvoke{CppCall::direct(helper),
-                 v.makeVcallArgs({{rVmFp}}),
-                 v.makeTuple({}),
-                 {done, catchBlock},
-                 Fixup{fixup.pcOffset, fixup.spOffset}};
+
+  auto const call = CppCall::direct(
+    reinterpret_cast<void(*)()>(mcg->tx().uniqueStubs.functionEnterHelper));
+  auto const args = v.makeVcallArgs({});
+  vcold << vinvoke{call, args, v.makeTuple({}), {done, catchBlock}, fixup};
 }
 
 void emitLdLowPtr(Vout& v, Vptr mem, Vreg reg, size_t size) {
@@ -368,7 +341,7 @@ void emitLdLowPtr(Vout& v, Vptr mem, Vreg reg, size_t size) {
 }
 
 void emitCmpClass(Vout& v, Vreg sf, const Class* c, Vptr mem) {
-  auto size = sizeof(LowClassPtr);
+  auto size = sizeof(LowPtr<Class>);
   if (size == 8) {
     v << cmpqm{v.cns(c), mem, sf};
   } else if (size == 4) {
@@ -380,7 +353,7 @@ void emitCmpClass(Vout& v, Vreg sf, const Class* c, Vptr mem) {
 }
 
 void emitCmpClass(Vout& v, Vreg sf, Vreg reg, Vptr mem) {
-  auto size = sizeof(LowClassPtr);
+  auto size = sizeof(LowPtr<Class>);
   if (size == 8) {
     v << cmpqm{reg, mem, sf};
   } else if (size == 4) {
@@ -393,11 +366,22 @@ void emitCmpClass(Vout& v, Vreg sf, Vreg reg, Vptr mem) {
 }
 
 void emitCmpClass(Vout& v, Vreg sf, Vreg reg1, Vreg reg2) {
-  auto size = sizeof(LowClassPtr);
+  auto size = sizeof(LowPtr<Class>);
   if (size == 8) {
     v << cmpq{reg1, reg2, sf};
   } else if (size == 4) {
     v << cmpl{reg1, reg2, sf};
+  } else {
+    not_implemented();
+  }
+}
+
+void emitCmpVecLen(Vout& v, Vreg sf, Vptr mem, Immed val) {
+  auto const size = sizeof(Class::veclen_t);
+  if (size == 2) {
+    v << cmpwim{val, mem, sf};
+  } else if (size == 4) {
+    v << cmplim{val, mem, sf};
   } else {
     not_implemented();
   }

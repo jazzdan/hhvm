@@ -69,9 +69,9 @@ let save_type hint_kind env x arg =
             let x_pos = Reason.to_pos (fst x) in
             add_type env x_pos hint_kind arg;
         )
-    | _, (Tmixed | Tarray (_, _) | Tprim _ | Tgeneric (_, _) | Toption _
-      | Tvar _ | Tabstract (_, _, _) | Tclass (_, _) | Ttuple _ | Tanon (_, _)
-      | Tfun _ | Tunresolved _ | Tobject | Tshape _ | Taccess (_, _)) -> ()
+    | _, (Tmixed | Tarray (_, _) | Tprim _ | Toption _
+      | Tvar _ | Tabstract (_, _) | Tclass (_, _) | Ttuple _ | Tanon (_, _)
+      | Tfun _ | Tunresolved _ | Tobject | Tshape _) -> ()
   end
 
 let save_return env x arg = save_type Kreturn env x arg
@@ -165,10 +165,10 @@ and normalize_ = function
     when List.exists (function _, (Tany | Tunresolved []) -> true | _ -> false) tyl ->
       let tyl = List.filter begin function
         |  _, (Tany |  Tunresolved []) -> false
-        | _, (Tmixed | Tarray (_, _) | Tprim _ | Tgeneric (_, _) | Toption _
-          | Tvar _ | Tabstract (_, _, _) | Tclass (_, _) | Ttuple _
+        | _, (Tmixed | Tarray (_, _) | Tprim _ | Toption _
+          | Tvar _ | Tabstract (_, _) | Tclass (_, _) | Ttuple _
           | Tanon (_, _) | Tfun _ | Tunresolved _ | Tobject | Tshape _
-          | Taccess (_, _)) -> true
+             ) -> true
       end tyl in
       normalize_ (Tunresolved tyl)
   | Tunresolved ((_, Tclass (x, [])) :: rl) ->
@@ -177,10 +177,10 @@ and normalize_ = function
        *)
       let rl = List.map begin function
         | _, Tclass (x, []) -> x
-        | _, (Tany | Tmixed | Tarray (_, _) | Tprim _ | Tgeneric (_, _)
-          | Toption _ | Tvar _ | Tabstract (_, _, _) | Tclass (_, _) | Ttuple _
+        | _, (Tany | Tmixed | Tarray (_, _) | Tprim _
+          | Toption _ | Tvar _ | Tabstract (_, _) | Tclass (_, _) | Ttuple _
           | Tanon (_, _) | Tfun _ | Tunresolved _ | Tobject
-          | Tshape _ | Taccess (_, _)) -> raise Exit
+          | Tshape _) -> raise Exit
       end rl in
       let x_imp = get_implements x in
       let set = List.fold_left begin fun x_imp x ->
@@ -198,14 +198,14 @@ and normalize_ = function
     try Tarray (opt_map normalize k, opt_map normalize v)
     with Exit -> Tarray (None, None)
   end
-  | Tgeneric _ as x -> x
+  | Tabstract (AKgeneric (_, _), _) as x -> x
+  | Tabstract (AKdependent _, Some ty) -> normalize_ (snd ty)
   | Toption (_, (Toption (_, _) as ty)) -> normalize_ ty
   | Toption (_, Tprim Nast.Tvoid) -> raise Exit
   | Toption ty -> Toption (normalize ty)
   | Tprim _ as ty -> ty
   | Tvar _ -> raise Exit
   | Tfun _ -> raise Exit
-  | Taccess (_, _) -> raise Exit
   | Tclass ((pos, name), tyl) when name.[0] = '\\' && String.rindex name '\\' = 0 ->
       (* TODO this transform isn't completely legit; can cause a reference into
        * the global namespace to suddenly refer to a different class in the

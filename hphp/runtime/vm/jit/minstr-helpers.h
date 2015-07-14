@@ -121,10 +121,7 @@ TypedValue cGetPropImpl(Class* ctx, TypedValue* base,
   TypedValue scratch;
   TypedValue* result = Prop<true, false, false, isObj, keyType>(
     scratch, mis->tvRef, ctx, base, key);
-
-  if (result->m_type == KindOfRef) {
-    result = result->m_data.pref->tv();
-  }
+  result = tvToCell(result);
   tvRefcountedIncRef(result);
   return *result;
 }
@@ -150,7 +147,8 @@ CGETPROP_HELPER_TABLE(X)
 inline TypedValue cGetPropSQ(Class* ctx, TypedValue* base,
                              StringData* key, MInstrState* mis) {
   TypedValue scratch;
-  auto const result = nullSafeProp(scratch, mis->tvRef, ctx, base, key);
+  auto result = nullSafeProp(scratch, mis->tvRef, ctx, base, key);
+  result = tvToCell(result);
   tvRefcountedIncRef(result);
   return *result;
 }
@@ -159,7 +157,8 @@ inline TypedValue cGetPropSQ(Class* ctx, TypedValue* base,
 inline TypedValue cGetPropSOQ(Class* ctx, ObjectData* base,
                              StringData* key, MInstrState* mis) {
   TypedValue scratch;
-  auto const result = base->prop(&scratch, &mis->tvRef, ctx, key);
+  auto result = base->prop(&scratch, &mis->tvRef, ctx, key);
+  result = tvToCell(result);
   tvRefcountedIncRef(result);
   return *result;
 }
@@ -457,33 +456,22 @@ ELEM_ARRAY_HELPER_TABLE(X)
 TypedValue arrayGetNotFound(int64_t k);
 TypedValue arrayGetNotFound(const StringData* k);
 
-template<KeyType keyType, bool checkForInt, bool arrIsStatic>
+template<KeyType keyType, bool checkForInt>
 TypedValue arrayGetImpl(ArrayData* a, key_type<keyType> key) {
   auto ret = checkForInt ? checkedGet(a, key) : a->nvGet(key);
-  if (ret) {
-    if (arrIsStatic) {
-      tvAssertCell(ret);
-    } else {
-      ret = tvToCell(ret);
-      tvRefcountedIncRef(ret);
-    }
-    return *ret;
-  }
+  if (ret) return *ret;
   return arrayGetNotFound(key);
 }
 
 #define ARRAYGET_HELPER_TABLE(m)                           \
-  /* name        keyType     checkForInt   arrIsStatic */  \
-  m(arrayGetSC,  KeyType::Str,   false,    false)          \
-  m(arrayGetSU,  KeyType::Str,   false,     true)          \
-  m(arrayGetSiC, KeyType::Str,    true,    false)          \
-  m(arrayGetSiU, KeyType::Str,    true,     true)          \
-  m(arrayGetIC,  KeyType::Int,   false,    false)          \
-  m(arrayGetIU,  KeyType::Int,   false,     true)
+  /* name        keyType     checkForInt */                \
+  m(arrayGetS,  KeyType::Str,   false)                     \
+  m(arrayGetSi, KeyType::Str,    true)                     \
+  m(arrayGetI,  KeyType::Int,   false)                     \
 
-#define X(nm, keyType, checkForInt, isStatic)                  \
-inline TypedValue nm(ArrayData* a, key_type<keyType> key) {    \
-  return arrayGetImpl<keyType, checkForInt, isStatic>(a, key); \
+#define X(nm, keyType, checkForInt)                          \
+inline TypedValue nm(ArrayData* a, key_type<keyType> key) {  \
+  return arrayGetImpl<keyType, checkForInt>(a, key);         \
 }
 ARRAYGET_HELPER_TABLE(X)
 #undef X

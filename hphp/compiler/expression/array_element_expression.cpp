@@ -145,7 +145,7 @@ bool ArrayElementExpression::appendClass(ExpressionPtr cls,
       m_variable->is(Expression::KindOfDynamicVariable)) {
     StaticMemberExpressionPtr sme(
       new StaticMemberExpression(
-        m_variable->getScope(), m_variable->getLocation(),
+        m_variable->getScope(), m_variable->getRange(),
         cls, m_variable));
     sme->onParse(ar, file);
     m_variable = sme;
@@ -158,11 +158,6 @@ bool ArrayElementExpression::appendClass(ExpressionPtr cls,
 
 ///////////////////////////////////////////////////////////////////////////////
 // static analysis functions
-
-bool ArrayElementExpression::isTemporary() const {
-  return !m_global &&
-    !(m_context & (AccessContext|LValue|RefValue|UnsetContext));
-}
 
 void ArrayElementExpression::analyzeProgram(AnalysisResultPtr ar) {
   m_variable->analyzeProgram(ar);
@@ -181,18 +176,6 @@ void ArrayElementExpression::analyzeProgram(AnalysisResultPtr ar) {
           Compiler::Error(Compiler::UseUndeclaredGlobalVariable,
                           shared_from_this());
         }
-      }
-    } else {
-      TypePtr at(m_variable->getActualType());
-      TypePtr et(m_variable->getExpectedType());
-      if (et &&
-          (et->is(Type::KindOfSequence) ||
-           et->is(Type::KindOfAutoSequence)) &&
-          at && at->isExactType()) {
-        // since Sequence maps to Variant in the runtime,
-        // using Sequence for the expected type will
-        // never allow the necessary casts to be generated.
-        m_variable->setExpectedType(at);
       }
     }
   }
@@ -227,10 +210,6 @@ void ArrayElementExpression::setNthKid(int n, ConstructPtr cp) {
       assert(false);
       break;
   }
-}
-
-bool ArrayElementExpression::canonCompare(ExpressionPtr e) const {
-  return m_offset && Expression::canonCompare(e);
 }
 
 ExpressionPtr ArrayElementExpression::preOptimize(AnalysisResultConstPtr ar) {
@@ -293,7 +272,7 @@ void ArrayElementExpression::outputCodeModel(CodeGenerator &cg) {
     cg.printPropertyHeader("operation");
     cg.printValue(PHP_ARRAY_ELEMENT);
     cg.printPropertyHeader("sourceLocation");
-    cg.printLocation(this->getLocation());
+    cg.printLocation(this);
     cg.printObjectFooter();
   } else {
     cg.printObjectHeader("UnaryOpExpression", 3);
@@ -302,7 +281,7 @@ void ArrayElementExpression::outputCodeModel(CodeGenerator &cg) {
     cg.printPropertyHeader("operation");
     cg.printValue(PHP_ARRAY_APPEND_POINT_OP);
     cg.printPropertyHeader("sourceLocation");
-    cg.printLocation(this->getLocation());
+    cg.printLocation(this);
     cg.printObjectFooter();
   }
 }

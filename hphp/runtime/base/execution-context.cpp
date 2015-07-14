@@ -44,7 +44,7 @@
 #include "hphp/runtime/base/type-conversions.h"
 #include "hphp/runtime/base/unit-cache.h"
 #include "hphp/runtime/debugger/debugger.h"
-#include "hphp/runtime/ext/ext_system_profiler.h"
+#include "hphp/runtime/base/system-profiler.h"
 #include "hphp/runtime/ext/std/ext_std_output.h"
 #include "hphp/runtime/ext/string/ext_string.h"
 #include "hphp/runtime/server/server-stats.h"
@@ -77,13 +77,14 @@ ExecutionContext::ExecutionContext()
   , m_lambdaCounter(0)
   , m_nesting(0)
   , m_dbgNoBreak(false)
+  , m_unwindingCppException(false)
   , m_lastErrorPath(staticEmptyString())
   , m_lastErrorLine(0)
   , m_executingSetprofileCallback(false)
 {
   resetCoverageCounters();
-  // We don't want a new execution context to cause any smart allocations
-  // (because it will cause us to hold a slab, even while idle)
+  // We don't want a new execution context to cause any request-heap
+  // allocations (because it will cause us to hold a slab, even while idle).
   static auto s_cwd = makeStaticString(Process::CurrentWorkingDirectory);
   m_cwd = s_cwd;
 
@@ -407,7 +408,7 @@ Array ExecutionContext::obGetStatus(bool full) {
     }
     status.set(s_level, level);
     status.set(s_chunk_size, buffer.chunk_size);
-    status.set(s_buffer_used, buffer.oss.size());
+    status.set(s_buffer_used, static_cast<uint64_t>(buffer.oss.size()));
 
     if (full) {
       ret.append(status);
@@ -746,7 +747,7 @@ void ExecutionContext::handleError(const std::string& msg,
           tvTo = tvTo->m_data.pref->tv();
         }
         tvDup(*tvFrom, *tvTo);
-      } else if (fp->hasVarEnv()) {
+      } else if ((fp->func()->attrs() & AttrMayUseVV) && fp->hasVarEnv()) {
         fp->getVarEnv()->set(s_php_errormsg.get(), tvFrom);
       }
     }

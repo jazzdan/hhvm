@@ -32,7 +32,7 @@
 #include "hphp/runtime/base/zend-functions.h"
 #include "hphp/runtime/base/zend-string.h"
 
-#include "hphp/runtime/ext/ext_collections.h"
+#include "hphp/runtime/ext/collections/ext_collections-idl.h"
 #include "hphp/runtime/ext/std/ext_std_variable.h"
 #include "hphp/runtime/vm/native-data.h"
 #include "hphp/runtime/vm/runtime.h"
@@ -81,29 +81,6 @@ const StaticString
 
 ///////////////////////////////////////////////////////////////////////////////
 
-Variant::Variant(const char* v) {
-  m_type = KindOfString;
-  m_data.pstr = StringData::Make(v);
-  m_data.pstr->incRefCount();
-}
-
-Variant::Variant(const String& v) noexcept : Variant(v.get()) {
-}
-
-Variant::Variant(const std::string & v) {
-  m_type = KindOfString;
-  StringData *s = StringData::Make(v.c_str(), v.size(), CopyString);
-  assert(s);
-  m_data.pstr = s;
-  s->incRefCount();
-}
-
-Variant::Variant(const Array& v) noexcept : Variant(v.get()) {}
-
-Variant::Variant(const Object& v) noexcept : Variant(v.get()) {}
-
-Variant::Variant(const Resource& v) noexcept : Variant(v.get()) {}
-
 Variant::Variant(StringData *v) noexcept {
   if (v) {
     m_data.pstr = v;
@@ -118,102 +95,8 @@ Variant::Variant(StringData *v) noexcept {
   }
 }
 
-Variant::Variant(const StringData* v, StaticStrInit) noexcept {
-  if (v) {
-    assert(v->isStatic());
-    m_data.pstr = const_cast<StringData*>(v);
-    m_type = KindOfStaticString;
-  } else {
-    m_type = KindOfNull;
-  }
-}
-
-Variant::Variant(ArrayData* v) noexcept {
-  if (v) {
-    m_type = KindOfArray;
-    m_data.parr = v;
-    v->incRefCount();
-  } else {
-    m_type = KindOfNull;
-  }
-}
-
-Variant::Variant(ObjectData* v) noexcept {
-  if (v) {
-    m_type = KindOfObject;
-    m_data.pobj = v;
-    v->incRefCount();
-  } else {
-    m_type = KindOfNull;
-  }
-}
-
-Variant::Variant(ResourceData* v) noexcept {
-  if (v) {
-    m_type = KindOfResource;
-    m_data.pres = v;
-    v->incRefCount();
-  } else {
-    m_type = KindOfNull;
-  }
-}
-
-Variant::Variant(RefData* r) noexcept {
-  if (r) {
-    m_type = KindOfRef;
-    m_data.pref = r;
-    r->incRefCount();
-  } else {
-    m_type = KindOfNull;
-  }
-}
-
-Variant::Variant(StringData* var, Attach) noexcept {
-  if (var) {
-    m_type = var->isStatic() ? KindOfStaticString : KindOfString;
-    m_data.pstr = var;
-  } else {
-    m_type = KindOfNull;
-  }
-}
-
-Variant::Variant(ArrayData* var, Attach) noexcept {
-  if (var) {
-    m_type = KindOfArray;
-    m_data.parr = var;
-  } else {
-    m_type = KindOfNull;
-  }
-}
-
-Variant::Variant(ObjectData* var, Attach) noexcept {
-  if (var) {
-    m_type = KindOfObject;
-    m_data.pobj = var;
-  } else {
-    m_type = KindOfNull;
-  }
-}
-
-Variant::Variant(ResourceData* var, Attach) noexcept {
-  if (var) {
-    m_type = KindOfResource;
-    m_data.pres = var;
-  } else {
-    m_type = KindOfNull;
-  }
-}
-
-Variant::Variant(RefData* var, Attach) noexcept {
-  if (var) {
-    m_type = KindOfRef;
-    m_data.pref = var;
-  } else {
-    m_type = KindOfNull;
-  }
-}
-
 // the version of the high frequency function that is not inlined
+NEVER_INLINE
 Variant::Variant(const Variant& v) noexcept {
   constructValHelper(v);
 }
@@ -237,14 +120,20 @@ static_assert(TYPE_TO_DESTR_IDX(KindOfRef)    == 5,    "Ref destruct index");
 static_assert(kDestrTableSize == 6,
               "size of g_destructors[] must be kDestrTableSize");
 
-const RawDestructor g_destructors[] = {
+RawDestructor g_destructors[] = {
   nullptr,
   (RawDestructor)getMethodPtr(&StringData::release),
   (RawDestructor)getMethodPtr(&ArrayData::release),
-  (RawDestructor)getMethodPtr(&ObjectData::release),
+  (RawDestructor)getMethodPtr(&ObjectData::release), // may replace at runtime
   (RawDestructor)getMethodPtr(&ResourceData::release),
   (RawDestructor)getMethodPtr(&RefData::release),
 };
+
+void tweak_variant_dtors() {
+  if (RuntimeOption::EnableObjDestructCall) return;
+  g_destructors[TYPE_TO_DESTR_IDX(KindOfObject)] =
+    (RawDestructor)getMethodPtr(&ObjectData::releaseNoObjDestructCheck);
+}
 
 Variant::~Variant() noexcept {
   tvRefcountedDecRef(asTypedValue());
@@ -333,6 +222,28 @@ IMPLEMENT_PTR_SET(ObjectData, pobj, KindOfObject)
 IMPLEMENT_PTR_SET(ResourceData, pres, KindOfResource)
 
 #undef IMPLEMENT_PTR_SET
+
+#define IMPLEMENT_STEAL(ptr, member, dtype)                             \
+  void Variant::steal(ptr* v) noexcept {                                \
+    Variant* self = (m_type == KindOfRef) ? m_data.pref->var() : this;  \
+    if (UNLIKELY(!v)) {                                                 \
+      self->setNull();                                                  \
+    } else {                                                            \
+      auto const d = self->m_data.num;                                  \
+      auto const t = self->m_type;                                      \
+      self->m_type = dtype;                                             \
+      self->m_data.member = v;                                          \
+      tvRefcountedDecRefHelper(t, d);                                   \
+    }                                                                   \
+  }
+
+IMPLEMENT_STEAL(StringData, pstr,
+                v->isStatic() ? KindOfStaticString : KindOfString)
+IMPLEMENT_STEAL(ArrayData, parr, KindOfArray)
+IMPLEMENT_STEAL(ObjectData, pobj, KindOfObject)
+IMPLEMENT_STEAL(ResourceData, pres, KindOfResource)
+
+#undef IMPLEMENT_STEAL
 
 int Variant::getRefCount() const noexcept {
   switch (m_type) {
@@ -544,7 +455,7 @@ Object Variant::toObjectHelper() const {
   switch (m_type) {
     case KindOfUninit:
     case KindOfNull:
-      return Object(SystemLib::AllocStdClassObject());
+      return SystemLib::AllocStdClassObject();
 
     case KindOfBoolean:
     case KindOfInt64:
@@ -552,7 +463,7 @@ Object Variant::toObjectHelper() const {
     case KindOfStaticString:
     case KindOfString:
     case KindOfResource: {
-      ObjectData *obj = SystemLib::AllocStdClassObject();
+      auto obj = SystemLib::AllocStdClassObject();
       obj->o_set(s_scalar, *this, false);
       return obj;
     }
@@ -583,7 +494,7 @@ Resource Variant::toResourceHelper() const {
     case KindOfString:
     case KindOfArray:
     case KindOfObject:
-      return Resource(makeSmartPtr<DummyResource>());
+      return Resource(req::make<DummyResource>());
 
     case KindOfResource:
       return m_data.pres;
@@ -714,6 +625,29 @@ void Variant::setEvalScalar() {
   not_reached();
 }
 
+
+namespace {
+static void serializeRef(const TypedValue* tv,
+                         VariableSerializer* serializer,
+                         bool isArrayKey) {
+  assert(tv->m_type == KindOfRef);
+  // Ugly, but behavior is different for serialize
+  if (serializer->getType() == VariableSerializer::Type::Serialize ||
+      serializer->getType() == VariableSerializer::Type::APCSerialize ||
+      serializer->getType() == VariableSerializer::Type::DebuggerSerialize) {
+    if (serializer->incNestedLevel(tv->m_data.pref->var())) {
+      serializer->writeOverflow(tv->m_data.pref->var());
+    } else {
+      // Tell the inner variant to skip the nesting check for data inside
+      serializeVariant(*tv->m_data.pref->var(), serializer, isArrayKey, true);
+    }
+    serializer->decNestedLevel(tv->m_data.pref->var());
+  } else {
+    serializeVariant(*tv->m_data.pref->var(), serializer, isArrayKey);
+  }
+}
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // output functions
 
@@ -722,23 +656,6 @@ void serializeVariant(const Variant& self, VariableSerializer *serializer,
                       bool skipNestCheck /* = false */,
                       bool noQuotes /* = false */) {
   auto tv = self.asTypedValue();
-  if (tv->m_type == KindOfRef) {
-    // Ugly, but behavior is different for serialize
-    if (serializer->getType() == VariableSerializer::Type::Serialize ||
-        serializer->getType() == VariableSerializer::Type::APCSerialize ||
-        serializer->getType() == VariableSerializer::Type::DebuggerSerialize) {
-      if (serializer->incNestedLevel(tv->m_data.pref->var())) {
-        serializer->writeOverflow(tv->m_data.pref->var());
-      } else {
-        // Tell the inner variant to skip the nesting check for data inside
-        serializeVariant(*tv->m_data.pref->var(), serializer, isArrayKey, true);
-      }
-      serializer->decNestedLevel(tv->m_data.pref->var());
-    } else {
-      serializeVariant(*tv->m_data.pref->var(), serializer, isArrayKey);
-    }
-    return;
-  }
 
   switch (tv->m_type) {
     case KindOfUninit:
@@ -782,6 +699,9 @@ void serializeVariant(const Variant& self, VariableSerializer *serializer,
       return;
 
     case KindOfRef:
+      serializeRef(tv, serializer, isArrayKey);
+      return;
+
     case KindOfClass:
       break;
   }
@@ -837,8 +757,8 @@ static void unserializeProp(VariableUnserializer* uns,
   auto msg = folly::format(
     "Property {} for class {} was deserialized with type ({}) that "
     "didn't match what we inferred in static analysis",
-    key.data(),
-    obj->getVMClass()->name()->data(),
+    key,
+    obj->getVMClass()->name(),
     tname(t->asTypedValue()->m_type)
   ).str();
   throw Exception(msg);
@@ -1007,7 +927,7 @@ void unserializeVariant(Variant& self, VariableUnserializer *uns,
       rsrcName.unserialize(uns);
       uns->expectChar('{');
       uns->expectChar('}');
-      auto rsrc = makeSmartPtr<DummyResource>();
+      auto rsrc = req::make<DummyResource>();
       rsrc->o_setResourceId(id);
       rsrc->m_class_name = rsrcName;
       self = std::move(rsrc);
@@ -1076,15 +996,14 @@ void unserializeVariant(Variant& self, VariableUnserializer *uns,
           assert(obj.isNull());
           throw_null_pointer_exception();
         } else {
-          obj = ObjectData::newInstance(cls);
+          obj = Object{cls};
           if (UNLIKELY(collections::isType(cls, CollectionType::Pair) &&
                        (size != 2))) {
             throw Exception("Pair objects must have exactly 2 elements");
           }
         }
       } else {
-        obj = ObjectData::newInstance(
-          SystemLib::s___PHP_Incomplete_ClassClass);
+        obj = Object{SystemLib::s___PHP_Incomplete_ClassClass};
         obj->o_set(s_PHP_Incomplete_Class_Name, clsName);
       }
       assert(!obj.isNull());
@@ -1197,8 +1116,8 @@ void unserializeVariant(Variant& self, VariableUnserializer *uns,
 
       auto const obj = [&]() -> Object {
         if (auto const cls = Unit::loadClass(clsName.get())) {
-          return g_context->createObject(cls, init_null_variant,
-            false /* init */);
+          return Object::attach(g_context->createObject(cls, init_null_variant,
+                                                        false /* init */));
         }
         if (!uns->allowUnknownSerializableClass()) {
           raise_error("unknown class %s", clsName.data());

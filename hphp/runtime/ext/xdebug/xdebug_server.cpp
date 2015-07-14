@@ -17,7 +17,6 @@
 
 #include "hphp/runtime/ext/xdebug/xdebug_server.h"
 
-#include "hphp/runtime/ext/xdebug/chrome.h"
 #include "hphp/runtime/ext/xdebug/xdebug_command.h"
 #include "hphp/runtime/ext/xdebug/xdebug_hook_handler.h"
 #include "hphp/runtime/ext/xdebug/xdebug_utils.h"
@@ -39,98 +38,15 @@ namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 // Helpers
 
+using Error  = XDebugError;
+using Status = XDebugStatus;
+using Reason = XDebugReason;
+
 // Globals
 const StaticString
   s_SERVER("_SERVER"),
   s_GET("_GET"),
   s_COOKIE("_COOKIE");
-
-// Given an xdebug error code, returns its corresponding error string
-static const char* getXDebugErrorString(XDebugServer::ErrorCode error) {
-  switch (error) {
-    case XDebugServer::ERROR_OK:
-      return "no error";
-    case XDebugServer::ERROR_PARSE:
-      return "parse error in command";
-    case XDebugServer::ERROR_DUP_ARG:
-      return "duplicate arguments in command";
-    case XDebugServer::ERROR_INVALID_ARGS:
-      return "invalid or missing options";
-    case XDebugServer::ERROR_UNIMPLEMENTED:
-      return "unimplemented command";
-    case XDebugServer::ERROR_COMMAND_UNAVAILABLE:
-      return "command is not available";
-    case XDebugServer::ERROR_CANT_OPEN_FILE:
-      return "can not open file";
-    case XDebugServer::ERROR_STREAM_REDIRECT_FAILED:
-      return "stream redirect failed";
-    case XDebugServer::ERROR_BREAKPOINT_NOT_SET:
-      return "breakpoint could not be set";
-    case XDebugServer::ERROR_BREAKPOINT_TYPE_NOT_SUPPORTED:
-      return "breakpoint type is not supported";
-    case XDebugServer::ERROR_BREAKPOINT_INVALID:
-      return "invalid breakpoint line";
-    case XDebugServer::ERROR_BREAKPOINT_NO_CODE:
-      return "no code on breakpoint line";
-    case XDebugServer::ERROR_BREAKPOINT_INVALID_STATE:
-      return "invalid breakpoint state";
-    case XDebugServer::ERROR_NO_SUCH_BREAKPOINT:
-      return "no such breakpoint";
-    case XDebugServer::ERROR_EVALUATING_CODE:
-      return "error evaluating code";
-    case XDebugServer::ERROR_INVALID_EXPRESSION:
-      return "invalid expression";
-    case XDebugServer::ERROR_PROPERTY_NON_EXISTENT:
-      return "can not get property";
-    case XDebugServer::ERROR_STACK_DEPTH_INVALID:
-      return "stack depth invalid";
-    case XDebugServer::ERROR_CONTEXT_INVALID:
-      return "context invalid";
-    case XDebugServer::ERROR_PROFILING_NOT_STARTED:
-      return "profiler not started";
-    case XDebugServer::ERROR_ENCODING_NOT_SUPPORTED:
-      return "encoding not supported";
-    case XDebugServer::ERROR_INTERNAL:
-      return "an internal exception in the debugger";
-    default:
-      return "unknown error";
-  }
-}
-
-// Returns the string corresponding to the given xdebug server status
-const char* getXDebugStatusString(XDebugServer::Status status) {
-  switch (status) {
-    case XDebugServer::Status::STARTING:
-      return "starting";
-    case XDebugServer::Status::STOPPING:
-      return "stopping";
-    case XDebugServer::Status::STOPPED:
-      return "stopped";
-    case XDebugServer::Status::RUNNING:
-      return "running";
-    case XDebugServer::Status::BREAK:
-      return "break";
-    case XDebugServer::Status::DETACHED:
-      return "detached";
-    default:
-      throw Exception("Invalid xdebug server status");
-  }
-}
-
-// Returns the string corresponding ot the xdebug server reason
-const char* getXDebugReasonString(XDebugServer::Reason reason) {
-  switch (reason) {
-    case XDebugServer::Reason::OK:
-      return "ok";
-    case XDebugServer::Reason::ERROR:
-      return "error";
-    case XDebugServer::Reason::ABORTED:
-      return "aborted";
-    case XDebugServer::Reason::EXCEPTION:
-      return "exception";
-    default: throw Exception("Invalid xdebug server reason");
-  }
-}
 
 ///////////////////////////////////////////////////////////////////////////////
 // Construction/Destruction
@@ -151,12 +67,12 @@ XDebugServer::XDebugServer(Mode mode)
     if (m_logFile == nullptr) {
       raise_warning("XDebug could not open the remote debug file '%s'.",
                     XDEBUG_GLOBAL(RemoteLog).c_str());
+    } else {
+      log("Log opened at");
+      XDebugUtils::fprintTimestamp(m_logFile);
+      log("\n");
+      logFlush();
     }
-
-    log("Log opened at");
-    XDebugUtils::fprintTimestamp(m_logFile);
-    log("\n");
-    logFlush();
   }
 
   // Grab the hostname and port to connect to
@@ -369,19 +285,21 @@ void XDebugServer::pollSocketLoop() {
     // it enter the jit.
     m_requestThread->m_reqInjectionData.setDebuggerIntr(false);
 
-    // Check if there is any input waiting on us.
-    if (!poll_socket(m_socket)) {
-      continue;
-    }
+    if (m_bufferAvail == 0) {
+      // Check if there is any input waiting on us.
+      if (!poll_socket(m_socket)) {
+        continue;
+      }
 
-    // Actually get the input from the socket.
-    if (!readInput()) {
-      log("Polling thread had input but failed to read it\n");
-      continue;
+      // Actually get the input from the socket.
+      if (!readInput()) {
+        log("Polling thread had input but failed to read it\n");
+        continue;
+      }
     }
 
     try {
-      log("Polling thread received: %s\n", m_buffer);
+      log("Polling thread received: %s\n", m_bufferCur);
       auto cmd = parseCommand();
       if (cmd->getCommandStr() != "break") {
         delete cmd;
@@ -402,8 +320,8 @@ void XDebugServer::pollSocketLoop() {
       // XDebugHookHandler::onOpcode().
       m_requestThread->m_reqInjectionData.setDebuggerIntr(true);
       m_requestThread->m_reqInjectionData.setFlag(DebuggerSignalFlag);
-    } catch (const ErrorCode& error) {
-      log("Polling thread got invalid command: %s\n", m_buffer);
+    } catch (const XDebugExn&) {
+      log("Polling thread got invalid command: %s\n", m_bufferCur);
       // Can drop the error.
     }
   }
@@ -539,31 +457,30 @@ void XDebugServer::addCommand(xdebug_xml_node& node, const XDebugCommand& cmd) {
 }
 
 void XDebugServer::addStatus(xdebug_xml_node& node) {
-  const char* status = getXDebugStatusString(m_status);
-  const char* reason = getXDebugReasonString(m_reason);
+  auto const status = xdebug_status_str(m_status);
+  auto const reason = xdebug_reason_str(m_reason);
   xdebug_xml_add_attribute(&node, "status", status);
   xdebug_xml_add_attribute(&node, "reason", reason);
 }
 
-void XDebugServer::addError(xdebug_xml_node& node, ErrorCode code) {
+void XDebugServer::addError(xdebug_xml_node& node, XDebugError code) {
   // Create the error node
-  xdebug_xml_node* error = xdebug_xml_node_init("error");
-  xdebug_xml_add_attribute(error, "code", code);
+  auto error = xdebug_xml_node_init("error");
+  xdebug_xml_add_attribute(error, "code", static_cast<int>(code));
   xdebug_xml_add_child(&node, error);
 
   // Add the error code's error message
-  xdebug_xml_node* message = xdebug_xml_node_init("message");
-  xdebug_xml_add_text(message,
-                      const_cast<char*>(getXDebugErrorString(code)), 0);
+  auto message = xdebug_xml_node_init("message");
+  xdebug_xml_add_text(message, const_cast<char*>(xdebug_error_str(code)), 0);
   xdebug_xml_add_child(error, message);
 }
 
 void XDebugServer::sendStream(const char* name, const char* bytes, int len) {
   // Casts are necessary due to xml api
-  char* name_str = const_cast<char*>(name);
-  char* bytes_str = const_cast<char*>(bytes);
+  auto name_str = const_cast<char*>(name);
+  auto bytes_str = const_cast<char*>(bytes);
 
-  xdebug_xml_node* message = xdebug_xml_node_init("stream");
+  auto message = xdebug_xml_node_init("stream");
   addXmlns(*message);
   xdebug_xml_add_attribute(message, "type", name_str);
   xdebug_xml_add_text_ex(message, bytes_str, len, 0, 1);
@@ -575,10 +492,10 @@ bool XDebugServer::initDbgp() {
   // Initialize the status and reason
   switch (m_mode) {
     case Mode::REQ:
-      setStatus(Status::STARTING, Reason::OK);
+      setStatus(Status::Starting, Reason::Ok);
       break;
     case Mode::JIT:
-      setStatus(Status::BREAK, Reason::ERROR);
+      setStatus(Status::Break, Reason::Error);
       break;
   }
   // Create the response
@@ -607,11 +524,11 @@ bool XDebugServer::initDbgp() {
   xdebug_xml_add_child(response, child);
 
   // Grab the absolute path of the script filename
-  const ArrayData* globals = get_global_variables()->asArrayData();
+  auto globals = get_global_variables()->asArrayData();
   Variant scriptname_var = globals->get(s_SERVER).toArray()[s_SCRIPT_FILENAME];
   assert(scriptname_var.isString());
-  char* scriptname = scriptname_var.toString().get()->mutableData();
-  char* fileuri = XDebugUtils::pathToUrl(scriptname);
+  auto scriptname = scriptname_var.toString().get()->mutableData();
+  auto fileuri = XDebugUtils::pathToUrl(scriptname);
 
   // Add attributes to the root init node
   xdebug_xml_add_attribute_ex(response, "fileuri", fileuri, 0, 1);
@@ -640,8 +557,8 @@ bool XDebugServer::initDbgp() {
 
 void XDebugServer::deinitDbgp() {
   // Unless we've already stopped, send the shutdown message
-  if (m_status != Status::STOPPED) {
-    setStatus(Status::STOPPING, Reason::OK);
+  if (m_status != Status::Stopped) {
+    setStatus(Status::Stopping, Reason::Ok);
 
     // Send the xml shutdown response
     auto response = xdebug_xml_node_init("response");
@@ -659,18 +576,11 @@ void XDebugServer::deinitDbgp() {
   }
 
   // Free the input buffer & the last command
-  smart_free(m_buffer);
+  req::free(m_buffer);
   delete m_lastCommand;
 }
 
 void XDebugServer::sendMessage(xdebug_xml_node& xml) {
-  if (RuntimeOption::XDebugChrome) {
-    auto const response = dbgp_to_chrome(&xml);
-    // Write the trailing NUL character.
-    write(m_socket, response.data(), response.size() + 1);
-    return;
-  }
-
   // Convert xml to an xdebug_str.
   xdebug_str xml_message = {0, 0, nullptr};
   xdebug_xml_return_node(&xml, &xml_message);
@@ -704,7 +614,7 @@ bool XDebugServer::breakpoint(const Variant& filename,
                               const Variant& message,
                               int line) {
   log("Hit breakpoint at %s:%d", filename.toString().data(), line);
-  setStatus(Status::BREAK, Reason::OK);
+  setStatus(Status::Break, Reason::Ok);
 
   // Initialize the response node
   auto response = xdebug_xml_node_init("response");
@@ -758,7 +668,7 @@ bool XDebugServer::breakpoint(const XDebugBreakpoint& bp,
   // If we are detached, short circuit
   Status status; Reason reason;
   getStatus(status, reason);
-  if (status == Status::DETACHED) {
+  if (status == Status::Detached) {
     return true;
   }
 
@@ -805,12 +715,13 @@ bool XDebugServer::doCommandLoop() {
 
   do {
     // If we are detached, short circuit
-    if (m_status == Status::DETACHED) {
+    if (m_status == Status::Detached) {
       return true;
     }
 
-    // Read from socket, store into m_buffer. On failure, return.
-    if (!readInput()) {
+    // If we have no input buffered, read from socket, store into m_buffer.
+    // On failure, return.
+    if (m_bufferAvail == 0 && !readInput()) {
       return false;
     }
 
@@ -831,8 +742,8 @@ bool XDebugServer::doCommandLoop() {
       if (cmd->shouldRespond()) {
         sendMessage(*response);
       }
-    } catch (const ErrorCode& error) {
-      addError(*response, error);
+    } catch (const XDebugExn& exn) {
+      addError(*response, exn.error);
       sendMessage(*response);
     }
 
@@ -844,6 +755,7 @@ bool XDebugServer::doCommandLoop() {
 }
 
 bool XDebugServer::readInput() {
+  assert(m_bufferAvail == 0);
   size_t bytes_read = 0;
   do {
     size_t bytes_left = m_bufferSize - bytes_read;
@@ -852,7 +764,7 @@ bool XDebugServer::readInput() {
       m_bufferSize = (m_bufferSize == 0) ?
         INPUT_BUFFER_INIT_SIZE : m_bufferSize * INPUT_BUFFER_EXPANSION;
       bytes_left = m_bufferSize - bytes_read;
-      m_buffer = (char*) smart_realloc(m_buffer, m_bufferSize);
+      m_buffer = (char*) req::realloc(m_buffer, m_bufferSize);
     }
 
     // Read into the buffer
@@ -862,26 +774,30 @@ bool XDebugServer::readInput() {
     }
     bytes_read += res;
   } while (m_buffer[bytes_read - 1] != '\0');
+  m_bufferAvail = bytes_read;
+  m_bufferCur = m_buffer;
   return true;
 }
 
 XDebugCommand* XDebugServer::parseCommand() {
+  assert(m_bufferAvail > 0);
+
   // Log the passed in command
-  log("<- %s\n", m_buffer);
+  log("<- %s\n", m_bufferCur);
   logFlush();
 
   // Attempt to parse the input.  parseInput will initialize cmd_str and args.
   String cmd_str;
   Array args;
 
-  // If we're being sent chrome debugger commands, then convert them to dbgp
-  // first.
-  std::string chrome_input;
-  folly::StringPiece input(m_buffer);
-  if (RuntimeOption::XDebugChrome) {
-    chrome_input = chrome_to_dbgp(input);
-    input = chrome_input;
-  }
+  folly::StringPiece input(m_bufferCur);
+
+  // Bump the current buffer pointer forward *before* calling parseInput, so we
+  // don't get stuck in an infinite loop if parseInput throws.
+  auto consumed = strlen(m_bufferCur) + 1;
+  assert(consumed <= m_bufferAvail);
+  m_bufferCur += consumed;
+  m_bufferAvail -= consumed;
 
   parseInput(input, cmd_str, args);
 
@@ -898,13 +814,13 @@ void XDebugServer::parseInput(folly::StringPiece in, String& cmd, Array& args) {
   auto ptr = strchr(const_cast<char*>(in.data()), ' ');
   if (ptr != nullptr) {
     size_t size = ptr - in.data();
-    cmd = String(StringData::Make(in.data(), size, CopyString));
+    cmd = String::attach(StringData::Make(in.data(), size, CopyString));
   } else if (in[0] != '\0') {
     // There are no spaces, the entire string is the command
-    cmd = String(in.data(), CopyString);
+    cmd = String::attach(StringData::Make(in.data(), CopyString));
     return;
   } else {
-    throw ERROR_PARSE;
+    throw_exn(Error::Parse);
   }
 
   // Loop starting after the space until the end of the string
@@ -918,7 +834,7 @@ void XDebugServer::parseInput(folly::StringPiece in, String& cmd, Array& args) {
       // A new option which is prefixed with "-" is expected
       case ParseState::NORMAL:
         if (*ptr != '-') {
-          throw ERROR_PARSE;
+          throw_exn(Error::Parse);
         } else {
           state = ParseState::OPT_FOLLOWS;
         }
@@ -931,7 +847,7 @@ void XDebugServer::parseInput(folly::StringPiece in, String& cmd, Array& args) {
       // Expect a " " separator to follow
       case ParseState::SEP_FOLLOWS:
         if (*ptr != ' ') {
-          throw ERROR_PARSE;
+          throw_exn(Error::Parse);
         } else {
           state = ParseState::VALUE_FOLLOWS_FIRST_CHAR;
           value = ptr + 1;
@@ -953,10 +869,10 @@ void XDebugServer::parseInput(folly::StringPiece in, String& cmd, Array& args) {
           if (args[opt].isNull()) {
             size_t size = ptr - value;
             StringData* val_data = StringData::Make(value, size, CopyString);
-            args.set(opt, String(val_data));
+            args.set(opt, String::attach(val_data));
             state = ParseState::NORMAL;
           } else {
-            throw ERROR_DUP_ARG;
+            throw_exn(Error::DupArg);
           }
         }
         break;
@@ -979,10 +895,10 @@ void XDebugServer::parseInput(folly::StringPiece in, String& cmd, Array& args) {
         if (args[opt].isNull()) {
           size_t size = ptr - value;
           StringData* val_data = StringData::Make(value, size, CopyString);
-          args.set(opt, HHVM_FN(stripcslashes)(String(val_data)));
+          args.set(opt, HHVM_FN(stripcslashes)(String::attach(val_data)));
           state = ParseState::SKIP_CHAR;
         } else {
-          throw ERROR_DUP_ARG;
+          throw_exn(Error::DupArg);
         }
         break;
       // Do nothing

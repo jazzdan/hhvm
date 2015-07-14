@@ -24,6 +24,7 @@ module DynamicYield = Typing_dynamic_yield
 module Reason = Typing_reason
 module Inst = Typing_instantiate
 module Attrs = Attributes
+module TUtils = Typing_utils
 
 module SN = Naming_special_names
 module Phase = Typing_phase
@@ -96,7 +97,7 @@ let check_arity pos class_name class_type class_parameters =
 
 let make_substitution pos class_name class_type class_parameters =
   check_arity pos class_name class_type class_parameters;
-  Inst.make_subst Phase.decl class_type.tc_tparams class_parameters
+  Inst.make_subst class_type.tc_tparams class_parameters
 
 (*-------------------------- end copypasta *)
 
@@ -253,7 +254,7 @@ let declared_class_req class_nast impls (env, requirements, req_extends) hint =
       (* since the req is declared on this class, we should
        * emphatically *not* substitute: a require extends Foo<T> is
        * going to be this class's <T> *)
-      let subst = Inst.make_subst Phase.decl [] [] in
+      let subst = Inst.make_subst [] [] in
       let ex_ty_opt = SMap.get req_name requirements in
       let env, merged = merge_single_req env subst
         req_ty ex_ty_opt req_pos in
@@ -304,7 +305,7 @@ let ifun_decl nenv (f: Ast.fun_) =
   let f = Naming.fun_ nenv f in
   let cid = snd f.f_name in
   Naming_heap.FunHeap.add cid f;
-  Typing.fun_decl (Naming.typechecker_options nenv) f;
+  Typing.fun_decl nenv f;
   ()
 
 (*****************************************************************************)
@@ -418,7 +419,7 @@ and class_decl tcopt c =
   SMap.iter (check_static_method m) sm;
   let parent_cstr = inherited.Typing_inherit.ih_cstr in
   let env, cstr = constructor_decl env parent_cstr c in
-  let need_init = match (fst cstr) with
+  let has_concrete_cstr = match (fst cstr) with
     | None
     | Some {ce_type = (_, Tfun ({ft_abstract = true; _})); _} -> false
     | _ -> true in
@@ -433,29 +434,8 @@ and class_decl tcopt c =
       ty :: impl
     | _ -> impl
   in
-  let env, impl_dimpl =
-    lfold (Typing.get_implements ~with_checks:false) env impl in
-  let impl, dimpl = List.split impl_dimpl in
-
-  let add_ancestor name c1 m = match SMap.get name m with
-    | Some c2 ->
-       (* Same ancestor listed multiple times - try to keep most specific one *)
-       let is_subtype = Errors.try_
-                   (* We ignore the returned env because we only want to test,
-                      not force the subtyping relation. *)
-         (fun () -> ignore (Typing_phase.sub_type_decl env c2 c1); true)
-         (fun _  -> false) in
-       if is_subtype then
-        (* c1 is a subtype of c2, so it's more specific *)
-         SMap.add name c1 m
-       else
-        (* c2 is a subtype of c1 OR there must exist c3 that is their common
-           descendant, and it will be picked in subsequent iterations.*)
-         m
-    | None -> SMap.add name c1 m in
-
-  let impl = List.fold_right (SMap.fold add_ancestor) impl SMap.empty in
-  let dimpl = List.fold_right (SMap.fold add_ancestor) dimpl SMap.empty in
+  let env, impl = lfold get_implements env impl in
+  let impl = List.fold_right (SMap.fold SMap.add) impl SMap.empty in
   let env, extends, ext_strict = get_class_parents_and_traits env c in
   let extends = if c.c_is_xhp
     then SSet.add "XHP" extends
@@ -491,13 +471,7 @@ and class_decl tcopt c =
     Errors.strict_members_not_known p name
   else ();
   let ext_strict = if not_strict_because_xhp then false else ext_strict in
-  let self_dimpl = if is_abstract then impl else SMap.empty in
-  let dimpl =
-    if is_abstract
-    then SMap.fold SMap.add self_dimpl dimpl
-    else dimpl
-  in
-  let env, tparams = lfold Typing.type_param env c.c_tparams in
+  let env, tparams = lfold Typing.type_param env (fst c.c_tparams) in
   let env, enum = match c.c_enum with
     | None -> env, None
     | Some e ->
@@ -507,11 +481,13 @@ and class_decl tcopt c =
         { te_base       = base_hint;
           te_constraint = constraint_hint } in
   let consts = Typing_enum.enum_class_decl_rewrite c.c_name enum impl consts in
+  let has_own_cstr = has_concrete_cstr && (None <> c.c_constructor) in
+  let deferred_members = NastInitCheck.class_decl ~has_own_cstr env c in
   let tc = {
     tc_final = c.c_final;
     tc_abstract = is_abstract;
-    tc_need_init = need_init;
-    tc_members_init = NastInitCheck.class_decl env c;
+    tc_need_init = has_concrete_cstr;
+    tc_deferred_init_members = deferred_members;
     tc_members_fully_known = ext_strict;
     tc_kind = c.c_kind;
     tc_name = snd c.c_name;
@@ -525,7 +501,6 @@ and class_decl tcopt c =
     tc_smethods = sm;
     tc_construct = cstr;
     tc_ancestors = impl;
-    tc_ancestors_checked_when_concrete = dimpl;
     tc_extends = extends;
     tc_req_ancestors = req_ancestors;
     tc_req_ancestors_extends = req_ancestors_extends;
@@ -541,10 +516,23 @@ and class_decl tcopt c =
   SMap.iter begin fun x _ ->
     Typing_deps.add_idep (Some class_dep) (Dep.Class x)
   end impl;
-  SMap.iter begin fun x _ ->
-    Typing_deps.add_idep (Some class_dep) (Dep.Class x)
-  end dimpl;
   Env.add_class (snd c.c_name) tc
+
+and get_implements (env: Env.env) ht =
+  let _r, (_p, c), paraml = Typing_hint.open_class_hint ht in
+  let class_ = Env.get_class_dep env c in
+  match class_ with
+  | None ->
+      (* The class lives in PHP land *)
+      env, SMap.singleton c ht
+  | Some class_ ->
+      let subst = Inst.make_subst class_.tc_tparams paraml in
+      let sub_implements =
+        SMap.map
+          (fun ty -> snd (Inst.instantiate subst env ty))
+          class_.tc_ancestors
+      in
+      env, SMap.add c ht sub_implements
 
 and trait_exists env acc trait =
   match trait with
@@ -664,13 +652,14 @@ and class_const_decl c (env, acc) (h, id, e) =
 and class_class_decl class_id =
   let pos, name = class_id in
   let reason = Reason.Rclass_class (pos, name) in
+  let classname_ty = (reason, Tprim (Tclassname name)) in
   {
     ce_final       = false;
     ce_is_xhp_attr = false;
     ce_override    = false;
     ce_synthesized = true;
     ce_visibility  = Vpublic;
-    ce_type        = (reason, Tprim Tstring);
+    ce_type        = classname_ty;
     ce_origin      = name;
   }
 
@@ -838,8 +827,12 @@ and type_typedef_naming_and_decl nenv tdef =
     match tdef.Ast.t_kind with
     | Ast.Alias _ -> false
     | Ast.NewType _ -> true
-  in
-  let params, tcstr, concrete_type as decl = Naming.typedef nenv tdef in
+  in let {
+    t_tparams = params;
+    t_constraint = tcstr;
+    t_kind = concrete_type;
+    t_user_attributes = _;
+  } as decl = Naming.typedef nenv tdef in
   let filename = Pos.filename pos in
   let tcopt = Naming.typechecker_options nenv in
   let env = Typing_env.empty tcopt filename in
@@ -856,9 +849,9 @@ and type_typedef_naming_and_decl nenv tdef =
       let env = sub_type env constraint_type concrete_type in
       env, Some constraint_type
   in
-  let visibility =
-    if is_abstract then Env.Typedef.Private else Env.Typedef.Public
-  in
+  let visibility = if is_abstract
+    then Typing_heap.Typedef.Private
+    else Typing_heap.Typedef.Public in
   let tdecl = visibility, params, tcstr, concrete_type, pos in
   Env.add_typedef tid tdecl;
   Naming_heap.TypedefHeap.add tid decl;

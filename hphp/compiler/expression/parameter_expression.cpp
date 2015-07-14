@@ -107,20 +107,21 @@ const std::string ParameterExpression::getTypeHintDisplayName() const {
 ///////////////////////////////////////////////////////////////////////////////
 // parser functions
 
-void ParameterExpression::parseHandler(ClassScopePtr cls) {
+void ParameterExpression::parseHandler(FileScopeRawPtr file,
+                                       ClassScopePtr cls) {
   // Trait has not been 'inlined' into using class so context is not available
   if (!m_type.empty() && !cls->isTrait()) {
     fixupSelfAndParentTypehints(cls);
 
     if (m_defaultValue) {
-      compatibleDefault();
+      compatibleDefault(file);
     }
   }
 }
 
 void ParameterExpression::fixupSelfAndParentTypehints(ClassScopePtr cls) {
   if (m_type == "self") {
-    m_type = cls->getName();
+    m_type = toLower(cls->getOriginalName());
   } else if (m_type == "parent") {
     if (!cls->getOriginalParent().empty()) {
       m_type = toLower(cls->getOriginalParent());
@@ -133,14 +134,6 @@ void ParameterExpression::fixupSelfAndParentTypehints(ClassScopePtr cls) {
 
 void ParameterExpression::analyzeProgram(AnalysisResultPtr ar) {
   if (m_defaultValue) m_defaultValue->analyzeProgram(ar);
-
-  if (ar->getPhase() == AnalysisResult::AnalyzeFinal) {
-    // Have to use non const ref params for magic methods
-    FunctionScopePtr fs = getFunctionScope();
-    if (fs->isMagicMethod() || fs->getName() == "offsetget") {
-      fs->getVariables()->addLvalParam(m_name);
-    }
-  }
 }
 
 ConstructPtr ParameterExpression::getNthKid(int n) const {
@@ -186,7 +179,7 @@ static bool useHackTypeHintErrorMessage(const char* hint) {
   }
 }
 
-void ParameterExpression::compatibleDefault() {
+void ParameterExpression::compatibleDefault(FileScopeRawPtr file) {
   bool compat = true;
   if (!m_defaultValue || !hasTypeHint()) return;
 
@@ -273,7 +266,8 @@ void ParameterExpression::compatibleDefault() {
 
     string name = getName();
     string tdefault = HPHP::tname(defaultType);
-    parseTimeFatal(Compiler::BadDefaultValueType, msg,
+    parseTimeFatal(file,
+                   Compiler::BadDefaultValueType, msg,
                    name.c_str(), tdefault.c_str(),
                    getTypeHintDisplayName().c_str());
   }
@@ -322,7 +316,7 @@ void ParameterExpression::outputCodeModel(CodeGenerator &cg) {
     m_defaultValue->outputCodeModel(cg);
   }
   cg.printPropertyHeader("sourceLocation");
-  cg.printLocation(this->getLocation());
+  cg.printLocation(this);
   cg.printObjectFooter();
 }
 

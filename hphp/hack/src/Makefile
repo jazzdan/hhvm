@@ -1,6 +1,3 @@
-# Copyright (c) 2014, Facebook, Inc.
-# All rights reserved.
-
 ################################################################################
 #                            Variables to override                             #
 ################################################################################
@@ -36,48 +33,49 @@ endif
 ################################################################################
 
 MODULES=\
-  utils\
   client\
-  socket\
-  server\
-  stubs\
-  typing\
-  naming\
-  parsing\
-  format\
   deps\
-  heap\
-  globals\
-  procs\
-  search\
-  hhi\
   dfind\
+  emitter\
+  format\
+  globals\
   h2tp/common\
   h2tp/mapper\
-  h2tp/unparser\
   h2tp/test\
+  h2tp/unparser\
   h2tp\
+  heap\
+  hhi\
+  naming\
+  parsing\
+  procs\
+  search\
+  server\
+  socket\
+  stubs\
   third-party/avl\
   third-party/core\
-  $(INOTIFY)\
-  $(FSNOTIFY)
+  typing\
+  utils\
+  $(FSNOTIFY)\
+  $(INOTIFY)
 
 NATIVE_OBJECT_FILES=\
   heap/hh_shared.o\
-  utils/realpath.o\
-  $(INOTIFY)/$(notdir $(INOTIFY))_stubs.o\
-  utils/nproc.o\
   hhi/hhi_elf.o\
   utils/get_build_id.gen.o\
-  utils/get_build_id.o
+  utils/get_build_id.o\
+  utils/nproc.o\
+  utils/realpath.o\
+  $(INOTIFY)/$(notdir $(INOTIFY))_stubs.o
 
 OCAML_LIBRARIES=\
-  unix\
-  str
+  str\
+  unix
 
 NATIVE_LIBRARIES=\
-  $(ELF)\
-  pthread
+  pthread\
+  $(ELF)
 
 TARGETS=_build/hh_server.native _build/hh_client.native _build/hh_single_type_check.native \
 		_build/hh_format.native _build/h2tp.native _build/test_unparser.native
@@ -121,18 +119,16 @@ $(TARGETS): $(ALL_SRC_FILES)
 	# build-hack-native-deps is a dependency of $(TARGETS) but as it is phony
 	# we place it here to avoid unnecessary rebuilds
 	$(MAKE) build-hack-native-deps build-hhi-archive
-	ocamlbuild -no-links $(INCLUDE_OPTS) $(LIB_OPTS) \
-		-lflags "$(LINKER_FLAGS)" \
+	ocamlbuild -no-links -cflag -g $(INCLUDE_OPTS) $(LIB_OPTS) \
+		-lflags "-g $(LINKER_FLAGS)" \
 		$(patsubst _build/%,%,$(TARGETS))
 	# Touching the targets is necessary because the ocaml build
-	# doens't change the modification dates of the targets if
+	# doesn't change the modification dates of the targets if
 	# the new binaries are exactly the same as the old ones
 	touch $(TARGETS)
 
 build-hack-native-deps: build-hack-stubs
-	# ocamlbuild before 4.00 does not pass thru cflags when building native C
-	# objects, because they're not important, right? So use this super ugly hack.
-	ocamlbuild -ocamlc "ocamlopt $(EXTRA_INCLUDE_OPTS) $(EXTRA_CC_OPTS)" $(NATIVE_OBJECT_FILES)
+	ocamlbuild -cflags "-g $(EXTRA_INCLUDE_OPTS) $(EXTRA_CC_OPTS)" $(NATIVE_OBJECT_FILES)
 
 build-hack-stubs:
 	REV="const char* const BuildInfo_kRevision = \"$$(git rev-parse HEAD)\";"; \
@@ -158,6 +154,7 @@ test: build-hack copy-hack-files
 	python3 ../test/verify.py --program ../bin/hh_single_type_check ../test/autocomplete
 	python3 ../test/verify.py --program ../bin/hh_single_type_check ../test/color
 	python3 ../test/verify.py --program ../bin/hh_single_type_check ../test/coverage
+	python3 ../test/verify.py --program ../bin/hh_single_type_check ../test/dumpsymbolinfo
 	python3 ../test/verify.py --program ../bin/hh_format ../test/format
 	python3 ../test/verify.py --program ../bin/hh_single_type_check ../test/suggest
 	python3 ../test/verify.py --program ../bin/hh_single_type_check ../test/typecheck

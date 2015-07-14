@@ -16,7 +16,7 @@
 */
 
 #include "hphp/runtime/ext/string/ext_string.h"
-#include "hphp/runtime/base/bstring.h"
+#include "hphp/util/bstring.h"
 #include "hphp/runtime/base/comparisons.h"
 #include "hphp/runtime/base/container-functions.h"
 #include "hphp/runtime/base/actrec-args.h"
@@ -503,7 +503,7 @@ String HHVM_FUNCTION(implode,
                              "one of the arguments");
     return String();
   }
-  return StringUtil::Implode(items, delim);
+  return StringUtil::Implode(items, delim, false);
 }
 
 String HHVM_FUNCTION(join,
@@ -668,7 +668,16 @@ Variant HHVM_FUNCTION(str_replace,
                       const Variant& subject,
                       VRefParam count /* = null */) {
   int nCount = 0;
-  Variant ret = str_replace(search, replace, subject, nCount, true);
+  Variant ret;
+  if (LIKELY(search.isString() && replace.isString() && subject.isString())) {
+    // Short-cut for the most common (and simplest) case
+    ret = string_replace(subject.asCStrRef(), search.asCStrRef(),
+                         replace.asCStrRef(), nCount, true);
+  } else {
+    // search, replace, and subject can all be arrays. str_replace() reduces all
+    // the valid combinations to multiple string_replace() calls.
+    ret = str_replace(search, replace, subject, nCount, true);
+  }
   count = nCount;
   return ret;
 }
@@ -1046,8 +1055,8 @@ Variant strpbrk_char_list_has_nulls_slow(const String& haystack,
   assert(memchr(charListData, '\0', charListSz) != nullptr);
 
   // in order to use strcspn, remove all null byte(s) from char_list
-  auto charListWithoutNull = (char*) smart_malloc(charListSz);
-  SCOPE_EXIT { smart_free(charListWithoutNull); };
+  auto charListWithoutNull = (char*) req::malloc(charListSz);
+  SCOPE_EXIT { req::free(charListWithoutNull); };
 
   auto copy_ptr = charListWithoutNull;
   auto const charListStop = charListData + char_list.size();
@@ -1414,7 +1423,7 @@ Array HHVM_FUNCTION(str_getcsv,
   char enclosure_char = check_arg(enclosure, '"');
   char escape_char = check_arg(escape, '\\');
 
-  auto dummy = makeSmartPtr<PlainFile>();
+  auto dummy = req::make<PlainFile>();
   return dummy->readCSV(0, delimiter_char, enclosure_char, escape_char, &str);
 }
 
@@ -1638,7 +1647,7 @@ String HHVM_FUNCTION(fb_htmlspecialchars,
                      const String& charset /* = "ISO-8859-1" */,
                      const Variant& extra /* = empty_array_ref */) {
   if (!extra.isNull() && !extra.isArray()) {
-    throw_expected_array_exception();
+    throw_expected_array_exception("fb_htmlspecialchars");
   }
   const Array& arr_extra = extra.isNull() ? empty_array_ref : extra.toArray();
   return StringUtil::HtmlEncodeExtra(str, StringUtil::toQuoteStyle(flags),

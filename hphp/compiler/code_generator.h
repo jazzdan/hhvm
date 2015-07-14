@@ -36,7 +36,6 @@ DECLARE_EXTENDED_BOOST_TYPES(ClassScope);
 DECLARE_BOOST_TYPES(FunctionScope);
 DECLARE_BOOST_TYPES(FileScope);
 DECLARE_BOOST_TYPES(LoopStatement);
-DECLARE_BOOST_TYPES(Location);
 DECLARE_BOOST_TYPES(Expression);
 DECLARE_BOOST_TYPES(ExpressionList);
 
@@ -105,40 +104,6 @@ public:
     BreakScopeBitMask = InsideSwitch | StaticCases
   };
 
-  class ClassScopeCompare {
-  public:
-    bool operator()(const ClassScopeRawPtr &p1,
-                    const ClassScopeRawPtr &p2) const {
-      return cmp(p1, p2) < 0;
-    }
-    int cmp(const ClassScopeRawPtr &p1, const ClassScopeRawPtr &p2) const;
-  };
-  typedef std::set<ClassScopeRawPtr,ClassScopeCompare> ClassScopeSet;
-  typedef std::pair<ClassScopeRawPtr, std::string> UsedClassConst;
-  class ClassConstCompare : public ClassScopeCompare {
-  public:
-    bool operator()(const UsedClassConst &p1,
-                    const UsedClassConst &p2) const {
-      int d = cmp(p1.first, p2.first);
-      if (d) return d < 0;
-      return p1.second < p2.second;
-    }
-  };
-  typedef std::set<UsedClassConst,ClassConstCompare> UsedClassConstSet;
-
-public:
-  /**
-   * Hash strings to numbers so we can build a switch statement.
-   */
-  typedef std::map<int, std::vector<const char *> > MapIntToStringVec;
-  static void BuildJumpTable(const std::vector<const char *> &strings,
-                             MapIntToStringVec &out, int tableSize,
-                             bool caseInsensitive);
-
-  static const char *STARTER_MARKER;
-  static const char *SPLITTER_MARKER;
-  static const char *HASH_INCLUDE;
-
 public:
   CodeGenerator() {} // only for creating a dummy code generator
   explicit CodeGenerator(std::ostream *primary, Output output = PickledPHP,
@@ -147,7 +112,7 @@ public:
   /**
    * ...if it was passed in from constructor.
    */
-  std::string getFileName() const { return m_filename;}
+  const std::string& getFileName() const { return m_filename;}
 
   /**
    * What kind of program are we generating?
@@ -298,7 +263,8 @@ public:
   void printAsEnclosedBlock(StatementPtr s) { printAsBlock(s, true); }
   void printStatementVector(StatementListPtr sl);
   void printStatementVector(StatementPtr s);
-  void printLocation(LocationPtr location);
+  void printLocation(ConstructPtr what) { printLocation(what.get()); }
+  void printLocation(const Construct* what);
   void setAstClassPrefix(const std::string &prefix) { m_astPrefix = prefix; }
 private:
   std::string m_filename;

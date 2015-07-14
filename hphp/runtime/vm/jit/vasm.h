@@ -79,7 +79,7 @@ private:                                                  \
 DECLARE_VNUM(Vlabel, true, "B");
 
 /*
- * Vpoint is a handle to record or retreive a code address.
+ * Vpoint is a handle to record or retrieve a code address.
  */
 DECLARE_VNUM(Vpoint, false, "P");
 
@@ -94,11 +94,6 @@ DECLARE_VNUM(Vtuple, true, "T");
 DECLARE_VNUM(VcallArgsId, true, "V");
 
 #undef DECLARE_VNUM
-
-/*
- * Vreg discriminator.
- */
-enum class VregKind : uint8_t { Any, Gpr, Simd, Sf };
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -119,10 +114,13 @@ void allocateRegisters(Vunit&, const Abi&);
 void fuseBranches(Vunit&);
 void optimizeExits(Vunit&);
 void optimizeJmps(Vunit&);
+void hoistFallbackccs(Vunit&);
 void optimizeCopies(Vunit&, const Abi&);
+void optimizePhis(Vunit&);
 void removeDeadCode(Vunit&);
 void removeTrivialNops(Vunit&);
 template<typename Folder> void foldImms(Vunit&);
+void simplify(Vunit&);
 
 ///////////////////////////////////////////////////////////////////////////////
 

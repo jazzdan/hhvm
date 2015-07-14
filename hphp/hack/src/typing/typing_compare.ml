@@ -116,13 +116,23 @@ module CompareTypes = struct
         List.fold_left2 string_id acc ids1 ids2
     | Ttuple tyl1, Ttuple tyl2 ->
         tyl acc tyl1 tyl2
-    | Tshape fdm1, Tshape fdm2 ->
-        ShapeMap.fold begin fun name v1 acc ->
+    | Tshape (fields_known1, fdm1), Tshape (fields_known2, fdm2) ->
+        let subst, same = ShapeMap.fold begin fun name v1 acc ->
           match ShapeMap.get name fdm2 with
           | None -> default
           | Some v2 ->
               ty acc v1 v2
-        end fdm1 acc
+        end fdm1 acc in
+        begin match fields_known1, fields_known2 with
+          | FieldsPartiallyKnown unset_fields1,
+            FieldsPartiallyKnown unset_fields2 ->
+              ShapeMap.fold begin fun name unset_pos1 acc ->
+                match ShapeMap.get name unset_fields2 with
+                  | None -> default
+                  | Some unset_pos2 -> pos acc unset_pos1 unset_pos2
+               end unset_fields1 (subst, same)
+          | _ -> subst, same && (fields_known1 = fields_known2)
+        end
     | (Tany | Tmixed | Tarray (_, _) | Tfun _ | Taccess (_, _) | Tgeneric (_, _)
        | Toption _ | Tprim _ | Tshape _| Tapply (_, _) | Ttuple _ | Tthis
       ), _ -> default
@@ -232,7 +242,7 @@ module CompareTypes = struct
       c1.tc_abstract = c2.tc_abstract &&
       c1.tc_kind = c2.tc_kind &&
       c1.tc_name = c2.tc_name &&
-      SSet.compare c1.tc_members_init c2.tc_members_init = 0 &&
+      SSet.compare c1.tc_deferred_init_members c2.tc_deferred_init_members = 0 &&
       SSet.compare c1.tc_extends c2.tc_extends = 0 &&
       SSet.compare c1.tc_req_ancestors_extends c2.tc_req_ancestors_extends = 0
     in
@@ -247,10 +257,6 @@ module CompareTypes = struct
     let acc = constructor acc c1.tc_construct c2.tc_construct in
     let acc = ancestry acc c1.tc_req_ancestors c2.tc_req_ancestors in
     let acc = ancestry acc c1.tc_ancestors c2.tc_ancestors in
-    let acc = ancestry acc
-      c1.tc_ancestors_checked_when_concrete
-      c2.tc_ancestors_checked_when_concrete
-    in
     let acc = cmp_opt enum_type acc c1.tc_enum_type c2.tc_enum_type in
     acc
 
@@ -278,6 +284,7 @@ module TraversePos(ImplementPos: sig val pos: Pos.t -> Pos.t end) = struct
     | Raccess p              -> Raccess (pos p)
     | Rarith p               -> Rarith (pos p)
     | Rarith_ret p           -> Rarith_ret (pos p)
+    | Rarray_plus_ret p      -> Rarray_plus_ret (pos p)
     | Rstring2 p             -> Rstring2 (pos p)
     | Rcomp p                -> Rcomp (pos p)
     | Rconcat p              -> Rconcat (pos p)
@@ -316,6 +323,7 @@ module TraversePos(ImplementPos: sig val pos: Pos.t -> Pos.t end) = struct
     | Rtype_access (r1, x, r2) -> Rtype_access (reason r1, x, reason r2)
     | Rexpr_dep_type (r, p, n) -> Rexpr_dep_type (reason r, pos p, n)
     | Rnullsafe_op p           -> Rnullsafe_op (pos p)
+    | Rtconst_no_cstr (p, s)   -> Rtconst_no_cstr (pos p, s)
 
   let string_id (p, x) = pos p, x
 
@@ -335,7 +343,8 @@ module TraversePos(ImplementPos: sig val pos: Pos.t -> Pos.t end) = struct
     | Tapply (sid, xl)     -> Tapply (string_id sid, List.map (ty) xl)
     | Taccess (root_ty, ids) ->
         Taccess (ty root_ty, List.map string_id ids)
-    | Tshape fdm           -> Tshape (ShapeMap.map ty fdm)
+    | Tshape (fields_known, fdm) ->
+        Tshape (fields_known, ShapeMap.map ty fdm)
 
   and ty_opt x = opt_map ty x
 
@@ -376,7 +385,7 @@ module TraversePos(ImplementPos: sig val pos: Pos.t -> Pos.t end) = struct
   and class_type tc =
     { tc_final                 = tc.tc_final                          ;
       tc_need_init             = tc.tc_need_init                      ;
-      tc_members_init          = tc.tc_members_init                   ;
+      tc_deferred_init_members = tc.tc_deferred_init_members          ;
       tc_abstract              = tc.tc_abstract                       ;
       tc_members_fully_known   = tc.tc_members_fully_known            ;
       tc_kind                  = tc.tc_kind                           ;
@@ -394,7 +403,6 @@ module TraversePos(ImplementPos: sig val pos: Pos.t -> Pos.t end) = struct
       tc_smethods              = SMap.map class_elt tc.tc_smethods    ;
       tc_construct             = opt_map class_elt (fst tc.tc_construct), (snd tc.tc_construct);
       tc_ancestors             = SMap.map ty tc.tc_ancestors          ;
-      tc_ancestors_checked_when_concrete    = SMap.map ty tc.tc_ancestors_checked_when_concrete ;
       tc_user_attributes       = tc.tc_user_attributes                ;
       tc_enum_type             = opt_map enum_type tc.tc_enum_type    ;
     }
@@ -405,12 +413,12 @@ module TraversePos(ImplementPos: sig val pos: Pos.t -> Pos.t end) = struct
     }
 
   and typedef = function
-    | Typing_env.Typedef.Error as x -> x
-    | Typing_env.Typedef.Ok (is_abstract, tparams, tcstr, h, pos) ->
+    | Typing_heap.Typedef.Error as x -> x
+    | Typing_heap.Typedef.Ok (is_abstract, tparams, tcstr, h, pos) ->
         let tparams = List.map type_param tparams in
         let tcstr = ty_opt tcstr in
         let tdef = (is_abstract, tparams, tcstr, ty h, pos) in
-        Typing_env.Typedef.Ok tdef
+        Typing_heap.Typedef.Ok tdef
 end
 
 (*****************************************************************************)
@@ -519,12 +527,11 @@ let class_big_diff class1 class2 =
   let class1 = NormalizeSig.class_type class1 in
   let class2 = NormalizeSig.class_type class2 in
   class1.tc_need_init <> class2.tc_need_init ||
-  SSet.compare class1.tc_members_init class2.tc_members_init <> 0 ||
+  SSet.compare class1.tc_deferred_init_members class2.tc_deferred_init_members <> 0 ||
   class1.tc_members_fully_known <> class2.tc_members_fully_known ||
   class1.tc_kind <> class2.tc_kind ||
   class1.tc_tparams <> class2.tc_tparams ||
   SMap.compare class1.tc_ancestors class2.tc_ancestors <> 0 ||
-  SMap.compare class1.tc_ancestors_checked_when_concrete class2.tc_ancestors_checked_when_concrete <> 0 ||
   SMap.compare class1.tc_req_ancestors class2.tc_req_ancestors <> 0 ||
   SSet.compare class1.tc_req_ancestors_extends class2.tc_req_ancestors_extends <> 0 ||
   SSet.compare class1.tc_extends class2.tc_extends <> 0 ||

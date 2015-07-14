@@ -35,9 +35,9 @@
 #include "hphp/runtime/vm/jit/translator-inline.h"
 
 #include "hphp/runtime/ext/array/ext_array.h"
-#include "hphp/runtime/ext/pdo_driver.h"
-#include "hphp/runtime/ext/pdo_mysql.h"
-#include "hphp/runtime/ext/pdo_sqlite.h"
+#include "hphp/runtime/ext/pdo/pdo_driver.h"
+#include "hphp/runtime/ext/pdo/pdo_mysql.h"
+#include "hphp/runtime/ext/pdo/pdo_sqlite.h"
 #include "hphp/runtime/ext/std/ext_std_classobj.h"
 #include "hphp/runtime/ext/std/ext_std_function.h"
 #include "hphp/runtime/ext/stream/ext_stream.h"
@@ -476,7 +476,7 @@ const StaticString
 
 void throw_pdo_exception(const Variant& code, const Variant& info,
                          const char *fmt, ...) {
-  ObjectData *obj = SystemLib::AllocPDOExceptionObject();
+  auto obj = SystemLib::AllocPDOExceptionObject();
   obj->o_set(s_code, code, s_PDOException);
 
   va_list ap;
@@ -489,7 +489,7 @@ void throw_pdo_exception(const Variant& code, const Variant& info,
   if (!info.isNull()) {
     obj->o_set(s_errorInfo, info, s_PDOException);
   }
-  throw Object(obj);
+  throw obj;
 }
 
 void pdo_raise_impl_error(sp_PDOResource rsrc, PDOStatement* stmt,
@@ -600,7 +600,7 @@ static Object pdo_stmt_instantiate(sp_PDOResource dbh, const String& clsname,
   if (!cls) {
     return Object();
   }
-  return ObjectData::newInstance(cls);
+  return Object{cls};
 }
 
 static void pdo_stmt_construct(sp_PDOStatement stmt, Object object,
@@ -941,15 +941,17 @@ struct PDORequestData final : RequestEventHandler {
     m_persistent_connections.clear();
   }
 
-  void addPersistent(const SmartPtr<PDOResource>& pdo) {
+  void addPersistent(const req::ptr<PDOResource>& pdo) {
+    pdo->conn()->is_persistent = true;
     m_persistent_connections.insert(pdo);
   }
-  void removePersistent(const SmartPtr<PDOResource>& pdo) {
+  void removePersistent(const req::ptr<PDOResource>& pdo) {
+    pdo->conn()->is_persistent = false;
     m_persistent_connections.erase(pdo);
   }
 
 public:
-  std::unordered_set<SmartPtr<PDOResource>> m_persistent_connections;
+  std::unordered_set<req::ptr<PDOResource>> m_persistent_connections;
 };
 IMPLEMENT_STATIC_REQUEST_LOCAL(PDORequestData, s_pdo_request_data);
 
@@ -1137,7 +1139,7 @@ static Variant HHVM_METHOD(PDO, prepare, const String& statement,
     PDO_HANDLE_DBH_ERR(data->m_dbh);
     return false;
   }
-  PDOStatementData *pdostmt = Native::data<PDOStatementData>(ret.get());
+  PDOStatementData *pdostmt = Native::data<PDOStatementData>(ret);
 
   if (data->m_dbh->conn()->preparer(statement, &pdostmt->m_stmt, options)) {
     auto stmt = pdostmt->m_stmt;
@@ -1499,7 +1501,7 @@ static Variant HHVM_METHOD(PDO, query, const String& sql,
        "failed to instantiate user supplied statement class");
     return init_null();
   }
-  PDOStatementData *pdostmt = Native::data<PDOStatementData>(ret.get());
+  PDOStatementData *pdostmt = Native::data<PDOStatementData>(ret);
 
   if (data->m_dbh->conn()->preparer(sql, &pdostmt->m_stmt, Array())) {
     auto stmt = pdostmt->m_stmt;
@@ -1834,7 +1836,7 @@ static bool do_fetch_common(sp_PDOStatement stmt, PDOFetchOrientation ori,
 }
 
 static bool do_fetch_func_prepare(sp_PDOStatement stmt) {
-  if (!HHVM_FN(is_callable)(stmt->fetch.func)) {
+  if (!is_callable(stmt->fetch.func)) {
     pdo_raise_impl_error(stmt->dbh, stmt, "HY000",
                          "user-supplied function must be a valid callback");
     return false;
@@ -2129,7 +2131,7 @@ static int register_bound_param(const Variant& paramno, VRefParam param,
                                 int64_t type, int64_t max_value_len,
                                 const Variant& driver_params,
                                 sp_PDOStatement stmt, bool is_param) {
-  auto p = makeSmartPtr<PDOBoundParam>();
+  auto p = req::make<PDOBoundParam>();
   // need to make sure this is NULL, in case a fatal errors occurs before it's
   // set inside really_register_bound_param
   p->stmt = NULL;
@@ -2461,7 +2463,7 @@ int pdo_parse_params(sp_PDOStatement stmt, const String& in, String &out) {
   int ret = 0;
   int newbuffer_len;
   Array params;
-  SmartPtr<PDOBoundParam> param;
+  req::ptr<PDOBoundParam> param;
   int query_type = PDO_PLACEHOLDER_NONE;
   struct placeholder *placeholders = NULL, *placetail = NULL, *plc = NULL;
 
@@ -2481,7 +2483,7 @@ int pdo_parse_params(sp_PDOStatement stmt, const String& in, String &out) {
         query_type |= PDO_PLACEHOLDER_POSITIONAL;
       }
 
-      plc = (placeholder*)smart_malloc(sizeof(*plc));
+      plc = (placeholder*)req::malloc(sizeof(*plc));
       memset(plc, 0, sizeof(*plc));
       plc->next = NULL;
       plc->pos = s.tok;
@@ -2735,7 +2737,7 @@ clean_up:
     plc = placeholders;
     placeholders = plc->next;
     plc->quoted.reset();
-    smart_free(plc);
+    req::free(plc);
   }
 
   return ret;
@@ -2767,7 +2769,7 @@ static Variant HHVM_METHOD(PDOStatement, execute,
   if (!params.empty()) {
     data->m_stmt->bound_params.reset();
     for (ArrayIter iter(params); iter; ++iter) {
-      auto param = makeSmartPtr<PDOBoundParam>();
+      auto param = req::make<PDOBoundParam>();
       param->param_type = PDO_PARAM_STR;
       param->parameter = iter.second();
       param->stmt = NULL;
@@ -3417,6 +3419,14 @@ static Variant HHVM_METHOD(PDOStatement, __sleep) {
 static class PDOExtension final : public Extension {
 public:
   PDOExtension() : Extension("pdo", " 1.0.4dev") {}
+
+  std::string mysql_default_socket;
+
+  void moduleLoad(const IniSetting::Map& ini, Hdf config) override {
+    IniSetting::Bind(this, IniSetting::PHP_INI_SYSTEM,
+                     "pdo_mysql.default_socket", nullptr,
+                     &mysql_default_socket);
+  }
 
   void moduleInit() override {
     HHVM_FE(pdo_drivers);

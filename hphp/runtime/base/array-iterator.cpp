@@ -28,7 +28,7 @@
 #include "hphp/runtime/base/shape.h"
 #include "hphp/runtime/base/apc-local-array.h"
 #include "hphp/runtime/base/builtin-functions.h"
-#include "hphp/runtime/ext/ext_collections.h"
+#include "hphp/runtime/ext/collections/ext_collections-idl.h"
 
 #include "hphp/runtime/base/mixed-array-defs.h"
 #include "hphp/runtime/base/packed-array-defs.h"
@@ -823,7 +823,7 @@ void MArrayIter::escalateCheck() {
     if (!data) return;
     auto const esc = data->escalate();
     if (data != esc) {
-      cellSet(make_tv<KindOfArray>(esc), *getRef()->tv());
+      cellMove(make_tv<KindOfArray>(esc), *getRef()->tv());
     }
     return;
   }
@@ -832,7 +832,6 @@ void MArrayIter::escalateCheck() {
   auto const data = getAd();
   auto const esc = data->escalate();
   if (data != esc) {
-    esc->incRefCount();
     decRefArr(data);
     setAd(esc);
   }
@@ -844,7 +843,7 @@ ArrayData* MArrayIter::cowCheck() {
     if (!data) return nullptr;
     if (data->hasMultipleRefs() && !data->noCopyOnWrite()) {
       data = data->copyWithStrongIterators();
-      cellSet(make_tv<KindOfArray>(data), *getRef()->tv());
+      cellMove(make_tv<KindOfArray>(data), *getRef()->tv());
     }
     return data;
   }
@@ -853,7 +852,7 @@ ArrayData* MArrayIter::cowCheck() {
   auto const data = getAd();
   if (data->hasMultipleRefs() && !data->noCopyOnWrite()) {
     ArrayData* copied = data->copyWithStrongIterators();
-    copied->incRefCount();
+    assert(data != copied);
     decRefArr(data);
     setAd(copied);
     return copied;
@@ -906,7 +905,7 @@ bool Iter::init(TypedValue* c1) {
       } else {
         Class* ctx = arGetContextClass(vmfp());
         auto ctxStr = ctx ? ctx->nameStr() : StrNR();
-        Array iterArray(obj->o_toIterArray(ctxStr));
+        Array iterArray(obj->o_toIterArray(ctxStr, ObjectData::EraseRefs));
         ArrayData* ad = iterArray.get();
         (void) new (&arr()) ArrayIter(ad);
       }
@@ -1360,7 +1359,7 @@ static int64_t new_iter_object_any(Iter* dest, ObjectData* obj, Class* ctx,
         TRACE(2, "%s: I %p, obj %p, ctx %p, iterate as array\n",
               __func__, dest, obj, ctx);
         auto ctxStr = ctx ? ctx->nameStr() : StrNR();
-        Array iterArray(itObj->o_toIterArray(ctxStr));
+        Array iterArray(itObj->o_toIterArray(ctxStr, ObjectData::EraseRefs));
         ArrayData* ad = iterArray.get();
         (void) new (&dest->arr()) ArrayIter(ad);
         itType = ArrayIter::TypeArray;
@@ -1696,7 +1695,7 @@ int64_t new_miter_object(Iter* dest, RefData* ref, Class* ctx,
   TRACE(2, "%s: I %p, obj %p, ctx %p, iterate as array\n",
         __func__, dest, obj, ctx);
   auto ctxStr = ctx ? ctx->nameStr() : StrNR();
-  Array iterArray(itObj->o_toIterArray(ctxStr, true));
+  Array iterArray(itObj->o_toIterArray(ctxStr, ObjectData::CreateRefs));
   ArrayData* ad = iterArray.detach();
   (void) new (&dest->marr()) MArrayIter(ad);
   if (UNLIKELY(!dest->marr().advance())) {

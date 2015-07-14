@@ -104,6 +104,7 @@ struct ImmFolder {
   }
   void fold(storeb& in, Vinstr& out) {
     int val;
+    if (out.origin && out.origin->marker().sk().prologue()) return;
     if (match_byte(in.s, val)) { out = storebi{val, in.m}; }
   }
   void fold(storel& in, Vinstr& out) {
@@ -295,7 +296,7 @@ void foldImms(Vunit& unit) {
   folder.vals.resize(unit.next_vr);
   folder.valid.resize(unit.next_vr);
   // figure out which Vregs are constants and stash their values.
-  for (auto& entry : unit.constants) {
+  for (auto& entry : unit.constToReg) {
     folder.valid.set(entry.second);
     folder.vals[entry.second] = entry.first.val;
   }

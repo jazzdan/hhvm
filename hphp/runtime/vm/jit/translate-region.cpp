@@ -49,28 +49,29 @@ namespace {
 /*
  * Create a map from RegionDesc::BlockId -> IR Block* for all region blocks.
  */
-void createBlockMap(IRGS& irgs,
-                    const RegionDesc& region,
-                    BlockIdToIRBlockMap& blockIdToIRBlock) {
+BlockIdToIRBlockMap createBlockMap(IRGS& irgs, const RegionDesc& region) {
+  auto ret = BlockIdToIRBlockMap{};
+
   auto& irb = *irgs.irb;
-  blockIdToIRBlock.clear();
   auto const& blocks = region.blocks();
   for (unsigned i = 0; i < blocks.size(); i++) {
-    auto rBlock = blocks[i];
-    auto id = rBlock->id();
+    auto const rBlock = blocks[i];
+    auto const id = rBlock->id();
     DEBUG_ONLY Offset bcOff = rBlock->start().offset();
     assertx(IMPLIES(i == 0, bcOff == irb.unit().bcOff()));
 
     // NB: This maps the region entry block to a new IR block, even though
     // we've already constructed an IR entry block. We'll make the IR entry
     // block jump to this block.
-    Block* iBlock = irb.unit().defBlock();
+    auto const iBlock = irb.unit().defBlock();
 
-    blockIdToIRBlock[id] = iBlock;
+    ret[id] = iBlock;
     FTRACE(1,
            "createBlockMaps: RegionBlock {} => IRBlock {} (BC offset = {})\n",
            id, iBlock->id(), bcOff);
   }
+
+  return ret;
 }
 
 /*
@@ -139,7 +140,7 @@ bool blockHasUnprocessedPred(
  * single predecessor is a merge point if it's the target of both the
  * fallthru and the taken paths.
  */
-static bool isMerge(const RegionDesc& region, RegionDesc::BlockId blockId) {
+bool isMerge(const RegionDesc& region, RegionDesc::BlockId blockId) {
   auto const& preds = region.preds(blockId);
   if (preds.size() == 0)               return false;
   if (preds.size() > 1)                return true;
@@ -160,24 +161,55 @@ static bool isMerge(const RegionDesc& region, RegionDesc::BlockId blockId) {
  * Returns whether any successor of `blockId' in the `region' is a
  * merge-point within the `region'.
  */
-static bool hasMergeSucc(const RegionDesc&   region,
-                         RegionDesc::BlockId blockId) {
+bool hasMergeSucc(const RegionDesc& region,
+                  RegionDesc::BlockId blockId) {
   for (auto succ : region.succs(blockId)) {
     if (isMerge(region, succ)) return true;
   }
   return false;
 }
 
+
+/*
+ * If this region's entry block is at the entry point for a function, we have
+ * some additional information we can assume about the types of non-parameter
+ * local variables.
+ *
+ * Note: we can't assume anything if there are DV initializers, because they
+ * can run arbitrary code before they get to the main entry point (and they do,
+ * in some hhas-based builtins), if they even go there (they aren't required
+ * to).
+ */
+void emitEntryAssertions(IRGS& irgs, const Func* func, SrcKey sk) {
+  if (sk.offset() != func->base()) return;
+  for (auto& pinfo : func->params()) {
+    if (pinfo.hasDefaultValue()) return;
+  }
+  if (func->isClosureBody()) {
+    // In a closure, non-parameter locals can have types other than Uninit
+    // after the prologue runs.  (Local 0 will be the closure itself, and other
+    // locals will have used vars unpacked into them.)  We rely on hhbbc to
+    // assert these types.
+    return;
+  }
+  auto const numLocs = func->numLocals();
+  for (auto loc = func->numParams(); loc < numLocs; ++loc) {
+    auto const location = RegionDesc::Location::Local { loc };
+    irgen::assertTypeLocation(irgs, location, TUninit);
+  }
+}
+
 /*
  * Emit type and reffiness prediction guards.
  */
-void emitPredictionGuards(IRGS& irgs,
+void emitPredictionsAndPreConditions(IRGS& irgs,
                           const RegionDesc& region,
                           const RegionDesc::BlockPtr block,
                           bool isEntry) {
-  auto sk = block->start();
-  auto bcOff = sk.offset();
-  auto typePreds = makeMapWalker(block->typePreds());
+  auto const sk = block->start();
+  auto const bcOff = sk.offset();
+  auto typePredictions = makeMapWalker(block->typePredictions());
+  auto typePreConditions = makeMapWalker(block->typePreConditions());
   auto refPreds  = makeMapWalker(block->reffinessPreds());
 
   // If the block has a next retranslations in the chain that is a
@@ -189,21 +221,28 @@ void emitPredictionGuards(IRGS& irgs,
     }
   }
 
-  if (isEntry) irgen::ringbufferEntry(irgs, Trace::RBTypeTraceletGuards, sk);
+  if (isEntry) {
+    irgen::ringbufferEntry(irgs, Trace::RBTypeTraceletGuards, sk);
+    emitEntryAssertions(irgs, block->func(), sk);
+  }
 
-  const bool emitPredictions = RuntimeOption::EvalHHIRConstrictGuards;
-
-  // Emit type guards.
-  while (typePreds.hasNext(sk)) {
-    auto const& pred = typePreds.next();
+  // Emit type predictions.
+  while (typePredictions.hasNext(sk)) {
+    auto const& pred = typePredictions.next();
     auto type = pred.type;
     auto loc  = pred.location;
+    irgen::predictTypeLocation(irgs, loc, type);
+  }
+
+  // Emit type guards/preconditions.
+  while (typePreConditions.hasNext(sk)) {
+    auto const& preCond = typePreConditions.next();
+    auto type = preCond.type;
+    auto loc  = preCond.location;
     if (type <= TCls) {
       // Do not generate guards for class; instead assert the type.
       assertx(loc.tag() == RegionDesc::Location::Tag::Stack);
       irgen::assertTypeLocation(irgs, loc, type);
-    } else if (emitPredictions) {
-      irgen::predictTypeLocation(irgs, loc, type);
     } else {
       // Check inner type eagerly if it is the first block during profiling.
       // Otherwise only check for BoxedInitCell.
@@ -213,7 +252,7 @@ void emitPredictionGuards(IRGS& irgs,
     }
   }
 
-  // Emit reffiness guards.
+  // Emit reffiness predictions.
   while (refPreds.hasNext(sk)) {
     auto const& pred = refPreds.next();
     irgen::checkRefs(irgs, pred.arSpOffset, pred.mask, pred.vals, bcOff);
@@ -250,13 +289,12 @@ void emitPredictionGuards(IRGS& irgs,
     }
   }
 
-  assertx(!typePreds.hasNext());
+  assertx(!typePredictions.hasNext());
   assertx(!refPreds.hasNext());
 }
 
 void initNormalizedInstruction(
   NormalizedInstruction& inst,
-  jit::vector<DynLocation>& dynLocs,
   MapWalker<RegionDesc::Block::ParamByRefMap>& byRefs,
   IRGS& irgs,
   const RegionDesc& region,
@@ -279,20 +317,9 @@ void initNormalizedInstruction(
 
   auto const inputInfos = getInputs(inst);
 
-  // Populate the NormalizedInstruction's input vector, using types
-  // from IRBuilder.
-  dynLocs.reserve(inputInfos.size());
-  auto newDynLoc = [&] (const InputInfo& ii) {
-    dynLocs.emplace_back(ii.loc,
-                         irgen::predictedTypeFromLocation(irgs, ii.loc));
-    FTRACE(2, "predictedTypeFromLocation: {} -> {}\n",
-           ii.loc.pretty(), dynLocs.back().rtt);
-    return &dynLocs.back();
-  };
-
   FTRACE(2, "populating inputs for {}\n", inst.toString());
   for (auto const& ii : inputInfos) {
-    inst.inputs.push_back(newDynLoc(ii));
+    inst.inputs.push_back(ii.loc);
   }
 
   if (inputInfos.needsRefCheck) {
@@ -534,8 +561,7 @@ TranslateResult irGenRegion(IRGS& irgs,
   auto& irb = *irgs.irb;
 
   // Create a map from region blocks to their corresponding initial IR blocks.
-  BlockIdToIRBlockMap blockIdToIRBlock;
-  createBlockMap(irgs, region, blockIdToIRBlock);
+  auto blockIdToIRBlock = createBlockMap(irgs, region);
 
   // Prepare to start translation of the first region block.
   auto const entry = irb.unit().entry();
@@ -543,9 +569,11 @@ TranslateResult irGenRegion(IRGS& irgs,
 
   // Make the IR entry block jump to the IR block we mapped the region entry
   // block to (they are not the same!).
-  auto const irBlock = blockIdToIRBlock[region.entry()->id()];
-  always_assert(irBlock != entry);
-  irgen::gen(irgs, Jmp, irBlock);
+  {
+    auto const irBlock = blockIdToIRBlock[region.entry()->id()];
+    always_assert(irBlock != entry);
+    irgen::gen(irgs, Jmp, irBlock);
+  }
 
   RegionDesc::BlockIdSet processedBlocks;
 
@@ -566,8 +594,7 @@ TranslateResult irGenRegion(IRGS& irgs,
     SCOPE_ASSERT_DETAIL("IRGS") { return show(irgs); };
 
     const Func* topFunc = nullptr;
-    TransID profTransId = getTransId(blockId);
-    irgs.profTransID = profTransId;
+    if (hasTransID(blockId)) irgs.profTransID = getTransID(blockId);
     irgs.inlineLevel = block->inlineLevel();
     irgs.firstBcInst = inEntryRetransChain(blockId, region);
     irgen::prepareForNextHHBC(irgs, nullptr, sk, false);
@@ -576,7 +603,7 @@ TranslateResult irGenRegion(IRGS& irgs,
     // FrameState for the IR block corresponding to the start of this
     // region block, and it also sets the map from BC offsets to IR
     // blocks for the successors of this block in the region.
-    Block* irBlock = blockIdToIRBlock[blockId];
+    auto const irBlock = blockIdToIRBlock[blockId];
     const bool hasUnprocPred = blockHasUnprocessedPred(region, blockId,
                                                        processedBlocks);
     // Note: a block can have an unprocessed predecessor even if the
@@ -598,7 +625,7 @@ TranslateResult irGenRegion(IRGS& irgs,
     auto const isEntry = block == region.entry();
     auto const checkOuterTypeOnly =
       !isEntry || mcg->tx().mode() != TransKind::Profile;
-    emitPredictionGuards(irgs, region, block, isEntry);
+    emitPredictionsAndPreConditions(irgs, region, block, isEntry);
     irb.resetGuardFailBlock();
 
     // Generate IR for each bytecode instruction in this block.
@@ -616,9 +643,8 @@ TranslateResult irGenRegion(IRGS& irgs,
 
       // Create and initialize the instruction.
       NormalizedInstruction inst(sk, block->unit());
-      jit::vector<DynLocation> dynLocs;
-      bool toInterpInst = toInterp.count(ProfSrcKey{profTransId, sk});
-      initNormalizedInstruction(inst, dynLocs, byRefs, irgs, region, blockId,
+      bool toInterpInst = toInterp.count(ProfSrcKey{irgs.profTransID, sk});
+      initNormalizedInstruction(inst, byRefs, irgs, region, blockId,
                                 topFunc, lastInstr, toInterpInst);
 
       // If this block ends with an inlined FCall, we don't emit anything for
@@ -635,10 +661,13 @@ TranslateResult irGenRegion(IRGS& irgs,
                show(irgs));
         auto returnSk = inst.nextSk();
         auto returnFuncOff = returnSk.offset() - block->func()->base();
-        irgen::beginInlining(irgs, inst.imm[0].u_IVA, callee, returnFuncOff);
-        // "Fallthrough" into the callee's first block
-        auto const calleeEntry = region.block(singleSucc(region, blockId));
-        irgen::endBlock(irgs, calleeEntry->start().offset(), inst.nextIsMerge);
+        if (irgen::beginInlining(irgs, inst.imm[0].u_IVA, callee,
+                                 returnFuncOff)) {
+          // "Fallthrough" into the callee's first block
+          auto const calleeEntry = region.block(singleSucc(region, blockId));
+          irgen::endBlock(irgs, calleeEntry->start().offset(),
+                          inst.nextIsMerge);
+        }
         continue;
       }
 
@@ -662,12 +691,21 @@ TranslateResult irGenRegion(IRGS& irgs,
 
       // Emit IR for the body of the instruction.
       try {
-        if (!skipTrans) translateInstr(irgs, inst, checkOuterTypeOnly);
+        if (!skipTrans) {
+          // Only emit ExitPlaceholders for the first bytecode in the block,
+          // and if we're not inlining. The inlining decision could be smarter
+          // but this is enough for now since we never emit guards in inlined
+          // functions (t7385908).
+          auto const emitExitPlaceholder = i == 0 && !irgen::isInlining(irgs);
+          translateInstr(irgs, inst, checkOuterTypeOnly, emitExitPlaceholder);
+        }
       } catch (const FailedIRGen& exn) {
-        ProfSrcKey psk{profTransId, sk};
+        ProfSrcKey psk{irgs.profTransID, sk};
         always_assert_flog(!toInterp.count(psk),
                            "IR generation failed with {}\n",
                            exn.what());
+        FTRACE(1, "ir generation for {} failed with {}\n",
+          inst.toString(), exn.what());
         toInterp.insert(psk);
         return TranslateResult::Retry;
       }
@@ -704,6 +742,7 @@ TranslateResult irGenRegion(IRGS& irgs,
     assertx(!byRefs.hasNext());
     assertx(!knownFuncs.hasNext());
   }
+  irgen::sealUnit(irgs);
   irGenTimer.stop();
   return TranslateResult::Success;
 }
@@ -762,7 +801,8 @@ TranslateResult translateRegion(IRGS& irgs,
 
   // For profiling translations, grab the postconditions to be used
   // for region selection whenever we decide to retranslate.
-  pConds.clear();
+  pConds.changed.clear();
+  pConds.refined.clear();
   if (mcg->tx().mode() == TransKind::Profile &&
       RuntimeOption::EvalJitPGOUsePostConditions) {
     auto& unit = irgs.irb->unit();

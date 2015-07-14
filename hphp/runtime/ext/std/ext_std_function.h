@@ -27,12 +27,8 @@ namespace HPHP {
 Array HHVM_FUNCTION(get_defined_functions);
 bool HHVM_FUNCTION(function_exists, const String& function_name,
   bool autoload = true);
-bool HHVM_FUNCTION(is_callable, const Variant& v, bool syntax = false,
-  VRefParam name = uninit_null());
 Variant HHVM_FUNCTION(call_user_func, const Variant& function,
   const Array& params = null_array);
-Variant HHVM_FUNCTION(call_user_func_array, const Variant& function,
-  const Array& params);
 Variant HHVM_FUNCTION(forward_static_call_array, const Variant& function,
   const Array& params);
 Variant HHVM_FUNCTION(forward_static_call, const Variant& function,

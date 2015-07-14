@@ -20,6 +20,7 @@
 #include "hphp/runtime/base/execution-context.h"
 
 #include "hphp/hhbbc/eval-cell.h"
+#include "hphp/hhbbc/type-builtins.h"
 #include "hphp/hhbbc/type-system.h"
 #include "hphp/hhbbc/interp-internal.h"
 
@@ -44,12 +45,14 @@ X(base64decode)
 X(base64_encode)
 X(base_convert)
 X(bindec)
+X(ceil)
 X(chr)
 X(count)
 X(decbin)
 X(dechex)
 X(decoct)
 X(explode)
+X(floor)
 X(getrandmax)
 X(gettype)
 X(hexdec)
@@ -57,6 +60,8 @@ X(implode)
 X(in_array)
 X(log)
 X(log10)
+X(max)
+X(mt_rand)
 X(mt_getrandmax)
 X(octdec)
 X(ord)
@@ -76,8 +81,6 @@ X(urldecode)
 X(urlencode)
 X(utf8_encode)
 X(version_compare)
-X(floor)
-X(ceil)
 X(sqrt)
 X(abs)
 
@@ -136,12 +139,14 @@ folly::Optional<Type> const_fold(ISS& env, const bc::FCallBuiltin& op) {
   X(s_base64_encode)
   X(s_base_convert)
   X(s_bindec)
+  X(s_ceil)
   X(s_chr)
   X(s_count)
   X(s_decbin)
   X(s_dechex)
   X(s_decoct)
   X(s_explode)
+  X(s_floor)
   X(s_getrandmax)
   X(s_gettype)
   X(s_hexdec)
@@ -167,8 +172,6 @@ folly::Optional<Type> const_fold(ISS& env, const bc::FCallBuiltin& op) {
   X(s_urlencode)
   X(s_utf8_encode)
   X(s_version_compare)
-  X(s_floor)
-  X(s_ceil)
   X(s_sqrt)
   X(s_abs)
 
@@ -236,11 +239,90 @@ bool builtin_abs(ISS& env, const bc::FCallBuiltin& op) {
   return true;
 }
 
+/**
+ * if the input to these functions is known to be integer or double,
+ * the result will be a double. Otherwise, the result is conditional
+ * on a successful conversion and an accurate number of arguments.
+ */
+bool floatIfNumeric(ISS& env, const bc::FCallBuiltin& op) {
+  if (op.arg1 != 1) return false;
+  auto const ty = popC(env);
+  push(env, ty.subtypeOf(TNum) ? TDbl : TInitUnc);
+  return true;
+}
+bool builtin_ceil(ISS& env, const bc::FCallBuiltin& op) {
+  return floatIfNumeric(env, op);
+}
+bool builtin_floor(ISS& env, const bc::FCallBuiltin& op) {
+  return floatIfNumeric(env, op);
+}
+
+bool builtin_mt_rand(ISS& env, const bc::FCallBuiltin& op) {
+  // In PHP, the two arg version can return false on input failure, but we don't
+  // behave the same as PHP. we allow 1-arg calls and we allow the params to
+  // come in any order.
+  auto success = [&] {
+    popT(env);
+    popT(env);
+    push(env, TInt);
+    return true;
+  };
+
+  switch (op.arg1) {
+  case 0:
+    return success();
+  case 1:
+    return topT(env, 0).subtypeOf(TNum) ? success() : false;
+  case 2:
+    if (topT(env, 0).subtypeOf(TNum) &&
+        topT(env, 1).subtypeOf(TNum)) {
+      return success();
+    }
+    break;
+  }
+  return false;
+}
+
+/**
+ * The compiler specializes the two-arg version of min() and max()
+ * into an HNI provided helper. If both arguments are an integer
+ * or both arguments are a double, we know the exact type of the
+ * return value. If they're both numeric, the result is at least
+ * numeric.
+ */
+bool minmax2(ISS& env, const bc::FCallBuiltin& op) {
+  // this version takes exactly two arguments.
+  if (op.arg1 != 2) return false;
+
+  auto const t0 = topT(env, 0);
+  auto const t1 = topT(env, 1);
+  if (!t0.subtypeOf(TNum) || !t1.subtypeOf(TNum)) return false;
+  popC(env);
+  popC(env);
+  push(env, t0 == t1 ? t0 : TNum);
+  return true;
+}
+bool builtin_max2(ISS& env, const bc::FCallBuiltin& op) {
+  return minmax2(env, op);
+}
+bool builtin_min2(ISS& env, const bc::FCallBuiltin& op) {
+  return minmax2(env, op);
+}
+
+const StaticString
+  s_max2("__SystemLib\\max2"),
+  s_min2("__SystemLib\\min2");
+
 bool handle_builtin(ISS& env, const bc::FCallBuiltin& op) {
 #define X(x) if (op.str3->isame(s_##x.get())) return builtin_##x(env, op);
 
-  X(get_class)
   X(abs)
+  X(ceil)
+  X(floor)
+  X(get_class)
+  X(max2)
+  X(min2)
+  X(mt_rand)
 
 #undef X
 
@@ -262,11 +344,12 @@ void builtin(ISS& env, const bc::FCallBuiltin& op) {
   // Try to handle the builtin at the type level.
   if (handle_builtin(env, op)) return;
 
-  // Fall back to generic version.  (This can at least push some return type
-  // information from HNI, but it won't be great in general.)
+  auto const name = op.str3;
+  auto const func = env.index.resolve_func(env.ctx, name);
+  auto const rt = env.index.lookup_return_type(env.ctx, func);
   for (auto i = uint32_t{0}; i < op.arg1; ++i) popT(env);
-  specialFunctionEffects(env, op.str3);
-  push(env, TInitGen);
+  specialFunctionEffects(env, name);
+  push(env, rt);
 }
 
 //////////////////////////////////////////////////////////////////////

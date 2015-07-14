@@ -36,15 +36,15 @@ public:
   virtual ~TempFile();
 
   // overriding ResourceData
-  const String& o_getClassNameHook() const { return classnameof(); }
+  const String& o_getClassNameHook() const override { return classnameof(); }
 
   // implementing File
   bool open(const String& filename, const String& mode) override;
   bool close() override;
 
   Object await(uint16_t events, double timeout) override {
-    throw Object(SystemLib::AllocExceptionObject(
-      "Temporary stream does not support awaiting"));
+    SystemLib::throwExceptionObject(
+      "Temporary stream does not support awaiting");
   }
 
 private:

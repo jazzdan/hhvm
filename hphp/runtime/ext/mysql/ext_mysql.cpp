@@ -365,7 +365,7 @@ static Variant HHVM_FUNCTION(mysql_fetch_result,
       return true;
     }
 
-    return Variant(makeSmartPtr<MySQLResult>(mysql_result));
+    return Variant(req::make<MySQLResult>(mysql_result));
 }
 
 static Variant HHVM_FUNCTION(mysql_unbuffered_query, const String& query,
@@ -387,7 +387,7 @@ static Variant HHVM_FUNCTION(mysql_list_dbs,
     raise_warning("Unable to save MySQL query result");
     return false;
   }
-  return Variant(makeSmartPtr<MySQLResult>(res));
+  return Variant(req::make<MySQLResult>(res));
 }
 
 static Variant HHVM_FUNCTION(mysql_list_tables, const String& database,
@@ -402,7 +402,7 @@ static Variant HHVM_FUNCTION(mysql_list_tables, const String& database,
     raise_warning("Unable to save MySQL query result");
     return false;
   }
-  return Variant(makeSmartPtr<MySQLResult>(res));
+  return Variant(req::make<MySQLResult>(res));
 }
 
 static Variant HHVM_FUNCTION(mysql_list_processes,
@@ -414,7 +414,7 @@ static Variant HHVM_FUNCTION(mysql_list_processes,
     raise_warning("Unable to save MySQL query result");
     return false;
   }
-  return Variant(makeSmartPtr<MySQLResult>(res));
+  return Variant(req::make<MySQLResult>(res));
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -508,7 +508,7 @@ static Variant HHVM_FUNCTION(mysql_async_query_result,
   mySQL->m_async_query.clear();
 
   MYSQL_RES* mysql_result = mysql_use_result(conn);
-  auto r = makeSmartPtr<MySQLResult>(mysql_result);
+  auto r = req::make<MySQLResult>(mysql_result);
   r->setAsyncConnection(mySQL);
   return Variant(std::move(r));
 }
@@ -892,7 +892,7 @@ static Variant HHVM_FUNCTION(mysql_fetch_field, const Resource& result,
   MySQLFieldInfo *info;
   if (!(info = res->fetchFieldInfo())) return false;
 
-  Object obj(SystemLib::AllocStdClassObject());
+  auto obj = SystemLib::AllocStdClassObject();
   obj->o_set("name",         info->name);
   obj->o_set("table",        info->table);
   obj->o_set("def",          info->def);

@@ -114,7 +114,7 @@ struct EmptyArray {
   static constexpr auto Dequeue = &PopOrDequeue;
   static ArrayData* Copy(const ArrayData* ad);
   static ArrayData* CopyWithStrongIterators(const ArrayData*);
-  static ArrayData* NonSmartCopy(const ArrayData*);
+  static ArrayData* CopyStatic(const ArrayData*);
   static ArrayData* ZSetInt(ArrayData* ad, int64_t k, RefData* v);
   static ArrayData* ZSetStr(ArrayData* ad, StringData* k, RefData* v);
   static ArrayData* ZAppend(ArrayData* ad, RefData* v, int64_t* key_ptr);
@@ -129,9 +129,6 @@ struct EmptyArray {
   static ArrayData* Escalate(const ArrayData* ad) {
     return const_cast<ArrayData*>(ad);
   }
-
-  static void InitMixed(MixedArray*, RefCount count, uint32_t size,
-                        int64_t nextIntKey);
 
 private:
   static std::pair<ArrayData*,TypedValue*> MakePacked(TypedValue);

@@ -14,7 +14,7 @@
    +----------------------------------------------------------------------+
 */
 #include "hphp/runtime/base/types.h"
-#include "hphp/runtime/base/smart-containers.h"
+#include "hphp/runtime/base/req-containers.h"
 #include "hphp/runtime/base/memory-manager-defs.h"
 #include "hphp/runtime/base/heap-scan.h"
 #include "hphp/runtime/base/thread-info.h"
@@ -81,10 +81,10 @@ struct Marker {
   void operator()(const StringBuffer&);
   void operator()(const NameValueTable&);
 
-  template<class T> void operator()(const smart::vector<T>& c) {
+  template<class T> void operator()(const req::vector<T>& c) {
     for (auto& e : c) (*this)(e);
   }
-  template<class T> void operator()(const smart::set<T>& c) {
+  template<class T> void operator()(const req::set<T>& c) {
     for (auto& e : c) (*this)(e);
   }
   template<class T,class U> void operator()(const std::pair<T,U>& p) {
@@ -92,12 +92,12 @@ struct Marker {
     (*this)(p.second);
   }
   template<class T,class U,class V,class W>
-  void operator()(const smart::hash_map<T,U,V,W>& c) {
+  void operator()(const req::hash_map<T,U,V,W>& c) {
     for (auto& e : c) (*this)(e); // each element is pair<T,U>
   }
 
   // Explicitly ignored field types.
-  void operator()(const LowClassPtr&) {}
+  void operator()(const LowPtr<Class>&) {}
   void operator()(const Unit*) {}
   void operator()(int) {}
 
@@ -137,6 +137,8 @@ void Marker::operator()(const ObjectData* p) {
   if (p->getAttribute(ObjectData::HasNativeData)) {
     // HNI style native object; mark the NativeNode header, queue the object.
     // [NativeNode][NativeData][ObjectData][props] is one allocation.
+    // For generators -
+    // [NativeNode][locals][Resumable][GeneratorData][ObjectData]
     auto h = Native::getNativeNode(p, p->getVMClass()->getNativeDataInfo());
     if (mark(h)) {
       enqueue(p);
@@ -203,7 +205,7 @@ void Marker::operator()(const StringData* p) {
 // ignore the interior pointer; NVT should be scanned by VarEnv::scan.
 void Marker::operator()(const NameValueTable* p) {}
 
-// VarEnvs are allocated with smart_new, so they aren't first-class heap
+// VarEnvs are allocated with req::make, so they aren't first-class heap
 // objects. assume a VarEnv* is a unique ptr, and scan it eagerly.
 void Marker::operator()(const VarEnv* p) {
   if (p) p->scan(*this);
@@ -217,7 +219,7 @@ void Marker::operator()(const String& p)    { (*this)(p.get()); }
 void Marker::operator()(const Array& p)     { (*this)(p.get()); }
 void Marker::operator()(const ArrayNoDtor& p) { (*this)(p.arr()); }
 void Marker::operator()(const Object& p)    { (*this)(p.get()); }
-void Marker::operator()(const Resource& p)  { (*this)(p.get()); }
+void Marker::operator()(const Resource& p)  { (*this)(deref<ResourceData>(p)); }
 void Marker::operator()(const Variant& p)   { (*this)(*p.asTypedValue()); }
 
 void Marker::operator()(const StringBuffer& p) { p.scan(*this); }
@@ -295,7 +297,6 @@ void Marker::operator()(const void* start, size_t len) {
       case HK::BigMalloc:
       case HK::Free:
       case HK::Hole:
-      case HK::Debug:
         break;
     }
     // for ObjectData embedded after NativeNode, ResumableNode, BigObj,
@@ -360,7 +361,6 @@ void Marker::init() {
         break;
       case HK::Free:
       case HK::Hole:
-      case HK::Debug:
         break;
     }
   });
@@ -378,7 +378,7 @@ void Marker::trace() {
 // another pass through the heap now that everything is marked.
 void Marker::sweep() {
   marked_ = ambig_marked_ = 0;
-  MM().forEachHeader([&](Header* h) {
+  MM().iterate([&](Header* h) {
     if (h->hdr_.cmark) ambig_marked_ += h->size();
     if (h->hdr_.mark) marked_ += h->size();
     switch (h->kind()) {
@@ -414,12 +414,11 @@ void Marker::sweep() {
         break;
       case HK::SmallMalloc:
       case HK::BigMalloc:
-        // these are managed by smart_malloc and should not have been marked.
+        // these are managed by req::malloc and should not have been marked.
         assert(!h->hdr_.mark);
         break;
       case HK::Free:
       case HK::Hole:
-      case HK::Debug:
         // free memory; mark implies dangling pointer bug. cmark is ok because
         // dangling ambiguous pointers are not bugs, e.g. on the stack.
         assert(!h->hdr_.mark);

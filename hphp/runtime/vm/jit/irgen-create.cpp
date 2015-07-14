@@ -117,27 +117,26 @@ SSATmp* allocObjFast(IRGS& env, const Class* cls) {
  * so we can just burn it into the TC without using RDS.
  */
 void emitCreateCl(IRGS& env, int32_t numParams, const StringData* clsName) {
-  auto const cls = Unit::lookupClassOrUniqueClass(clsName);
-  auto const invokeFunc = cls->lookupMethod(s_uuinvoke.get());
-  auto const clonedFunc = invokeFunc->cloneAndSetClass(
+  auto cls = Unit::lookupClassOrUniqueClass(clsName)->rescope(
     const_cast<Class*>(curClass(env))
   );
   assertx(cls && (cls->attrs() & AttrUnique));
 
+  auto const func = cls->getCachedInvoke();
+
   auto const closure = allocObjFast(env, cls);
-  gen(env, IncRef, closure);
 
   auto const ctx = [&]{
     if (!curClass(env)) return cns(env, nullptr);
     auto const ldctx = gen(env, LdCtx, fp(env));
-    if (invokeFunc->attrs() & AttrStatic) {
+    if (func->isStatic()) {
       return gen(env, ConvClsToCctx, gen(env, LdClsCtx, ldctx));
     }
     gen(env, IncRefCtx, ldctx);
     return ldctx;
   }();
+
   gen(env, StClosureCtx, closure, ctx);
-  gen(env, StClosureFunc, FuncData(clonedFunc), closure);
 
   SSATmp* args[numParams];
   for (int32_t i = 0; i < numParams; ++i) {
@@ -155,11 +154,11 @@ void emitCreateCl(IRGS& env, int32_t numParams, const StringData* clsName) {
     );
   }
 
+  assertx(cls->numDeclProperties() == func->numStaticLocals() + numParams);
+
   // Closure static variables are per instance, and need to start
   // uninitialized.  After numParams use vars, the remaining instance
   // properties hold any static locals.
-  assertx(cls->numDeclProperties() ==
-         clonedFunc->numStaticLocals() + numParams);
   for (int32_t numDeclProperties = cls->numDeclProperties();
       propId < numDeclProperties;
       ++propId) {
@@ -244,7 +243,7 @@ void emitNewPackedArray(IRGS& env, int32_t numArgs) {
       InitPackedArray,
       IndexData { static_cast<uint32_t>(numArgs - i - 1) },
       array,
-      popC(env)
+      popC(env, DataTypeGeneric)
     );
   }
   push(env, array);
@@ -308,20 +307,13 @@ void emitAddNewElemC(IRGS& env) {
   push(env, gen(env, AddNewElem, arr, val));
 }
 
-void emitNewCol(IRGS& env, int type, int size) {
-  auto const extra = NewColData {
-    static_cast<CollectionType>(type),
-    static_cast<uint32_t>(size)
-  };
-  push(env, gen(env, NewCol, extra));
+void emitNewCol(IRGS& env, int type) {
+  push(env, gen(env, NewCol, NewColData{type}));
 }
 
 void emitColFromArray(IRGS& env, int type) {
   auto const arr = popC(env);
-  push(env, gen(env,
-                NewColFromArray,
-                NewColFromArrayData(static_cast<CollectionType>(type)),
-                arr));
+  push(env, gen(env, NewColFromArray, NewColData{type}, arr));
 }
 
 void emitMapAddElemC(IRGS& env) {

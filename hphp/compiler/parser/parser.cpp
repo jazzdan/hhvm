@@ -103,19 +103,19 @@
 #include "hphp/runtime/base/annot-type.h"
 
 #define NEW_EXP0(cls)                                           \
-  cls##Ptr(new cls(BlockScopePtr(),                             \
-                   getLocation()))
-#define NEW_EXP(cls, e...)                                      \
-  cls##Ptr(new cls(BlockScopePtr(),                             \
-                   getLocation(), ##e))
+  std::make_shared<cls>(BlockScopePtr(),                        \
+                        getRange())
+#define NEW_EXP(cls, ...)                                      \
+  std::make_shared<cls>(BlockScopePtr(),                        \
+                        getRange(), ##__VA_ARGS__)
 #define NEW_STMT0(cls)                                          \
-  cls##Ptr(new cls(BlockScopePtr(), getLabelScope(),            \
-                   getLocation()))
-#define NEW_STMT(cls, e...)                                     \
-  cls##Ptr(new cls(BlockScopePtr(), getLabelScope(),            \
-                   getLocation(), ##e))
+  std::make_shared<cls>(BlockScopePtr(), getLabelScope(),       \
+                        getRange())
+#define NEW_STMT(cls, ...)                                     \
+  std::make_shared<cls>(BlockScopePtr(), getLabelScope(),       \
+                        getRange(), ##__VA_ARGS__)
 
-#define PARSE_ERROR(fmt, args...)  HPHP_PARSER_ERROR(fmt, this, ##args)
+#define PARSE_ERROR(fmt, ...)  HPHP_PARSER_ERROR(fmt, this, ##__VA_ARGS__)
 
 using namespace HPHP::Compiler;
 
@@ -125,10 +125,10 @@ SimpleFunctionCallPtr NewSimpleFunctionCall(
   EXPRESSION_CONSTRUCTOR_PARAMETERS,
   const std::string &name, bool hadBackslash, ExpressionListPtr params,
   ExpressionPtr cls) {
-  return SimpleFunctionCallPtr(
-    new SimpleFunctionCall(
+  return
+    std::make_shared<SimpleFunctionCall>(
       EXPRESSION_CONSTRUCTOR_DERIVED_PARAMETER_VALUES,
-      name, hadBackslash, params, cls));
+      name, hadBackslash, params, cls);
 }
 
 static std::string fully_qualified_name_as_alias_key(const std::string &fqn,
@@ -178,7 +178,7 @@ Parser::Parser(Scanner &scanner, const char *fileName,
   auto const md5str = mangleUnitMd5(scanner.getMd5());
   MD5 md5 = MD5(md5str.c_str());
 
-  m_file = FileScopePtr(new FileScope(m_fileName, fileSize, md5));
+  m_file = std::make_shared<FileScope>(m_fileName, fileSize, md5);
 
   newScope();
   m_staticVars.push_back(StringToExpressionPtrVecMap());
@@ -221,9 +221,6 @@ void Parser::error(const char* fmt, ...) {
 }
 
 void Parser::parseFatal(const Location* loc, const char* msg) {
-  // we can't use loc->file, as the bison parser doesn't track that in YYLTYPE
-  auto file = m_file->getName().c_str();
-
   // If the parser has a message, prepend it to the given message. Otherwise
   // just use the given message.
   std::string str = getMessage();
@@ -234,14 +231,15 @@ void Parser::parseFatal(const Location* loc, const char* msg) {
   }
   strInput += msg;
 
-  auto exn = ParseTimeFatalException(file, loc->line0, "%s", strInput.c_str());
+  auto exn = ParseTimeFatalException(m_file->getName(), loc->r.line0,
+                                     "%s", strInput.c_str());
 
   exn.setParseFatal();
   throw exn;
 }
 
 void Parser::fatal(const Location* loc, const char* msg) {
-  throw ParseTimeFatalException(loc->file, loc->line0, "%s", msg);
+  throw ParseTimeFatalException(m_file->getName(), loc->r.line0, "%s", msg);
 }
 
 string Parser::errString() {
@@ -292,7 +290,7 @@ void Parser::onNewLabelScope(bool fresh) {
     m_labelScopes.push_back(LabelScopePtrVec());
   }
   assert(!m_labelScopes.empty());
-  LabelScopePtr labelScope(new LabelScope());
+  auto labelScope = std::make_shared<LabelScope>();
   m_labelScopes.back().push_back(labelScope);
 }
 
@@ -476,7 +474,7 @@ void Parser::onCallParam(Token &out, Token *params, Token &expr,
   }
   if (unpack) {
     (dynamic_pointer_cast<ExpressionList>(out->exp))->setContainsUnpack();
-    expr->exp->setContext(Expression::UnpackParameter);
+    expr->exp->setIsUnpack();
   }
   out->exp->addElement(expr->exp);
 }
@@ -488,9 +486,11 @@ void Parser::onCall(Token &out, bool dynamic, Token &name, Token &params,
     clsExp = cls->exp;
   }
   if (dynamic) {
-    out->exp = NEW_EXP(DynamicFunctionCall, name->exp,
-                       dynamic_pointer_cast<ExpressionList>(params->exp),
-                       clsExp);
+    auto call = NEW_EXP(DynamicFunctionCall, name->exp,
+                        dynamic_pointer_cast<ExpressionList>(params->exp),
+                        clsExp);
+    call->onParse(m_ar, m_file);
+    out->exp = call;
   } else {
     string funcName = name.text();
     // strip out namespaces for func_get_args and friends check
@@ -523,6 +523,7 @@ void Parser::onCall(Token &out, bool dynamic, Token &name, Token &params,
            stripped == "invariant_callback_register" ||
            stripped == "invariant" ||
            stripped == "invariant_violation" ||
+           stripped == "idx" ||
            stripped == "asio_get_current_context_idx" ||
            stripped == "asio_get_running_in_context" ||
            stripped == "asio_get_running" ||
@@ -541,19 +542,10 @@ void Parser::onCall(Token &out, bool dynamic, Token &name, Token &params,
       }
     }
 
-    SimpleFunctionCallPtr call
-      (new SimpleFunctionCall
-       (BlockScopePtr(), getLocation(),
-        funcName, hadBackslash,
-        dynamic_pointer_cast<ExpressionList>(params->exp), clsExp));
-    if (m_scanner.isHHSyntaxEnabled() && !(name->num() & 2)) {
-      // If the function name is without any backslashes or
-      // namespace qualification then we treat this as a candidate
-      // for optimization via bytecode promotion.
-      // "idx" is the only function in that class for now but it's
-      // cheaper to set the bit that to check for the function name
-      call->setOptimizable();
-    }
+    auto call = NEW_EXP(SimpleFunctionCall,
+                        funcName, hadBackslash,
+                        dynamic_pointer_cast<ExpressionList>(params->exp),
+                        clsExp);
     out->exp = call;
 
     call->onParse(m_ar, m_file);
@@ -577,6 +569,7 @@ void Parser::onObjectProperty(Token &out, Token &base,
     auto om = NEW_EXP(ObjectMethodExpression, base->exp,
                       getAttributeMethodName, paramsExp,
                       propAccessType == PropAccessType::NullSafe);
+    om->onParse(m_ar, m_file);
     om->setIsXhpGetAttr();
     out->exp = om;
     return;
@@ -613,8 +606,10 @@ void Parser::onObjectMethodCall(Token &out, Token &base, bool nullsafe,
   } else {
     paramsExp = NEW_EXP0(ExpressionList);
   }
-  out->exp = NEW_EXP(ObjectMethodExpression, base->exp, prop->exp, paramsExp,
-                     nullsafe);
+  auto mcall = NEW_EXP(ObjectMethodExpression, base->exp, prop->exp, paramsExp,
+                       nullsafe);
+  mcall->onParse(m_ar, m_file);
+  out->exp = mcall;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -859,16 +854,15 @@ void Parser::onAssign(Token &out, Token &var, Token &expr, bool ref,
 void Parser::onAssignNew(Token &out, Token &var, Token &name, Token &args) {
   checkAllowedInWriteContext(var->exp);
   checkThisContext(var, ThisContextError::Assign);
-  ExpressionPtr exp =
-    NEW_EXP(NewObjectExpression, name->exp,
-            dynamic_pointer_cast<ExpressionList>(args->exp));
+  auto exp = NEW_EXP(NewObjectExpression, name->exp,
+                     dynamic_pointer_cast<ExpressionList>(args->exp));
+  exp->onParse(m_ar, m_file);
   out->exp = NEW_EXP(AssignmentExpression, var->exp, exp, true);
 }
 
 void Parser::onNewObject(Token &out, Token &name, Token &args) {
-  NewObjectExpressionPtr new_obj =
-    NEW_EXP(NewObjectExpression, name->exp,
-            dynamic_pointer_cast<ExpressionList>(args->exp));
+  auto new_obj = NEW_EXP(NewObjectExpression, name->exp,
+                         dynamic_pointer_cast<ExpressionList>(args->exp));
   new_obj->onParse(m_ar, m_file);
   out->exp = new_obj;
 }
@@ -1110,21 +1104,24 @@ void Parser::prepareConstructorParameters(StatementListPtr stmts,
     if (mod == 0) continue;
 
     if (isAbstract) {
-       param->parseTimeFatal(Compiler::InvalidAttribute,
-                             "parameter modifiers not allowed on "
-                             "abstract __construct");
+      param->parseTimeFatal(getFileScope(),
+                            Compiler::InvalidAttribute,
+                            "parameter modifiers not allowed on "
+                            "abstract __construct");
     }
     if (!stmts) {
-       param->parseTimeFatal(Compiler::InvalidAttribute,
-                             "parameter modifiers not allowed on "
-                             "__construct without a body");
+      param->parseTimeFatal(getFileScope(),
+                            Compiler::InvalidAttribute,
+                            "parameter modifiers not allowed on "
+                            "__construct without a body");
     }
     if (param->annotation()) {
       std::vector<std::string> typeNames;
       param->annotation()->getAllSimpleNames(typeNames);
       for (auto& typeName : typeNames) {
         if (isTypeVarInImmediateScope(typeName)) {
-          param->parseTimeFatal(Compiler::InvalidAttribute,
+          param->parseTimeFatal(getFileScope(),
+                                Compiler::InvalidAttribute,
                                 "parameter modifiers not supported with "
                                 "type variable annotation");
         }
@@ -1162,9 +1159,9 @@ string Parser::getFunctionName(FunctionType type, Token* name) {
 }
 
 StatementPtr Parser::onFunctionHelper(FunctionType type,
-                              Token *modifiers, Token &ret,
-                              Token &ref, Token *name, Token &params,
-                              Token &stmt, Token *attr, bool reloc) {
+                                      Token *modifiers, Token &ret,
+                                      Token &ref, Token *name, Token &params,
+                                      Token &stmt, Token *attr, bool reloc) {
   // prepare and validate function modifiers
   ModifierExpressionPtr modifiersExp = modifiers && modifiers->exp ?
     dynamic_pointer_cast<ModifierExpression>(modifiers->exp)
@@ -1243,10 +1240,9 @@ StatementPtr Parser::onFunctionHelper(FunctionType type,
   mth->getFunctionScope()->setAsync(modifiersExp->isAsync());
   m_funcContexts.pop_back();
 
-  LocationPtr loc = popFuncLocation();
+  auto loc = popFuncLocation();
   if (reloc) {
-    mth->getLocation()->line0 = loc->line0;
-    mth->getLocation()->char0 = loc->char0;
+    mth->setFirst(loc.line0, loc.char0);
   }
 
   return mth;
@@ -1421,7 +1417,7 @@ void Parser::onClass(Token &out, int type, Token &name, Token &base,
 
   // look for argument promotion in ctor
   ExpressionListPtr promote = NEW_EXP(ExpressionList);
-  cls->checkArgumentsToPromote(promote, type);
+  cls->checkArgumentsToPromote(m_file, promote, type);
   auto count = promote->getCount();
   cls->setPromotedParameterCount(count);
   for (int i = 0; i < count; i++) {
@@ -1434,17 +1430,17 @@ void Parser::onClass(Token &out, int type, Token &name, Token &base,
 
     // create the class variable and change the location to
     // point to the parameter location for error reporting
-    LocationPtr location = param->getLocation();
-    ModifierExpressionPtr modifier = NEW_EXP0(ModifierExpression);
+    auto range = param->getRange();
+    ModifierExpressionPtr modifier = std::make_shared<ModifierExpression>(
+      BlockScopePtr(), range);
     modifier->add(mod);
-    modifier->setLocation(location);
-    SimpleVariablePtr svar = NEW_EXP(SimpleVariable, name);
-    svar->setLocation(location);
-    ExpressionListPtr expList = NEW_EXP0(ExpressionList);
+    SimpleVariablePtr svar = std::make_shared<SimpleVariable>(
+      BlockScopePtr(), range, name);
+    ExpressionListPtr expList = std::make_shared<ExpressionList>(
+      BlockScopePtr(), range);
     expList->addElement(svar);
-    expList->setLocation(location);
-    ClassVariablePtr var = NEW_STMT(ClassVariable, modifier, type, expList);
-    var->setLocation(location);
+    ClassVariablePtr var = std::make_shared<ClassVariable>(
+      BlockScopePtr(), getLabelScope(), range, modifier, type, expList);
     cls->getStmts()->addElement(var);
   }
 
@@ -1636,9 +1632,7 @@ void Parser::finiParseTree() {
   pseudoMain->setOuterScope(m_file);
   m_file->setOuterScope(m_ar);
   m_ar->parseExtraCode(m_file->getName());
-  LocationPtr loc = getLocation();
-  loc->line0 = loc->char0 = 1;
-  pseudoMain->getStmt()->setLocation(loc);
+  pseudoMain->getStmt()->setFirst(1, 1);
 }
 
 void Parser::onHaltCompiler() {
@@ -1816,12 +1810,9 @@ void Parser::onReturn(Token &out, Token *expr) {
 }
 
 void Parser::invalidYield() {
-  ExpressionPtr exp(new SimpleFunctionCall(BlockScopePtr(),
-                                           getLocation(),
-                                           "yield",
-                                           false,
-                                           ExpressionListPtr(),
-                                           ExpressionPtr()));
+  ExpressionPtr exp = std::make_shared<SimpleFunctionCall>(
+    BlockScopePtr(), getRange(), "yield", false,
+    ExpressionListPtr(), ExpressionPtr());
   Compiler::Error(Compiler::InvalidYield, exp);
 }
 
@@ -1887,12 +1878,9 @@ void Parser::onYieldBreak(Token &out) {
 }
 
 void Parser::invalidAwait() {
-  ExpressionPtr exp(new SimpleFunctionCall(BlockScopePtr(),
-                                           getLocation(),
-                                           "async",
-                                           false,
-                                           ExpressionListPtr(),
-                                           ExpressionPtr()));
+  auto exp = std::make_shared<SimpleFunctionCall>(
+    BlockScopePtr(), getRange(), "async", false,
+    ExpressionListPtr(), ExpressionPtr());
   Compiler::Error(Compiler::InvalidAwait, exp);
 }
 
@@ -1963,8 +1951,8 @@ void Parser::onHashBang(Token &out, Token &text) {
 
 void Parser::onEcho(Token &out, Token &expr, bool html) {
   if (html) {
-    LocationPtr loc = getLocation();
-    if (loc->line1 == 2 && loc->char1 == 0 && expr->text()[0] == '#') {
+    auto const& loc = getRange();
+    if (loc.line1 == 2 && loc.char1 == 0 && expr->text()[0] == '#') {
       // skipping linux interpreter declaration
       out->stmt = NEW_STMT0(StatementList);
     } else {
@@ -2170,8 +2158,8 @@ void Parser::onTypedef(Token& out, const Token& name, const Token& type) {
 void Parser::onTypeAnnotation(Token& out, const Token& name,
                                           const Token& typeArgs) {
   out.set(name.num(), name.text());
-  out.typeAnnotation = TypeAnnotationPtr(
-    new TypeAnnotation(name.text(), typeArgs.typeAnnotation));
+  out.typeAnnotation = std::make_shared<TypeAnnotation>(
+    name.text(), typeArgs.typeAnnotation);
 
   // Namespaced identifiers (num & 1) can never be type variables.
   if ((name.num() & 1) && isTypeVar(name.text())) {
@@ -2367,7 +2355,7 @@ void Parser::AliasTable::set(std::string alias,
                              std::string name,
                              AliasType type,
                              int line_no) {
-  m_aliases[alias] = (NameEntry){name, type, line_no};
+  m_aliases[alias] = NameEntry{name, type, line_no};
 }
 
 /*
@@ -2402,68 +2390,69 @@ hphp_string_imap<std::string> Parser::getAutoAliasedClassesHelper() {
   hphp_string_imap<std::string> autoAliases;
   typedef AliasTable::AliasEntry AliasEntry;
   std::vector<AliasEntry> aliases {
-    (AliasEntry){"AsyncIterator", "HH\\AsyncIterator"},
-    (AliasEntry){"AsyncKeyedIterator", "HH\\AsyncKeyedIterator"},
-    (AliasEntry){"Traversable", "HH\\Traversable"},
-    (AliasEntry){"Container", "HH\\Container"},
-    (AliasEntry){"KeyedTraversable", "HH\\KeyedTraversable"},
-    (AliasEntry){"KeyedContainer", "HH\\KeyedContainer"},
-    (AliasEntry){"Iterator", "HH\\Iterator"},
-    (AliasEntry){"KeyedIterator", "HH\\KeyedIterator"},
-    (AliasEntry){"Iterable", "HH\\Iterable"},
-    (AliasEntry){"KeyedIterable", "HH\\KeyedIterable"},
-    (AliasEntry){"Collection", "HH\\Collection"},
-    (AliasEntry){"Vector", "HH\\Vector"},
-    (AliasEntry){"Map", "HH\\Map"},
-    (AliasEntry){"Set", "HH\\Set"},
-    (AliasEntry){"Pair", "HH\\Pair"},
-    (AliasEntry){"ImmVector", "HH\\ImmVector"},
-    (AliasEntry){"ImmMap", "HH\\ImmMap"},
-    (AliasEntry){"ImmSet", "HH\\ImmSet"},
-    (AliasEntry){"InvariantException", "HH\\InvariantException"},
-    (AliasEntry){"IMemoizeParam", "HH\\IMemoizeParam"},
+    AliasEntry{"AsyncIterator", "HH\\AsyncIterator"},
+    AliasEntry{"AsyncKeyedIterator", "HH\\AsyncKeyedIterator"},
+    AliasEntry{"Traversable", "HH\\Traversable"},
+    AliasEntry{"Container", "HH\\Container"},
+    AliasEntry{"KeyedTraversable", "HH\\KeyedTraversable"},
+    AliasEntry{"KeyedContainer", "HH\\KeyedContainer"},
+    AliasEntry{"Iterator", "HH\\Iterator"},
+    AliasEntry{"KeyedIterator", "HH\\KeyedIterator"},
+    AliasEntry{"Iterable", "HH\\Iterable"},
+    AliasEntry{"KeyedIterable", "HH\\KeyedIterable"},
+    AliasEntry{"Collection", "HH\\Collection"},
+    AliasEntry{"Vector", "HH\\Vector"},
+    AliasEntry{"Map", "HH\\Map"},
+    AliasEntry{"Set", "HH\\Set"},
+    AliasEntry{"Pair", "HH\\Pair"},
+    AliasEntry{"ImmVector", "HH\\ImmVector"},
+    AliasEntry{"ImmMap", "HH\\ImmMap"},
+    AliasEntry{"ImmSet", "HH\\ImmSet"},
+    AliasEntry{"InvariantException", "HH\\InvariantException"},
+    AliasEntry{"IMemoizeParam", "HH\\IMemoizeParam"},
+    AliasEntry{"Shapes", "HH\\Shapes"},
 
-    (AliasEntry){"Awaitable", "HH\\Awaitable"},
-    (AliasEntry){"AsyncGenerator", "HH\\AsyncGenerator"},
-    (AliasEntry){"WaitHandle", "HH\\WaitHandle"},
+    AliasEntry{"Awaitable", "HH\\Awaitable"},
+    AliasEntry{"AsyncGenerator", "HH\\AsyncGenerator"},
+    AliasEntry{"WaitHandle", "HH\\WaitHandle"},
     // Keep in sync with order in hphp/runtime/ext/asio/wait-handle.h
-    (AliasEntry){"StaticWaitHandle", "HH\\StaticWaitHandle"},
-    (AliasEntry){"WaitableWaitHandle", "HH\\WaitableWaitHandle"},
-    (AliasEntry){"ResumableWaitHandle", "HH\\ResumableWaitHandle"},
-    (AliasEntry){"AsyncFunctionWaitHandle", "HH\\AsyncFunctionWaitHandle"},
-    (AliasEntry){"AsyncGeneratorWaitHandle", "HH\\AsyncGeneratorWaitHandle"},
-    (AliasEntry){"AwaitAllWaitHandle", "HH\\AwaitAllWaitHandle"},
-    (AliasEntry){"GenArrayWaitHandle", "HH\\GenArrayWaitHandle"},
-    (AliasEntry){"GenMapWaitHandle", "HH\\GenMapWaitHandle"},
-    (AliasEntry){"GenVectorWaitHandle", "HH\\GenVectorWaitHandle"},
-    (AliasEntry){"ConditionWaitHandle", "HH\\ConditionWaitHandle"},
-    (AliasEntry){"RescheduleWaitHandle", "HH\\RescheduleWaitHandle"},
-    (AliasEntry){"SleepWaitHandle", "HH\\SleepWaitHandle"},
-    (AliasEntry){
+    AliasEntry{"StaticWaitHandle", "HH\\StaticWaitHandle"},
+    AliasEntry{"WaitableWaitHandle", "HH\\WaitableWaitHandle"},
+    AliasEntry{"ResumableWaitHandle", "HH\\ResumableWaitHandle"},
+    AliasEntry{"AsyncFunctionWaitHandle", "HH\\AsyncFunctionWaitHandle"},
+    AliasEntry{"AsyncGeneratorWaitHandle", "HH\\AsyncGeneratorWaitHandle"},
+    AliasEntry{"AwaitAllWaitHandle", "HH\\AwaitAllWaitHandle"},
+    AliasEntry{"GenArrayWaitHandle", "HH\\GenArrayWaitHandle"},
+    AliasEntry{"GenMapWaitHandle", "HH\\GenMapWaitHandle"},
+    AliasEntry{"GenVectorWaitHandle", "HH\\GenVectorWaitHandle"},
+    AliasEntry{"ConditionWaitHandle", "HH\\ConditionWaitHandle"},
+    AliasEntry{"RescheduleWaitHandle", "HH\\RescheduleWaitHandle"},
+    AliasEntry{"SleepWaitHandle", "HH\\SleepWaitHandle"},
+    AliasEntry{
       "ExternalThreadEventWaitHandle",
       "HH\\ExternalThreadEventWaitHandle"
     },
 
-    (AliasEntry){"bool", "HH\\bool"},
-    (AliasEntry){"int", "HH\\int"},
-    (AliasEntry){"float", "HH\\float"},
-    (AliasEntry){"num", "HH\\num"},
-    (AliasEntry){"arraykey", "HH\\arraykey"},
-    (AliasEntry){"string", "HH\\string"},
-    (AliasEntry){"resource", "HH\\resource"},
-    (AliasEntry){"mixed", "HH\\mixed"},
-    (AliasEntry){"noreturn", "HH\\noreturn"},
-    (AliasEntry){"void", "HH\\void"},
-    (AliasEntry){"this", "HH\\this"},
-    (AliasEntry){"classname", "HH\\string"}, // for ::class
+    AliasEntry{"bool", "HH\\bool"},
+    AliasEntry{"int", "HH\\int"},
+    AliasEntry{"float", "HH\\float"},
+    AliasEntry{"num", "HH\\num"},
+    AliasEntry{"arraykey", "HH\\arraykey"},
+    AliasEntry{"string", "HH\\string"},
+    AliasEntry{"resource", "HH\\resource"},
+    AliasEntry{"mixed", "HH\\mixed"},
+    AliasEntry{"noreturn", "HH\\noreturn"},
+    AliasEntry{"void", "HH\\void"},
+    AliasEntry{"this", "HH\\this"},
+    AliasEntry{"classname", "HH\\string"}, // for ::class
 
     // Support a handful of synonyms for backwards compat with code written
     // against older versions of HipHop, and to be consistent with PHP5 casting
     // syntax (for example, PHP5 supports both "(bool)$x" and "(boolean)$x")
-    (AliasEntry){"boolean", "HH\\bool"},
-    (AliasEntry){"integer", "HH\\int"},
-    (AliasEntry){"double", "HH\\float"},
-    (AliasEntry){"real", "HH\\float"},
+    AliasEntry{"boolean", "HH\\bool"},
+    AliasEntry{"integer", "HH\\int"},
+    AliasEntry{"double", "HH\\float"},
+    AliasEntry{"real", "HH\\float"},
   };
   for (auto entry : aliases) {
     autoAliases[entry.alias] = entry.name;

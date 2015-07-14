@@ -31,8 +31,7 @@ public:
 
   DECLARE_BASE_EXPRESSION_VIRTUAL_FUNCTIONS;
 
-  virtual bool isRefable(bool checkError = false) const { return checkError; }
-  bool isTemporary() const { return true; }
+  bool isRefable(bool checkError = false) const override { return checkError; }
 private:
   bool m_dynamic;
 };

@@ -15,25 +15,32 @@
 */
 
 #include "hphp/runtime/base/array-init.h"
+#include "hphp/runtime/base/collections.h"
 #include "hphp/runtime/base/comparisons.h"
 #include "hphp/runtime/base/enum-cache.h"
 #include "hphp/runtime/base/mixed-array.h"
 #include "hphp/runtime/base/rds.h"
 #include "hphp/runtime/base/strings.h"
-#include "hphp/runtime/base/collections.h"
-#include "hphp/runtime/ext/string/ext_string.h"
 #include "hphp/runtime/vm/jit/translator.h"
+#include "hphp/runtime/vm/instance-bits.h"
 #include "hphp/runtime/vm/native-data.h"
 #include "hphp/runtime/vm/native-prop-handler.h"
 #include "hphp/runtime/vm/treadmill.h"
+
+#include "hphp/runtime/ext/string/ext_string.h"
+
 #include "hphp/system/systemlib.h"
-#include "hphp/util/debug.h"
-#include "hphp/util/logger.h"
 #include "hphp/parser/parser.h"
 
+#include "hphp/util/debug.h"
+#include "hphp/util/logger.h"
+
 #include <folly/Bits.h>
+
 #include <algorithm>
 #include <iostream>
+
+TRACE_SET_MOD(class_load);
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -80,26 +87,26 @@ const Class* getOwningClassForFunc(const Func* f) {
 Class::PropInitVec::PropInitVec()
   : m_data(nullptr)
   , m_size(0)
-  , m_smart(false)
+  , m_req_allocated(false)
 {}
 
 Class::PropInitVec::~PropInitVec() {
-  if (!m_smart) free(m_data);
+  if (!m_req_allocated) free(m_data);
 }
 
 Class::PropInitVec*
-Class::PropInitVec::allocWithSmartAllocator(const PropInitVec& src) {
-  PropInitVec* p = smart_new<PropInitVec>();
+Class::PropInitVec::allocWithReqAllocator(const PropInitVec& src) {
+  PropInitVec* p = req::make_raw<PropInitVec>();
   p->m_size = src.size();
-  p->m_data = smart_new_array<TypedValueAux>(src.size());
+  p->m_data = req::make_raw_array<TypedValueAux>(src.size());
   memcpy(p->m_data, src.m_data, src.size() * sizeof(*p->m_data));
-  p->m_smart = true;
+  p->m_req_allocated = true;
   return p;
 }
 
 const Class::PropInitVec&
 Class::PropInitVec::operator=(const PropInitVec& piv) {
-  assert(!m_smart);
+  assert(!m_req_allocated);
   if (this != &piv) {
     unsigned sz = m_size = piv.size();
     if (sz) sz = folly::nextPowTwo(sz);
@@ -112,7 +119,7 @@ Class::PropInitVec::operator=(const PropInitVec& piv) {
 }
 
 void Class::PropInitVec::push_back(const TypedValue& v) {
-  assert(!m_smart);
+  assert(!m_req_allocated);
   /*
    * the allocated size is always the next power of two (or zero)
    * so we just need to reallocate when we hit a power of two
@@ -128,9 +135,6 @@ void Class::PropInitVec::push_back(const TypedValue& v) {
 
 ///////////////////////////////////////////////////////////////////////////////
 // Class.
-
-static_assert(sizeof(Class) == (use_lowptr ? 256 : 288),
-               "Change this only on purpose");
 
 namespace {
 
@@ -181,12 +185,33 @@ unsigned loadUsedTraits(PreClass* preClass,
   return methodCount;
 }
 
+/*
+ * Class ends with a dynamically sized array, m_classVec. C++ doesn't allow
+ * declaring empty arrays like C does, so we give it size 1 and use
+ * m_classVec's offset as the true size of Class when allocating memory to
+ * construct one.
+ */
+constexpr size_t sizeof_Class = Class::classVecOff();
+
+template<size_t sz>
+struct assert_sizeof_class {
+  // If this static_assert fails, the compiler error will have the real value
+  // of sizeof_Class in it since it's in this struct's type.
+  static_assert(sz == (use_lowptr ? 252 : 296), "Change this only on purpose");
+};
+template struct assert_sizeof_class<sizeof_Class>;
+
+/*
+ * R/W lock for caching scopings of closures.
+ */
+ReadWriteMutex s_scope_cache_mutex;
+
 }
 
 Class* Class::newClass(PreClass* preClass, Class* parent) {
   auto const classVecLen = parent != nullptr ? parent->m_classVecLen + 1 : 1;
-  auto  funcVecLen = (parent != nullptr ? parent->m_methods.size() : 0)
-                      + preClass->numMethods();
+  auto funcVecLen = (parent != nullptr ? parent->m_methods.size() : 0)
+    + preClass->numMethods();
 
   std::vector<ClassPtr> usedTraits;
   auto numTraitMethodsEstimate = loadUsedTraits(preClass, usedTraits);
@@ -196,12 +221,12 @@ Class* Class::newClass(PreClass* preClass, Class* parent) {
     funcVecLen += numTraitMethodsEstimate;
   }
 
-  auto const size = offsetof(Class, m_classVec)
+  auto const size = sizeof_Class
                     + sizeof(m_classVec[0]) * classVecLen
-                    + sizeof(LowFuncPtr) * funcVecLen;
+                    + sizeof(LowPtr<Func>) * funcVecLen;
   auto const mem = low_malloc(size);
   auto const classPtr = (void *)((uintptr_t)mem +
-                                 funcVecLen * sizeof(LowFuncPtr));
+                                 funcVecLen * sizeof(LowPtr<Func>));
   try {
     return new (classPtr) Class(preClass, parent, std::move(usedTraits),
                                 classVecLen, funcVecLen);
@@ -209,6 +234,82 @@ Class* Class::newClass(PreClass* preClass, Class* parent) {
     low_free(mem);
     throw;
   }
+}
+
+Class* Class::rescope(Class* ctx, Attr attrs /* = AttrNone */) {
+  assert(parent() == SystemLib::s_ClosureClass);
+  assert(m_invoke);
+
+  bool const is_dynamic = (attrs != AttrNone);
+
+  // Look up the generated template class for this particular subclass of
+  // Closure.  This class maintains the table of scoped clones of itself, and
+  // if we create a new scoped clone, we need to map it there.
+  auto template_cls = is_dynamic ? Unit::lookupClass(name()) : this;
+  auto const invoke = template_cls->m_invoke;
+
+  assert(IMPLIES(is_dynamic, m_scoped));
+  assert(IMPLIES(is_dynamic, template_cls->m_scoped));
+
+  auto const try_template = [&]() -> Class* {
+    bool const ctx_match = invoke->cls() == ctx;
+    bool const attrs_match = (attrs == AttrNone || attrs == invoke->attrs());
+
+    return ctx_match && attrs_match ? template_cls : nullptr;
+  };
+
+  // If the template class has already been scoped to `ctx', we're done.  This
+  // is the common case in repo mode.
+  if (auto cls = try_template()) return cls;
+
+  template_cls->allocExtraData();
+  auto& scopedClones = template_cls->m_extra.raw()->m_scopedClones;
+
+  auto const key = reinterpret_cast<uintptr_t>(ctx) | uintptr_t(attrs) << 32;
+
+  auto const try_cache = [&] {
+    auto it = scopedClones.find(key);
+    return it != scopedClones.end() ? it->second.get() : nullptr;
+  };
+
+  { // Return the cached clone if we have one.
+    ReadLock l(s_scope_cache_mutex);
+
+    // This assertion only holds under lock, since setting m_scoped and
+    // m_invoke->cls() are independent atomic operations.
+    assert(template_cls->m_scoped == (invoke->cls() != template_cls));
+
+    // If this succeeds, someone raced us to scoping the template.  We may have
+    // unnecessarily allocated an ExtraData, but whatever.
+    if (auto cls = try_template()) return cls;
+
+    if (auto cls = try_cache()) return cls;
+  }
+
+  // We use the French for closure because using the English crashes gcc in the
+  // implicit lambda capture below.  (This is fixed in gcc 4.8.5.)
+  auto fermeture = ClassPtr {
+    template_cls->m_scoped
+      ? newClass(m_preClass.get(), m_parent.get())
+      : template_cls
+  };
+
+  WriteLock l(s_scope_cache_mutex);
+
+  // Check the caches again.
+  if (auto cls = try_template()) return cls;
+  if (auto cls = try_cache()) return cls;
+
+  fermeture->m_invoke->rescope(ctx, attrs);
+  fermeture->m_scoped = true;
+
+  InstanceBits::ifInitElse(
+    [&] { fermeture->setInstanceBits();
+          if (this != fermeture.get()) scopedClones[key] = fermeture; },
+    [&] { if (this != fermeture.get()) scopedClones[key] = fermeture; }
+  );
+
+  return fermeture.get();
 }
 
 void Class::destroy() {
@@ -247,7 +348,7 @@ void Class::atomicRelease() {
   assert(!m_cachedClass.bound());
   assert(!getCount());
   this->~Class();
-  low_free(mallocPtrFromThis());
+  low_free(mallocPtr());
 }
 
 Class::~Class() {
@@ -260,10 +361,14 @@ Class::~Class() {
     free(m_sPropCache);
   }
 
-  auto num = numMethods();
-  for (auto i = 0; i < num; i++) {
-    Func* meth = getMethod(i);
-    if (meth) Func::destroy(meth);
+  for (auto i = size_t{}, n = numMethods(); i < n; i++) {
+    if (auto meth = getMethod(i)) {
+      if (meth->isPreFunc()) {
+        meth->freeClone();
+      } else {
+        Func::destroy(meth);
+      }
+    }
   }
 
   if (m_extra) {
@@ -272,6 +377,8 @@ Class::~Class() {
 
   // clean enum cache
   EnumCache::deleteValues(this);
+
+  low_free(m_vtableVec.get());
 }
 
 void Class::releaseRefs() {
@@ -380,9 +487,15 @@ Class::Avail Class::avail(Class*& parent,
 ///////////////////////////////////////////////////////////////////////////////
 // Pre- and post-allocations.
 
-LowFuncPtr* Class::mallocPtrFromThis() const {
-  return reinterpret_cast<LowFuncPtr*>(
-      reinterpret_cast<uintptr_t>(this) - m_funcVecLen * sizeof(LowFuncPtr));
+LowPtr<Func>* Class::funcVec() const {
+  return reinterpret_cast<LowPtr<Func>*>(
+    reinterpret_cast<uintptr_t>(this) -
+    m_funcVecLen * sizeof(LowPtr<Func>)
+  );
+}
+
+void* Class::mallocPtr() const {
+  return funcVec();
 }
 
 
@@ -413,7 +526,7 @@ const Func* Class::getDeclaredCtor() const {
   return f->name() != s_86ctor.get() ? f : nullptr;
 }
 
-LowFuncPtr Class::getCachedInvoke() const {
+const Func* Class::getCachedInvoke() const {
   assert(IMPLIES(m_invoke, !m_invoke->isStatic() || m_invoke->isClosureBody()));
   return m_invoke;
 }
@@ -472,7 +585,7 @@ void Class::initProps() const {
   // 86pinit() calls below. 86pinit() takes a reference to an array to populate
   // with initial property values; after it completes, we copy the values into
   // the new propVec.
-  auto propVec = PropInitVec::allocWithSmartAllocator(m_declPropInit);
+  auto propVec = PropInitVec::allocWithReqAllocator(m_declPropInit);
 
   initPropHandle();
   *m_propDataCache = propVec;
@@ -488,8 +601,8 @@ void Class::initProps() const {
     }
   } catch (...) {
     // Undo the allocation of propVec
-    smart_delete_array(propVec->begin(), propVec->size());
-    smart_delete(propVec);
+    req::destroy_raw_array(propVec->begin(), propVec->size());
+    req::destroy_raw(propVec);
     *m_propDataCache = nullptr;
     throw;
   }
@@ -1202,8 +1315,8 @@ Class::Class(PreClass* preClass, Class* parent,
              unsigned classVecLen, unsigned funcVecLen)
   : m_parent(parent)
   , m_preClass(PreClassPtr(preClass))
-  , m_classVecLen(classVecLen)
-  , m_funcVecLen(funcVecLen)
+  , m_classVecLen(always_safe_cast<decltype(m_classVecLen)>(classVecLen))
+  , m_funcVecLen(always_safe_cast<decltype(m_funcVecLen)>(funcVecLen))
 {
   if (usedTraits.size()) {
     allocExtraData();
@@ -1211,7 +1324,7 @@ Class::Class(PreClass* preClass, Class* parent,
   }
   setParent();
   setMethods();
-  setSpecial();
+  setSpecial();       // must run before setODAttributes
   setODAttributes();
   setInterfaces();
   setConstants();
@@ -1221,6 +1334,11 @@ Class::Class(PreClass* preClass, Class* parent,
   setRequirements();
   setNativeDataInfo();
   setEnumType();
+
+  // A class is allowed to implement two interfaces that share the same slot if
+  // we'll fatal trying to define that class, so this has to happen after all
+  // of those fatals could be thrown.
+  setInterfaceVtables();
 }
 
 void Class::methodOverrideCheck(const Func* parentMethod, const Func* method) {
@@ -1293,7 +1411,7 @@ void Class::setMethods() {
     }
   }
 
-  assert(AttrPublic < AttrProtected && AttrProtected < AttrPrivate);
+  static_assert(AttrPublic < AttrProtected && AttrProtected < AttrPrivate, "");
   // Overlay/append this class's public/protected methods onto/to those of the
   // parent.
   for (size_t methI = 0; methI < m_preClass->numMethods(); ++methI) {
@@ -1435,6 +1553,8 @@ void Class::setODAttributes() {
   if (lookupMethod(s_unset.get()     )) { m_ODAttrs |= ObjectData::UseUnset; }
   if (lookupMethod(s_call.get()      )) { m_ODAttrs |= ObjectData::HasCall;  }
   if (lookupMethod(s_clone.get()     )) { m_ODAttrs |= ObjectData::HasClone; }
+
+  if (m_dtor == nullptr) m_ODAttrs |= ObjectData::NoDestructor;
 
   if ((isBuiltin() && Native::getNativePropHandler(name())) ||
       (m_parent && m_parent->hasNativePropHandler())) {
@@ -2218,7 +2338,7 @@ void Class::setInterfaces() {
     }
     declInterfaces.push_back(ClassPtr(cp));
     if (interfacesBuilder.find(cp->name()) == interfacesBuilder.end()) {
-      interfacesBuilder.add(cp->name(), LowClassPtr(cp));
+      interfacesBuilder.add(cp->name(), LowPtr<Class>(cp));
     }
     int size = cp->m_interfaces.size();
     for (int i = 0; i < size; i++) {
@@ -2247,13 +2367,72 @@ void Class::setInterfaces() {
       Class* stringish = Unit::lookupClass(s_Stringish.get());
       assert(stringish != nullptr);
       assert((stringish->attrs() & AttrInterface));
-      interfacesBuilder.add(stringish->name(), LowClassPtr(stringish));
+      interfacesBuilder.add(stringish->name(), LowPtr<Class>(stringish));
     }
   }
 
   m_interfaces.create(interfacesBuilder);
   checkInterfaceConstraints();
   checkInterfaceMethods();
+}
+
+void Class::setInterfaceVtables() {
+  // We only need to set interface vtables for classes that can be instantiated
+  // and implement more than 0 interfaces.
+  if (!RuntimeOption::RepoAuthoritative ||
+      !isNormalClass(this) || isAbstract(this) || m_interfaces.empty()) return;
+
+  size_t totalMethods = 0;
+  Slot maxSlot = 0;
+  for (auto iface : m_interfaces.range()) {
+    auto const slot = iface->preClass()->ifaceVtableSlot();
+    if (slot == kInvalidSlot) continue;
+
+    maxSlot = std::max(maxSlot, slot);
+    totalMethods += iface->numMethods();
+  }
+
+  const size_t nVtables = maxSlot + 1;
+  auto const vtableVecSz = nVtables * sizeof(VtableVecSlot);
+  auto const memSz = vtableVecSz + totalMethods * sizeof(LowPtr<Func>);
+  auto const mem = static_cast<char*>(low_malloc(memSz));
+  auto cursor = mem;
+
+  ITRACE(3, "Setting interface vtables for class {}. "
+         "{} interfaces, {} vtable slots, {} total methods\n",
+         name()->data(), m_interfaces.size(), nVtables, totalMethods);
+  Trace::Indent indent;
+
+  auto const vtableVec = reinterpret_cast<VtableVecSlot*>(cursor);
+  cursor += vtableVecSz;
+  m_vtableVecLen = always_safe_cast<decltype(m_vtableVecLen)>(nVtables);
+  m_vtableVec = vtableVec;
+  memset(vtableVec, 0, vtableVecSz);
+
+  for (auto iface : m_interfaces.range()) {
+    auto const slot = iface->preClass()->ifaceVtableSlot();
+    if (slot == kInvalidSlot) continue;
+    ITRACE(3, "{} @ slot {}\n", iface->name()->data(), slot);
+    Trace::Indent indent;
+    always_assert(slot < nVtables);
+
+    auto const nMethods = iface->numMethods();
+    auto const vtable = reinterpret_cast<LowPtr<Func>*>(cursor);
+    cursor += nMethods * sizeof(LowPtr<Func>);
+    always_assert(vtableVec[slot].vtable == nullptr);
+    vtableVec[slot].vtable = vtable;
+    vtableVec[slot].iface = iface;
+
+    for (size_t i = 0; i < nMethods; ++i) {
+      auto ifunc = iface->getMethod(i);
+      auto func = lookupMethod(ifunc->name());
+      ITRACE(3, "{}:{} @ slot {}\n", ifunc->name()->data(), func, i);
+      always_assert(func || Func::isSpecial(ifunc->name()));
+      vtable[i] = func;
+    }
+  }
+
+  always_assert(cursor == mem + memSz);
 }
 
 void Class::setRequirements() {
@@ -2522,11 +2701,11 @@ void Class::setClassVec() {
 }
 
 void Class::setFuncVec(MethodMapBuilder& builder) {
-  auto funcVec = (LowFuncPtr*)mallocPtrFromThis();
+  auto funcVec = this->funcVec();
 
-  memset(funcVec, 0, m_funcVecLen * sizeof(LowFuncPtr));
+  memset(funcVec, 0, m_funcVecLen * sizeof(LowPtr<Func>));
 
-  funcVec = (LowFuncPtr*)this;
+  funcVec = (LowPtr<Func>*)this;
   assert(builder.size() <= m_funcVecLen);
 
   for (Slot i = 0; i < builder.size(); i++) {

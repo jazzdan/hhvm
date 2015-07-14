@@ -33,16 +33,16 @@ BCMarker initial_marker(TransContext ctx) {
 
 //////////////////////////////////////////////////////////////////////
 
-IRGS::IRGS(TransContext context)
+IRGS::IRGS(TransContext context, TransFlags flags)
   : context(context)
+  , transFlags(flags)
   , unit(context)
   , irb(new IRBuilder(unit, initial_marker(context)))
   , bcStateStack { context.srcKey() }
 {
   irgen::updateMarker(*this);
   auto const frame = irgen::gen(*this, DefFP);
-  irgen::gen(*this, DefSP,
-    StackOffset { safe_cast<int32_t>(context.initSpOffset.offset) }, frame);
+  irgen::gen(*this, DefSP, FPInvOffsetData { context.initSpOffset }, frame);
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -100,7 +100,7 @@ std::string show(const IRGS& irgs) {
   for (auto i = 0; i < irgs.irb->evalStack().size(); ++i) {
     while (checkFpi());
     auto const value = irgen::top(const_cast<IRGS&>(irgs),
-      TStkElem, BCSPOffset{i}, DataTypeGeneric);
+                                  BCSPOffset{i}, DataTypeGeneric);
     elem(value->inst()->toString());
   }
 

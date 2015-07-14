@@ -17,6 +17,8 @@
 
 #include "hphp/runtime/vm/jit/irgen-exit.h"
 #include "hphp/runtime/vm/jit/irgen-control.h"
+#include "hphp/runtime/vm/jit/cfg.h"
+#include "hphp/runtime/vm/jit/dce.h"
 
 #include "hphp/runtime/vm/jit/irgen-internal.h"
 
@@ -188,6 +190,10 @@ void endRegion(IRGS& env, SrcKey nextSk) {
   gen(env, ReqBindJmp, data, sp(env), fp(env));
 }
 
+void sealUnit(IRGS& env) {
+  mandatoryDCE(env.unit);
+}
+
 Type predictedTypeFromLocal(const IRGS& env, uint32_t locId) {
   return env.irb->predictedLocalType(locId);
 }
@@ -238,7 +244,6 @@ Type provenTypeFromStack(const IRGS& env, BCSPOffset offset) {
   return env.irb->stackType(offsetFromIRSP(env, offset), DataTypeGeneric);
 }
 
-
 Type provenTypeFromLocation(const IRGS& env, const Location& loc) {
   switch (loc.space) {
   case Location::Stack:
@@ -269,6 +274,12 @@ void endBlock(IRGS& env, Offset next, bool nextIsMerge) {
     // If there's no fp, we've already executed a RetCtrl or similar, so
     // there's no reason to try to jump anywhere now.
     return;
+  }
+  // Don't emit the jump if it would be unreachable.  This avoids
+  // unreachable blocks appearing to be reachable, which would cause
+  // translateRegion to process them.
+  if (auto const curBlock = env.irb->curBlock()) {
+    if (!curBlock->empty() && curBlock->back().isTerminal()) return;
   }
   jmpImpl(env, next, nextIsMerge ? JmpFlagNextIsMerge : JmpFlagNone);
 }
@@ -301,7 +312,7 @@ void prepareForNextHHBC(IRGS& env,
   updateMarker(env);
   env.lastBcInst = lastBcInst;
   env.catchCreator = nullptr;
-  env.irb->prepareForNextHHBC();
+  env.irb->exceptionStackBoundary();
 }
 
 void finishHHBC(IRGS& env) {

@@ -30,6 +30,8 @@
 #include "hphp/runtime/vm/jit/type.h"
 
 #include "hphp/util/arena.h"
+#include "hphp/runtime/ext/asio/ext_async-function-wait-handle.h"
+#include "hphp/runtime/ext/asio/ext_static-wait-handle.h"
 
 #include <folly/Range.h>
 
@@ -162,6 +164,7 @@ bool IRInstruction::consumesReference(int srcNo) const {
       return srcNo == 0;
 
     case CreateAFWH:
+    case CreateAFWHNoVV:
       return srcNo == 4;
 
     case InitPackedArray:
@@ -172,24 +175,6 @@ bool IRInstruction::consumesReference(int srcNo) const {
 
     default:
       return true;
-  }
-}
-
-bool IRInstruction::killsSource(int idx) const {
-  if (!killsSources()) return false;
-  switch (m_op) {
-    case DecRef:
-    case ConvObjToArr:
-    case ConvCellToArr:
-    case ConvCellToObj:
-      assertx(idx == 0);
-      return true;
-    case ArraySet:
-    case ArraySetRef:
-      return idx == 1;
-    default:
-      not_reached();
-      break;
   }
 }
 
@@ -230,7 +215,7 @@ Type boxPtr(Type t) {
 Type allocObjReturn(const IRInstruction* inst) {
   switch (inst->op()) {
     case ConstructInstance:
-      return Type::SubObj(inst->extra<ConstructInstance>()->cls);
+      return Type::ExactObj(inst->extra<ConstructInstance>()->cls);
 
     case NewInstanceRaw:
       return Type::ExactObj(inst->extra<NewInstanceRaw>()->cls);
@@ -239,6 +224,13 @@ Type allocObjReturn(const IRInstruction* inst) {
       return inst->src(0)->hasConstVal()
         ? Type::ExactObj(inst->src(0)->clsVal())
         : TObj;
+
+    case CreateSSWH:
+      return Type::ExactObj(c_StaticWaitHandle::classof());
+
+    case CreateAFWH:
+    case CreateAFWHNoVV:
+      return Type::ExactObj(c_AsyncFunctionWaitHandle::classof());
 
     default:
       always_assert(false && "Invalid opcode returning AllocObj");
@@ -251,7 +243,7 @@ Type arrElemReturn(const IRInstruction* inst) {
 
   auto resultType = inst->hasTypeParam() ? inst->typeParam() : TGen;
   if (inst->is(ArrayGet)) {
-    resultType &= TInitCell;
+    resultType &= TInit;
   }
 
   // Elements of a static array are uncounted
@@ -269,7 +261,7 @@ Type arrElemReturn(const IRInstruction* inst) {
     case T::Packed:
     {
       auto const idx = inst->src(1);
-      if (idx->hasConstVal() &&
+      if (idx->hasConstVal(TInt) &&
           idx->intVal() >= 0 &&
           idx->intVal() < arrTy->size()) {
         resultType &= typeFromRAT(arrTy->packedElem(idx->intVal()));

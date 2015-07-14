@@ -38,7 +38,7 @@
 #include "hphp/runtime/base/thread-init-fini.h"
 #include "hphp/runtime/base/user-stream-wrapper.h"
 #include "hphp/runtime/base/zend-scanf.h"
-#include "hphp/runtime/ext/ext_hash.h"
+#include "hphp/runtime/ext/hash/ext_hash.h"
 #include "hphp/runtime/ext/std/ext_std_options.h"
 #include "hphp/runtime/ext/string/ext_string.h"
 #include "hphp/runtime/server/static-content-cache.h"
@@ -300,7 +300,7 @@ Variant HHVM_FUNCTION(popen,
                       const String& command,
                       const String& mode) {
   CHECK_PATH_FALSE(command, 1);
-  auto file = makeSmartPtr<Pipe>();
+  auto file = req::make<Pipe>();
   bool ret = CHECK_ERROR(file->open(File::TranslateCommand(command), mode));
   if (!ret) {
     raise_warning("popen(%s,%s): Invalid argument",
@@ -1072,9 +1072,38 @@ bool HHVM_FUNCTION(is_executable,
   */
 }
 
+static VFileType lookupVirtualFile(const String& filename) {
+  if (filename.empty() || !StaticContentCache::TheFileCache) {
+    return VFileType::NotFound;
+  }
+
+  String cwd;
+  std::string root;
+  bool isRelative = (filename.charAt(0) != '/');
+  if (isRelative) {
+    cwd = g_context->getCwd();
+    root = RuntimeOption::SourceRoot;
+    if (cwd.empty() || cwd[cwd.size() - 1] != '/') root.pop_back();
+  }
+
+  if (!isRelative || !root.compare(cwd.data())) {
+    return StaticContentCache::TheFileCache->getFileType(filename.data());
+  }
+
+  return VFileType::NotFound;
+}
+
 bool HHVM_FUNCTION(is_file,
                    const String& filename) {
   CHECK_PATH_FALSE(filename, 1);
+  if (filename.empty()) {
+    return false;
+  }
+  auto vtype = lookupVirtualFile(filename);
+  if (vtype != VFileType::NotFound) {
+    return vtype == VFileType::PlainFile;
+  }
+
   struct stat sb;
   CHECK_SYSTEM_SILENT(statSyscall(filename, &sb, true));
   return (sb.st_mode & S_IFMT) == S_IFREG;
@@ -1083,16 +1112,12 @@ bool HHVM_FUNCTION(is_file,
 bool HHVM_FUNCTION(is_dir,
                    const String& filename) {
   CHECK_PATH_FALSE(filename, 1);
-  String cwd;
   if (filename.empty()) {
     return false;
   }
-  bool isRelative = (filename.charAt(0) != '/');
-  if (isRelative) cwd = g_context->getCwd();
-  if (!isRelative || cwd == String(RuntimeOption::SourceRoot)) {
-    if (File::IsVirtualDirectory(filename)) {
-      return true;
-    }
+  auto vtype = lookupVirtualFile(filename);
+  if (vtype != VFileType::NotFound) {
+    return vtype == VFileType::Directory;
   }
 
   struct stat sb;
@@ -1120,6 +1145,11 @@ bool HHVM_FUNCTION(is_uploaded_file,
 bool HHVM_FUNCTION(file_exists,
                    const String& filename) {
   CHECK_PATH_FALSE(filename, 1);
+  auto vtype = lookupVirtualFile(filename);
+  if (vtype != VFileType::NotFound) {
+    return true;
+  }
+
   if (filename.empty() ||
       (accessSyscall(filename, F_OK, true)) < 0) {
     return false;
@@ -1733,7 +1763,7 @@ Variant HHVM_FUNCTION(glob,
     return false;
   }
   // php's glob always produces an array, but Variant::Variant(CArrRef)
-  // will produce KindOfNull if given a SmartPtr wrapped around null.
+  // will produce KindOfNull if given a req::ptr wrapped around null.
   if (ret.isNull()) {
     return empty_array();
   }
@@ -1756,8 +1786,7 @@ Variant HHVM_FUNCTION(tempnam,
     trailing_slash = "";
   }
   String templ = tmpdir + trailing_slash + pbase + "XXXXXX";
-  char buf[PATH_MAX + 1];
-  strcpy(buf, templ.data());
+  auto buf = templ.get()->mutableData();
   int fd = mkstemp(buf);
   if (fd < 0) {
     Logger::Verbose("%s/%d: %s", __FUNCTION__, __LINE__,
@@ -1766,13 +1795,13 @@ Variant HHVM_FUNCTION(tempnam,
   }
 
   close(fd);
-  return String(buf, CopyString);
+  return templ.setSize(strlen(buf));
 }
 
 Variant HHVM_FUNCTION(tmpfile) {
   FILE *f = tmpfile();
   if (f) {
-    return Variant(makeSmartPtr<PlainFile>(f));
+    return Variant(req::make<PlainFile>(f));
   }
   return false;
 }
@@ -1847,7 +1876,7 @@ struct DirectoryData final : RequestEventHandler {
   void requestShutdown() override {
     defaultDirectory = nullptr;
   }
-  SmartPtr<Directory> defaultDirectory;
+  req::ptr<Directory> defaultDirectory;
 };
 
 IMPLEMENT_STATIC_REQUEST_LOCAL(DirectoryData, s_directory_data);
@@ -1856,7 +1885,7 @@ const StaticString
   s_handle("handle"),
   s_path("path");
 
-SmartPtr<Directory> get_dir(const Resource& dir_handle) {
+req::ptr<Directory> get_dir(const Resource& dir_handle) {
   if (dir_handle.isNull()) {
     auto defaultDir = s_directory_data->defaultDirectory;
     if (!defaultDir) {
@@ -1890,7 +1919,7 @@ Variant HHVM_FUNCTION(dir,
   if (same(dir, false)) {
     return false;
   }
-  ObjectData* d = SystemLib::AllocDirectoryObject();
+  auto d = SystemLib::AllocDirectoryObject();
   *(d->o_realProp(s_path, 0)) = directory;
   *(d->o_realProp(s_handle, 0)) = dir;
   return d;

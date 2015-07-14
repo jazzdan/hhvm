@@ -37,6 +37,7 @@ folly::Range<Vlabel*> succs(Vinstr& inst) {
     case Vinstr::bindcall:  return {inst.bindcall_.targets, 2};
     case Vinstr::contenter: return {inst.contenter_.targets, 2};
     case Vinstr::jcc:       return {inst.jcc_.targets, 2};
+    case Vinstr::jcci:      return {&inst.jcci_.target, 1};
     case Vinstr::jmp:       return {&inst.jmp_.target, 1};
     case Vinstr::phijmp:    return {&inst.phijmp_.target, 1};
     case Vinstr::phijcc:    return {inst.phijcc_.targets, 2};
@@ -138,22 +139,6 @@ jit::vector<Vlabel> sortBlocks(const Vunit& unit) {
   return s.blocks;
 }
 
-jit::vector<Vlabel> layoutBlocks(const Vunit& unit) {
-  auto blocks = sortBlocks(unit);
-  // Partition into main/cold/frozen areas without changing relative order, and
-  // the end{} block will be last.
-  auto coldIt = std::stable_partition(blocks.begin(), blocks.end(),
-    [&](Vlabel b) {
-      return unit.blocks[b].area == AreaIndex::Main &&
-             unit.blocks[b].code.back().op != Vinstr::fallthru;
-    });
-  std::stable_partition(coldIt, blocks.end(),
-    [&](Vlabel b) {
-      return unit.blocks[b].area == AreaIndex::Cold &&
-             unit.blocks[b].code.back().op != Vinstr::fallthru;
-    });
-  return blocks;
-}
-
 ///////////////////////////////////////////////////////////////////////////////
+
 }}

@@ -97,7 +97,7 @@ folly::Optional<Type> interpOutputType(IRGS& env,
   using namespace jit::InstrFlags;
   auto localType = [&]{
     auto locId = localInputId(inst);
-    static_assert(std::is_unsigned<typeof(locId)>::value,
+    static_assert(std::is_unsigned<decltype(locId)>::value,
                   "locId should be unsigned");
     assertx(locId < curFunc(env)->numLocals());
     return env.irb->localType(locId, DataTypeSpecific);
@@ -293,7 +293,7 @@ interpOutputLocals(IRGS& env,
       switch (inst.immVec.locationCode()) {
         case LL: {
           auto const& mii = getMInstrInfo(inst.mInstrOp());
-          auto const& base = inst.inputs[mii.valCount()]->location;
+          auto const& base = inst.inputs[mii.valCount()];
           assertx(base.space == Location::Local);
 
           // MInstrEffects expects to be used in the context of a normally

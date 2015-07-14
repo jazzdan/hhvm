@@ -20,6 +20,7 @@
 #include "hphp/util/disasm.h"
 
 #include "hphp/runtime/base/arch.h"
+#include "hphp/runtime/base/thread-init-fini.h"
 
 #include "hphp/runtime/vm/jit/abi-x64.h"
 #include "hphp/runtime/vm/jit/back-end-x64.h"
@@ -40,6 +41,7 @@
 
 #ifdef USE_LLVM
 
+#include <llvm/ADT/Triple.h>
 #include <llvm/Analysis/Passes.h>
 #include <llvm/CodeGen/MachineFunctionAnalysis.h>
 #include <llvm/CodeGen/Passes.h>
@@ -56,10 +58,12 @@
 #include <llvm/IR/InlineAsm.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/TypeBuilder.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/IRReader/IRReader.h>
+#include <llvm/InitializePasses.h>
 #include <llvm/PassManager.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/ErrorHandling.h>
@@ -70,6 +74,7 @@
 #include <llvm/Support/SourceMgr.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/Target/TargetLibraryInfo.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Transforms/IPO.h>
 #include <llvm/Transforms/IPO/PassManagerBuilder.h>
@@ -278,16 +283,12 @@ void reportLLVMError(void* data, const std::string& err, bool gen_crash_diag) {
   always_assert_flog(false, "LLVM fatal error: {}", err);
 }
 
-struct LLVMErrorInit {
-  LLVMErrorInit() {
-    llvm::install_fatal_error_handler(reportLLVMError);
-  }
+InitFiniNode llvmInit(
+  []() { llvm::install_fatal_error_handler(reportLLVMError); },
+  InitFiniNode::When::ProcessInit);
 
-  ~LLVMErrorInit() {
-    llvm::remove_fatal_error_handler();
-  }
-};
-static LLVMErrorInit s_llvmErrorInit;
+InitFiniNode llvmExit(llvm::remove_fatal_error_handler,
+                      InitFiniNode::When::ProcessExit);
 
 std::string showNewCode(const Vasm::AreaList& areas) DEBUG_ONLY;
 std::string showNewCode(const Vasm::AreaList& areas) {
@@ -516,7 +517,7 @@ struct LLVMEmitter {
           llvm::Type::getVoidTy(m_context),
           std::vector<llvm::Type*>(3, llvm::IntegerType::get(m_context, 64)),
           false),
-      llvm::Function::ExternalLinkage, "", m_module.get()))
+      llvm::Function::ExternalLinkage, "tracelet", m_module.get()))
     , m_irb(m_context,
             llvm::ConstantFolder(),
             IRBuilderVasmInserter(*this))
@@ -591,7 +592,7 @@ struct LLVMEmitter {
     m_int64Undef  = llvm::UndefValue::get(m_int64);
 
     // Register all unit's constants.
-    for (auto const& pair : unit.constants) {
+    for (auto const& pair : unit.constToReg) {
       switch (pair.first.kind) {
         case Vconst::Quad:
           if (pair.first.isUndef) {
@@ -612,6 +613,14 @@ struct LLVMEmitter {
             defineValue(pair.second, llvm::UndefValue::get(m_int8));
           } else {
             defineValue(pair.second, cns(uint8_t(pair.first.val)));
+          }
+          break;
+        case Vconst::Double:
+          if (pair.first.isUndef) {
+            defineValue(pair.second,
+                        llvm::UndefValue::get(m_irb.getDoubleTy()));
+          } else {
+            defineValue(pair.second, cnsDbl(pair.first.doubleVal));
           }
           break;
         case Vconst::ThreadLocal:
@@ -733,6 +742,25 @@ struct LLVMEmitter {
       .create());
     always_assert_flog(ee, "ExecutionEngine creation failed: {}\n", errStr);
 
+    llvm::PassManager pm;
+    if (!RuntimeOption::EvalJitLLVMBasicOpt) {
+      auto TLI =
+        new llvm::TargetLibraryInfo(llvm::Triple(module->getTargetTriple()));
+      pm.add(TLI);
+      auto& Registry = *llvm::PassRegistry::getPassRegistry();
+      llvm::initializeCore(Registry);
+      llvm::initializeScalarOpts(Registry);
+      llvm::initializeVectorization(Registry);
+      llvm::initializeIPO(Registry);
+      llvm::initializeAnalysis(Registry);
+      llvm::initializeIPA(Registry);
+      llvm::initializeTransformUtils(Registry);
+      llvm::initializeInstCombine(Registry);
+      llvm::initializeTarget(Registry);
+      llvm::initializeCodeGenPreparePass(Registry);
+      llvm::initializeAtomicExpandLoadLinkedPass(Registry);
+    }
+
     llvm::LLVMTargetMachine* targetMachine =
       static_cast<llvm::LLVMTargetMachine*>(ee->getTargetMachine());
 
@@ -763,7 +791,13 @@ struct LLVMEmitter {
       llvm::PassManagerBuilder PM;
       PM.OptLevel = RuntimeOption::EvalJitLLVMOptLevel;
       PM.SizeLevel = RuntimeOption::EvalJitLLVMSizeLevel;
+      PM.Inliner = llvm::createFunctionInliningPass(PM.OptLevel, PM.SizeLevel);
+      PM.DisableUnitAtATime = false;
+      PM.SLPVectorize = RuntimeOption::EvalJitLLVMSLPVectorize;
+      PM.BBVectorize = RuntimeOption::EvalJitLLVMBBVectorize;
+      PM.LoadCombine = RuntimeOption::EvalJitLLVMLoadCombine;
       PM.populateFunctionPassManager(*fpm);
+      PM.populateModulePassManager(pm);
     }
 
     {
@@ -773,7 +807,9 @@ struct LLVMEmitter {
         fpm->run(*it);
       }
       fpm->doFinalization();
+      pm.run(*module);
     }
+
     FTRACE(2, "{:-^80}\n{}\n", " LLVM IR after optimizing ",
            showModule(module));
 
@@ -839,8 +875,7 @@ struct LLVMEmitter {
         if (di.isCall()) {
           auto afterCall = ip + di.size();
           FTRACE(2, "From afterCall for fixup = {}\n", afterCall);
-          mcg->recordSyncPoint(afterCall,
-                               fix.fixup.pcOffset, fix.fixup.spOffset);
+          mcg->recordSyncPoint(afterCall, fix.fixup);
         }
       }
     }
@@ -1186,6 +1221,9 @@ private:
 
       for (auto phiInd = 0; phiInd < m_defs.size(); ++phiInd) {
         llvm::Type* type = e.value(m_pendingPreds[0].uses[phiInd])->getType();
+        // doubles through phis are treated as i64. See comment in
+        // addIncoming().
+        if (type->isDoubleTy()) type = e.m_int64;
         llvm::PHINode* phi = e.m_irb.CreatePHI(type, 1);
         m_phis.push_back(phi);
 
@@ -1204,8 +1242,18 @@ private:
     };
 
     void addIncoming(LLVMEmitter& e, UseInfo& useInfo, unsigned phiInd) {
-      m_phis[phiInd]->addIncoming(e.value(useInfo.uses[phiInd]),
-                                  useInfo.fromLabel);
+      // Due to the lack of a proper type system in vasm, we're tolerant of
+      // doubles being passed around as i64, and we insert bitcast instructions
+      // as needed to get proper double values. Until we get stronger types in
+      // the incoming Vunit, we bitcast all double values to i64 when sending
+      // them through a phi node, to avoid having to look ahead and figure out
+      // where we might be joining an i64 with a double.
+      auto value = e.value(useInfo.uses[phiInd]);
+      if (value->getType()->isDoubleTy()) {
+        value = new llvm::BitCastInst(value, e.m_int64, "",
+                                      useInfo.fromLabel->getTerminator());
+      }
+      m_phis[phiInd]->addIncoming(value, useInfo.fromLabel);
       auto typeStr = llshow(e.value(useInfo.uses[phiInd])->getType());
       FTRACE(2,
              "phidef --> phiInd:{}, type:{}, incoming:{}, use:%{}, "
@@ -1423,6 +1471,7 @@ O(cmovq) \
 O(cmpb) \
 O(cmpbi) \
 O(cmpbim) \
+O(cmpwim) \
 O(cmpl) \
 O(cmpli) \
 O(cmplim) \
@@ -1528,9 +1577,11 @@ O(testqim) \
 O(ud2) \
 O(xorb) \
 O(xorbi) \
+O(xorl) \
 O(xorq) \
 O(xorqi) \
 O(landingpad) \
+O(leavetc) \
 O(vretm) \
 O(vret) \
 O(absdbl) \
@@ -1568,16 +1619,21 @@ O(unpcklpd)
       case Vinstr::psllq:
       case Vinstr::psrlq:
       case Vinstr::fallthru:
+      case Vinstr::popm:  // currently used in cgEnterFrame
+      case Vinstr::callfaststub:
         always_assert_flog(false,
                            "Banned opcode in B{}: {}",
                            size_t(label), show(m_unit, inst));
 
       // Not yet implemented opcodes:
+      case Vinstr::jcci:
       case Vinstr::contenter:
       case Vinstr::mccall:
       case Vinstr::mcprep:
       case Vinstr::cmpsd:
       case Vinstr::ucomisd:
+      case Vinstr::ldimmqs:
+      case Vinstr::cmpqims:
       // ARM opcodes:
       case Vinstr::asrv:
       case Vinstr::brk:
@@ -1900,6 +1956,7 @@ void LLVMEmitter::emit(const bindaddr& inst) {
     TransFlags{}.packed
   );
   mcg->cgFixups().m_codePointers.insert(inst.dest);
+  mcg->setJmpTransID(TCA(inst.dest));
 }
 
 void LLVMEmitter::emit(const defvmsp& inst) {
@@ -2134,6 +2191,10 @@ void LLVMEmitter::emit(const cmpbi& inst) {
 
 void LLVMEmitter::emit(const cmpbim& inst) {
   defineFlagTmp(inst.sf, m_irb.CreateLoad(emitPtr(inst.s1, 8)));
+}
+
+void LLVMEmitter::emit(const cmpwim& inst) {
+  defineFlagTmp(inst.sf, m_irb.CreateLoad(emitPtr(inst.s1, 16)));
 }
 
 void LLVMEmitter::emit(const cmpl& inst) {
@@ -2377,6 +2438,9 @@ llvm::Value* LLVMEmitter::emitCmpForCC(Vreg sf, ConditionCode cc) {
   } else if (cmp.op == Vinstr::cmpbim) {
     lhs = flagTmp(sf);
     rhs = cns(cmp.cmpbim_.s0.b());
+  } else if (cmp.op == Vinstr::cmpwim) {
+    lhs = flagTmp(sf);
+    rhs = cns(cmp.cmpwim_.s0.w());
   } else if (cmp.op == Vinstr::cmpl) {
     lhs = value(cmp.cmpl_.s1);
     rhs = value(cmp.cmpl_.s0);
@@ -2642,9 +2706,9 @@ void LLVMEmitter::emit(const orqim& inst) {
 }
 
 void LLVMEmitter::emit(const phijmp& inst) {
+  m_irb.CreateBr(block(inst.target));
   m_phiInfos[block(inst.target)].phij(*this, m_irb.GetInsertBlock(),
                                       m_unit.tuples[inst.uses]);
-  m_irb.CreateBr(block(inst.target));
 }
 
 void LLVMEmitter::emit(const phijcc& inst) {
@@ -2652,12 +2716,11 @@ void LLVMEmitter::emit(const phijcc& inst) {
   auto next  = block(inst.targets[0]);
   auto taken = block(inst.targets[1]);
   auto& uses = m_unit.tuples[inst.uses];
+  auto cond = emitCmpForCC(inst.sf, inst.cc);
+  m_irb.CreateCondBr(cond, taken, next);
 
   m_phiInfos[next].phij(*this, curBlock, uses);
   m_phiInfos[taken].phij(*this, curBlock, uses);
-
-  auto cond = emitCmpForCC(inst.sf, inst.cc);
-  m_irb.CreateCondBr(cond, taken, next);
 }
 
 void LLVMEmitter::emit(const phidef& inst) {
@@ -2733,6 +2796,21 @@ void LLVMEmitter::emit(const vret& inst) {
   auto const retAddr = m_irb.CreateIntToPtr(value(inst.retAddr),
                                             ptrType(m_traceletFnTy));
   auto call = emitTraceletTailCall(retAddr, inst.args);
+  if (RuntimeOption::EvalJitLLVMRetOpt) {
+    call->setCallingConv(llvm::CallingConv::X86_64_HHVM_TCR);
+    call->setTailCallKind(llvm::CallInst::TCK_Tail);
+  }
+}
+
+void LLVMEmitter::emit(const leavetc& inst) {
+  auto const exit = reinterpret_cast<intptr_t>(
+    mcg->tx().uniqueStubs.callToExit
+  );
+  auto const exit_ptr = m_irb.CreateIntToPtr(
+    cns(exit),
+    ptrType(m_traceletFnTy)
+  );
+  auto call = emitTraceletTailCall(exit_ptr, inst.args);
   if (RuntimeOption::EvalJitLLVMRetOpt) {
     call->setCallingConv(llvm::CallingConv::X86_64_HHVM_TCR);
     call->setTailCallKind(llvm::CallInst::TCK_Tail);
@@ -3001,6 +3079,10 @@ void LLVMEmitter::emit(const xorb& inst) {
 
 void LLVMEmitter::emit(const xorbi& inst) {
   defineValue(inst.d, m_irb.CreateXor(value(inst.s1), inst.s0.b()));
+}
+
+void LLVMEmitter::emit(const xorl& inst) {
+  defineValue(inst.d, m_irb.CreateXor(value(inst.s1), value(inst.s0)));
 }
 
 void LLVMEmitter::emit(const xorq& inst) {

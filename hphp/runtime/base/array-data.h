@@ -28,6 +28,7 @@
 #include "hphp/runtime/base/typed-value.h"
 #include "hphp/runtime/base/sort-flags.h"
 #include "hphp/runtime/base/cap-code.h"
+#include "hphp/util/md5.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -65,11 +66,11 @@ protected:
    */
   explicit ArrayData(ArrayKind kind)
     : m_sizeAndPos(uint32_t(-1)) {
-    m_hdr.init(static_cast<HeaderKind>(kind), 0);
+    m_hdr.init(static_cast<HeaderKind>(kind), 1);
     assert(m_size == -1);
     assert(m_pos == 0);
     assert(m_hdr.kind == static_cast<HeaderKind>(kind));
-    assert(getCount() == 0);
+    assert(hasExactlyOneRef());
   }
 
   /*
@@ -94,7 +95,7 @@ public:
   static ArrayData *CreateRef(const Variant& name, Variant& value);
 
   /*
-   * Called to return an ArrayData to the smart allocator.  This is
+   * Called to return an ArrayData to the request heap.  This is
    * normally called when the reference count goes to zero (e.g. via a
    * helper like decRefArr).
    */
@@ -317,13 +318,13 @@ public:
   /**
    * Make a copy of myself.
    *
-   * The nonSmartCopy() version means not to use the smart allocator.
-   * Is only implemented for array types that need to be able to go
+   * copyStatic() means not to use the request-scoped heap.
+   * It is only implemented for array types that need to be able to go
    * into the static array list.
    */
   ArrayData* copy() const;
   ArrayData* copyWithStrongIterators() const;
-  ArrayData* nonSmartCopy() const;
+  ArrayData* copyStatic() const;
 
   /**
    * Append a value to the array. If "copy" is true, make a copy first
@@ -381,8 +382,24 @@ public:
 
   ArrayData *escalate() const;
 
+  using ScalarArrayKey = MD5;
+  struct ScalarHash {
+    size_t operator()(const ScalarArrayKey& key) const {
+      return key.hash();
+    }
+    size_t hash(const ScalarArrayKey& key) const {
+      return key.hash();
+    }
+    bool equal(const ScalarArrayKey& k1,
+               const ScalarArrayKey& k2) const {
+      return k1 == k2;
+    }
+  };
+
+  static ScalarArrayKey GetScalarArrayKey(ArrayData* arr);
+  static ScalarArrayKey GetScalarArrayKey(const char* str, size_t sz);
   static ArrayData* GetScalarArray(ArrayData *arr);
-  static ArrayData* GetScalarArray(ArrayData *arr, const std::string& key);
+  static ArrayData* GetScalarArray(ArrayData *arr, const ScalarArrayKey& key);
 
   static constexpr size_t offsetofSize() { return offsetof(ArrayData, m_size); }
   static constexpr size_t sizeofSize() { return sizeof(m_size); }
@@ -510,7 +527,7 @@ struct ArrayFunctions {
   bool (*uasort[NK])(ArrayData* ad, const Variant& cmp_function);
   ArrayData* (*copy[NK])(const ArrayData*);
   ArrayData* (*copyWithStrongIterators[NK])(const ArrayData*);
-  ArrayData* (*nonSmartCopy[NK])(const ArrayData*);
+  ArrayData* (*copyStatic[NK])(const ArrayData*);
   ArrayData* (*append[NK])(ArrayData*, const Variant& v, bool copy);
   ArrayData* (*appendRef[NK])(ArrayData*, Variant& v, bool copy);
   ArrayData* (*appendWithRef[NK])(ArrayData*, const Variant& v, bool copy);

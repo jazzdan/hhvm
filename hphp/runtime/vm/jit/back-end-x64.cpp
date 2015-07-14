@@ -150,13 +150,6 @@ struct BackEnd final : jit::BackEnd {
     return x64::funcPrologueToGuard(prologue, func);
   }
 
-  SrcKey emitFuncPrologue(TransID transID, Func* func, int argc,
-                          TCA& start) override {
-    return func->isMagic()
-      ? x64::emitMagicFuncPrologue(transID, func, argc, start)
-      : x64::emitFuncPrologue(transID, func, argc, start);
-  }
-
   TCA emitCallArrayPrologue(Func* func, DVFuncletsVec& dvs) override {
     return x64::emitCallArrayPrologue(func, dvs);
   }
@@ -318,7 +311,7 @@ struct BackEnd final : jit::BackEnd {
     disasm.disasm(os, begin, end);
   }
 
-  void genCodeImpl(IRUnit& unit, AsmInfo*) override;
+  void genCodeImpl(IRUnit& unit, CodeKind, AsmInfo*) override;
 
 private:
   void do_moveToAlign(CodeBlock& cb, MoveToAlignFlags alignment) override {
@@ -478,7 +471,7 @@ static void printLLVMComparison(const IRUnit& ir_unit,
   }
 }
 
-void BackEnd::genCodeImpl(IRUnit& unit, AsmInfo* asmInfo) {
+void BackEnd::genCodeImpl(IRUnit& unit, CodeKind kind, AsmInfo* asmInfo) {
   Timer _t(Timer::codeGen);
   CodeBlock& mainCodeIn   = mcg->code.main();
   CodeBlock& coldCodeIn   = mcg->code.cold();
@@ -488,6 +481,7 @@ void BackEnd::genCodeImpl(IRUnit& unit, AsmInfo* asmInfo) {
   CodeBlock coldCode;
   bool do_relocate = false;
   if (!mcg->useLLVM() &&
+      !RuntimeOption::EvalEnableReusableTC &&
       RuntimeOption::EvalJitRelocationSize &&
       coldCodeIn.canEmit(RuntimeOption::EvalJitRelocationSize * 3)) {
     /*
@@ -574,6 +568,9 @@ void BackEnd::genCodeImpl(IRUnit& unit, AsmInfo* asmInfo) {
     printUnit(kInitialVasmLevel, "after initial vasm generation", vunit);
     assertx(check(vunit));
 
+    auto const& abi = kind == CodeKind::Trace ? x64::abi
+                                              : x64::cross_trace_abi;
+
     if (mcg->useLLVM()) {
       auto& areas = vasm.areas();
       auto x64_unit = vunit;
@@ -593,7 +590,7 @@ void BackEnd::genCodeImpl(IRUnit& unit, AsmInfo* asmInfo) {
       // vasm, just to see how big it is. The cost of this is trivial compared
       // to the LLVM code generation.
       if (RuntimeOption::EvalJitLLVMKeepSize) {
-        optimizeX64(x64_unit, x64::abi);
+        optimizeX64(x64_unit, abi);
         optimized = true;
         emitX64(x64_unit, areas, nullptr);
         vasm_size = areas[0].code.frontier() - areas[0].start;
@@ -620,7 +617,7 @@ void BackEnd::genCodeImpl(IRUnit& unit, AsmInfo* asmInfo) {
 
         mcg->setUseLLVM(false);
         resetCode();
-        if (!optimized) optimizeX64(x64_unit, x64::abi);
+        if (!optimized) optimizeX64(x64_unit, abi);
         emitX64(x64_unit, areas, state.asmInfo);
 
         if (auto compare = dynamic_cast<const CompareLLVMCodeGen*>(&e)) {
@@ -628,7 +625,7 @@ void BackEnd::genCodeImpl(IRUnit& unit, AsmInfo* asmInfo) {
         }
       }
     } else {
-      optimizeX64(vunit, x64::abi);
+      optimizeX64(vunit, abi);
       emitX64(vunit, vasm.areas(), state.asmInfo);
     }
   }
@@ -679,13 +676,15 @@ void BackEnd::genCodeImpl(IRUnit& unit, AsmInfo* asmInfo) {
         (coldCode.frontier() - coldCode.base());
 
       mainDeltaTot += mainDelta;
-      HPHP::Trace::traceRelease("main delta after relocation: "
-                                "%" PRId64 " (%" PRId64 ")\n",
-                                mainDelta, mainDeltaTot);
       coldDeltaTot += coldDelta;
-      HPHP::Trace::traceRelease("cold delta after relocation: "
-                                "%" PRId64 " (%" PRId64 ")\n",
-                                coldDelta, coldDeltaTot);
+      if (HPHP::Trace::moduleEnabledRelease(HPHP::Trace::printir, 1)) {
+        HPHP::Trace::traceRelease("main delta after relocation: "
+                                  "%" PRId64 " (%" PRId64 ")\n",
+                                  mainDelta, mainDeltaTot);
+        HPHP::Trace::traceRelease("cold delta after relocation: "
+                                  "%" PRId64 " (%" PRId64 ")\n",
+                                  coldDelta, coldDeltaTot);
+      }
     }
 #ifndef NDEBUG
     auto& ip = mcg->cgFixups().m_inProgressTailJumps;

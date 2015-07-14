@@ -14,7 +14,7 @@ open Utils
 
 let rec guess_root config start recursion_limit : Path.t option =
   let fs_root = Path.make "/" in
-  if Path.equal start fs_root then None
+  if start = fs_root then None
   else if Wwwroot.is_www_directory ~config start then Some start
   else if recursion_limit <= 0 then None
   else guess_root config (Path.parent start) (recursion_limit - 1)
@@ -57,7 +57,7 @@ let get_root ?(config=".hhconfig") path_opt =
 let parse_check_args cmd =
   (* arg parse output refs *)
   let mode = ref MODE_UNSPECIFIED in
-  let retries = ref 3 in
+  let retries = ref 800 in
   let output_json = ref false in
   let retry_if_init = ref true in
   let no_load = ref false in
@@ -179,12 +179,26 @@ let parse_check_args cmd =
       " (mode) find all occurrences of lint with the given error code";
     "--version", Arg.Set version,
       " (mode) show version and exit\n";
+    (* Create a checkpoint which can be used to retrieve changed files later *)
+    "--create-checkpoint", Arg.String (fun x -> set_mode (MODE_CREATE_CHECKPOINT x) ()),
+      "";
+    (* Retrieve changed files since input checkpoint.
+     * Output is separated by newline.
+     * Exit code will be non-zero if no checkpoint is found *)
+    "--retrieve-checkpoint",
+      Arg.String (fun x -> set_mode (MODE_RETRIEVE_CHECKPOINT x) ()),
+      "";
+    (* Delete an existing checkpoint.
+     * Exitcode will be non-zero if no checkpoint is found *)
+    "--delete-checkpoint",
+      Arg.String (fun x -> set_mode (MODE_DELETE_CHECKPOINT x) ()),
+      "";
 
     (* flags *)
     "--json", Arg.Set output_json,
       " output json for machine consumption. (default: false)";
     "--retries", Arg.Set_int retries,
-      " set the number of retries. (default: 3)";
+      spf " set the number of retries. (default: %d)" !retries;
     "--retry-if-init", Arg.Bool (fun x -> retry_if_init := x),
       " retry if the server is initializing (default: true)";
     "--no-load", Arg.Set no_load,
@@ -354,6 +368,7 @@ let parse_build_args () =
   in
   CBuild { ClientBuild.
     root = root;
+    wait = !wait;
     build_opts = { ServerBuild.
       steps = !steps;
       no_steps = !no_steps;
@@ -368,7 +383,6 @@ let parse_build_args () =
       incremental = !incremental;
       user = Sys_utils.logname ();
       verbose = !verbose;
-      wait = !wait;
     }
   }
 

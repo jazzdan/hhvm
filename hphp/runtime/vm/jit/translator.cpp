@@ -41,8 +41,8 @@
 #include "hphp/runtime/base/stats.h"
 #include "hphp/runtime/base/types.h"
 #include "hphp/runtime/base/unit-cache.h"
-#include "hphp/runtime/ext/ext_collections.h"
-#include "hphp/runtime/ext/ext_generator.h"
+#include "hphp/runtime/ext/collections/ext_collections-idl.h"
+#include "hphp/runtime/ext/generator/ext_generator.h"
 #include "hphp/runtime/vm/bytecode.h"
 #include "hphp/runtime/vm/hhbc.h"
 #include "hphp/runtime/vm/runtime.h"
@@ -73,71 +73,6 @@ namespace HPHP { namespace jit {
 ///////////////////////////////////////////////////////////////////////////////
 
 Lease Translator::s_writeLease;
-
-int locPhysicalOffset(int32_t localIndex) {
-  return -(localIndex + 1);
-}
-
-bool isClassSpecializedTypeReliable(Type input) {
-  assert(input.isSpecialized());
-  assert(input.clsSpec());
-  auto baseClass = input.clsSpec().cls();
-  return RuntimeOption::RepoAuthoritative &&
-      (baseClass->preClass()->attrs() & AttrUnique);
-}
-
-PropInfo getPropertyOffset(const IRGS& env,
-                           const NormalizedInstruction& ni,
-                           const Class* ctx, const Class*& baseClass,
-                           const MInstrInfo& mii,
-                           unsigned mInd, unsigned iInd) {
-  if (mInd == 0) {
-    auto const baseIndex = mii.valCount();
-    auto const type = irgen::predictedTypeFromLocation(
-      const_cast<IRGS&>(env), ni.inputs[baseIndex]->location);
-    baseClass = type <= TObj ? type.clsSpec().cls() : nullptr;
-  }
-  if (!baseClass) return PropInfo();
-
-  // TODO: This use of rtt is not guaranteed to be correctly guarded on.
-  auto keyType = ni.inputs[iInd]->rtt;
-  if (!keyType.hasConstVal(TStr)) return PropInfo();
-  auto const name = keyType.strVal();
-
-  // If we are not in repo-authoriative mode, we need to check that
-  // baseClass cannot change in between requests
-  if (!RuntimeOption::RepoAuthoritative ||
-      !(baseClass->preClass()->attrs() & AttrUnique)) {
-    if (!ctx) return PropInfo();
-    if (!ctx->classof(baseClass)) {
-      if (baseClass->classof(ctx)) {
-        // baseClass can change on us in between requests, but since
-        // ctx is an ancestor of baseClass we can make the weaker
-        // assumption that the object is an instance of ctx
-        baseClass = ctx;
-      } else {
-        // baseClass can change on us in between requests and it is
-        // not related to ctx, so bail out
-        return PropInfo();
-      }
-    }
-  }
-  // Lookup the index of the property based on ctx and baseClass
-  auto const lookup = baseClass->getDeclPropIndex(ctx, name);
-  auto const idx = lookup.prop;
-
-  // If we couldn't find a property that is accessible in the current context,
-  // bail out
-  if (idx == kInvalidSlot || !lookup.accessible) return PropInfo();
-
-  // If it's a declared property we're good to go: even if a subclass redefines
-  // an accessible property with the same name it's guaranteed to be at the same
-  // offset.
-  return PropInfo(
-    baseClass->declPropOffset(idx),
-    baseClass->declPropRepoAuthType(idx)
-  );
-}
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -492,6 +427,7 @@ static const struct {
 
   /*** 15. Async functions instructions ***/
 
+  { OpWHResult,    {Stack1,           Stack1,       OutUnknown,        0 }},
   { OpAwait,       {Stack1,           Stack1,       OutUnknown,        0 }},
 };
 
@@ -1072,6 +1008,7 @@ bool dontGuardAnyInputs(Op op) {
   case Op::VerifyParamType:
   case Op::VerifyRetTypeC:
   case Op::VerifyRetTypeV:
+  case Op::WHResult:
   case Op::Xor:
     return false;
 
@@ -1332,7 +1269,9 @@ static void translateDispatch(IRGS& irgs,
 
 //////////////////////////////////////////////////////////////////////
 
-static Type flavorToType(FlavorDesc f) {
+namespace {
+
+Type flavorToType(FlavorDesc f) {
   switch (f) {
     case NOV: not_reached();
 
@@ -1346,15 +1285,15 @@ static Type flavorToType(FlavorDesc f) {
   not_reached();
 }
 
-void emitInputChecks(
+Type typeToCheckForInput(
   IRGS& irgs,
   const NormalizedInstruction& ni,
-  bool checkOuterTypeOnly
+  int32_t opndIdx,
+  Type predictedType
 ) {
-  auto typeToCheckForInput = [&](int32_t opndIdx, Type predictedType) {
-    auto opc = ni.op();
-    auto tc = TypeConstraint(DataTypeSpecific);
-    switch (opc) {
+  auto opc = ni.op();
+  auto tc = TypeConstraint(DataTypeSpecific);
+  switch (opc) {
     case OpSetS:
     case OpSetG:
     case OpSetL: {
@@ -1378,8 +1317,15 @@ void emitInputChecks(
       break;
     }
 
-    case OpCGetL: {
+    case OpCGetL:
+    case OpVGetL:
+    case OpFPassL: {
       tc = DataTypeCountnessInit;
+      break;
+    }
+
+    case OpCUGetL: {
+      tc = DataTypeCountness;
       break;
     }
 
@@ -1429,35 +1375,57 @@ void emitInputChecks(
       break;
     }
 
-    case OpCGetM:
-    case OpIssetM:
-    case OpSetM: {
-      if (opndIdx == 0) {
-        if (predictedType.isSpecialized()) {
-          if (predictedType.clsSpec() &&
-              isClassSpecializedTypeReliable(predictedType)) {
-            tc = TypeConstraint(predictedType.clsSpec().cls());
-          } else if (predictedType.arrSpec() &&
-              predictedType.arrSpec().kind()) {
-            tc = TypeConstraint(DataTypeSpecialized).setWantArrayKind();
-          }
-          break;
-        }
-      }
+    case OpNewPackedArray: {
+      tc = DataTypeGeneric;
+      break;
+    }
+
+    case OpIterInit:
+    case OpIterInitK:
+    case OpMIterInit:
+    case OpMIterInitK:
+    case OpWIterInit:
+    case OpWIterInitK: {
+      // We care about the type of the stack input but not the locals.
+      tc = opndIdx == 0 ? DataTypeSpecific : DataTypeGeneric;
+      break;
+    }
+
+    case OpIterNext:
+    case OpIterNextK:
+    case OpMIterNext:
+    case OpMIterNextK:
+    case OpWIterNext:
+    case OpWIterNextK: {
+      // Don't care about local input types; all we do is pass their address to
+      // helpers.
+      tc = DataTypeGeneric;
       break;
     }
 
     default: {
       break;
     }
-    }
-    return relaxType(predictedType, tc);
-  };
+  }
 
+  if (hasMVector(opc) && opndIdx == getMInstrInfo(ni.mInstrOp()).valCount()) {
+    tc = irgen::mInstrBaseConstraint(irgs, predictedType);
+  }
+
+  return relaxType(predictedType, tc);
+}
+
+void emitInputChecks(
+  IRGS& irgs,
+  const NormalizedInstruction& ni,
+  bool checkOuterTypeOnly
+) {
   FTRACE(4, "\n{}: {}\n", ni.offset(), opcodeToName(ni.op()));
+  if (isAlwaysNop(ni.op())) return;
+
   for (auto i = 0; i < ni.inputs.size(); ++i) {
     FTRACE(4, "Input {}: ", i);
-    auto loc = ni.inputs[i]->location;
+    auto loc = ni.inputs[i];
     if (!loc.isLocal() && !loc.isStack()) {
       FTRACE(4, "!isLocal && !isStack, skipping\n");
       continue;
@@ -1474,7 +1442,7 @@ void emitInputChecks(
 
     auto typeToCheck = predictedType <= TCls
       ? predictedType
-      : typeToCheckForInput(i, predictedType);
+      : typeToCheckForInput(irgs, ni, i, predictedType);
 
     // Make sure typeToCheck is checkable.
     if (!(typeToCheck <= TCell || typeToCheck <= TBoxedInitCell)) {
@@ -1514,10 +1482,13 @@ void emitInputChecks(
   irgs.irb->exceptionStackBoundary();
 }
 
+}
+
 void translateInstr(
   IRGS& irgs,
   const NormalizedInstruction& ni,
-  bool checkOuterTypeOnly
+  bool checkOuterTypeOnly,
+  bool needsExitPlaceholder
 ) {
   irgen::prepareForNextHHBC(
     irgs,
@@ -1529,11 +1500,9 @@ void translateInstr(
   auto pc = reinterpret_cast<const Op*>(ni.pc());
   for (auto i = 0, num = instrNumPops(pc); i < num; ++i) {
     auto const type = flavorToType(instrInputFlavor(pc, i));
-    if (type != TGen) {
-      // TODO(#5706706): want to use assertTypeLocation, but Location::Stack
-      // is a little unsure of itself.
-      irgen::assertTypeStack(irgs, BCSPOffset{i}, type);
-    }
+    // TODO(#5706706): want to use assertTypeLocation, but Location::Stack
+    // is a little unsure of itself.
+    irgen::assertTypeStack(irgs, BCSPOffset{i}, type);
   }
 
   if (RuntimeOption::EvalHHIRConstrictGuards) {
@@ -1544,6 +1513,8 @@ void translateInstr(
                                          ni.offset(), ni.toString(),
                                          show(irgs)));
 
+  if (needsExitPlaceholder) irgen::makeExitPlaceholder(irgs);
+
   irgen::ringbufferEntry(irgs, Trace::RBTypeBytecodeStart, ni.source, 2);
   irgen::emitIncStat(irgs, Stats::Instr_TC, 1);
   if (Trace::moduleEnabledRelease(Trace::llvm_count, 1) ||
@@ -1551,13 +1522,13 @@ void translateInstr(
     irgen::gen(irgs, CountBytecode);
   }
 
-  if (isAlwaysNop(ni.op())) {
-    // Do nothing
-  } else if (ni.interp || RuntimeOption::EvalJitAlwaysInterpOne) {
+  if (isAlwaysNop(ni.op())) return;
+  if (ni.interp || RuntimeOption::EvalJitAlwaysInterpOne) {
     irgen::interpOne(irgs, ni);
-  } else {
-    translateDispatch(irgs, ni);
+    return;
   }
+
+  translateDispatch(irgs, ni);
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -1585,7 +1556,7 @@ void Translator::addTranslation(const TransRec& transRec) {
     Trace::traceRelease("New translation: %" PRId64 " %s %u %u %d\n",
                         HPHP::Timer::GetCurrentTimeMicros() - m_createdTime,
                         folly::format("{}:{}:{}",
-                          transRec.src.unit()->filepath()->data(),
+                          transRec.src.unit()->filepath(),
                           transRec.src.funcID(),
                           transRec.src.offset()).str().c_str(),
                         transRec.aLen,
@@ -1596,7 +1567,8 @@ void Translator::addTranslation(const TransRec& transRec) {
   if (!isTransDBEnabled()) return;
   uint32_t id = getCurrentTransID();
   m_translations.emplace_back(transRec);
-  m_translations[id].id = id;
+  auto& newTransRec = m_translations[id];
+  newTransRec.id = id;
 
   if (transRec.aLen > 0) {
     m_transDB[transRec.aStart] = id;
@@ -1604,6 +1576,9 @@ void Translator::addTranslation(const TransRec& transRec) {
   if (transRec.acoldLen > 0) {
     m_transDB[transRec.acoldStart] = id;
   }
+
+  // Optimize storage of the created TransRec.
+  newTransRec.optimizeForMemory();
 }
 
 uint64_t Translator::getTransCounter(TransID transId) const {
@@ -1627,8 +1602,7 @@ const Func* lookupImmutableMethod(const Class* cls, const StringData* name,
   if (!cls || RuntimeOption::EvalJitEnableRenameFunction) return nullptr;
   if (cls->attrs() & AttrInterface) return nullptr;
   bool privateOnly = false;
-  if (!RuntimeOption::RepoAuthoritative ||
-      !(cls->preClass()->attrs() & AttrUnique)) {
+  if (!(cls->attrs() & AttrUnique)) {
     if (!ctx || !ctx->classof(cls)) {
       return nullptr;
     }
@@ -1686,6 +1660,29 @@ const Func* lookupImmutableMethod(const Class* cls, const StringData* name,
       func = nullptr;
     }
   }
+  return func;
+}
+
+const Func* lookupImmutableCtor(const Class* cls, const Class* ctx) {
+  if (!cls || RuntimeOption::EvalJitEnableRenameFunction) return nullptr;
+  if (!(cls->attrs() & AttrUnique)) {
+    if (!ctx || !ctx->classof(cls)) {
+      return nullptr;
+    }
+  }
+
+  auto const func = cls->getCtor();
+  if (func && !(func->attrs() & AttrPublic)) {
+    auto fcls = func->cls();
+    if (fcls != ctx) {
+      if (!ctx) return nullptr;
+      if ((func->attrs() & AttrPrivate) ||
+          !(ctx->classof(fcls) || fcls->classof(ctx))) {
+        return nullptr;
+      }
+    }
+  }
+
   return func;
 }
 

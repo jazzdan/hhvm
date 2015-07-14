@@ -17,7 +17,7 @@
 #ifndef incl_HPHP_STRING_H_
 #define incl_HPHP_STRING_H_
 
-#include "hphp/runtime/base/smart-ptr.h"
+#include "hphp/runtime/base/req-ptr.h"
 #include "hphp/runtime/base/static-string-table.h"
 #include "hphp/runtime/base/string-data.h"
 #include "hphp/runtime/base/typed-value.h"
@@ -53,6 +53,7 @@ constexpr int kMinShrinkThreshold = 1024;
 
 //////////////////////////////////////////////////////////////////////
 
+// Built strings will have their reference counts pre-initialized to 1.
 StringData* buildStringData(int     n);
 StringData* buildStringData(int64_t n);
 StringData* buildStringData(double  n);
@@ -66,11 +67,11 @@ std::string convDblToStrWithPhpFormat(double n);
  * literal string handling (to avoid string copying).
  */
 class String {
-  SmartPtr<StringData> m_str;
+  req::ptr<StringData> m_str;
 
 protected:
-  using IsUnowned = SmartPtr<StringData>::IsUnowned;
-  using NoIncRef = SmartPtr<StringData>::NoIncRef;
+  using IsUnowned = req::ptr<StringData>::IsUnowned;
+  using NoIncRef = req::ptr<StringData>::NoIncRef;
 
   String(StringData* sd, NoIncRef) : m_str(sd, NoIncRef{}) {}
 
@@ -133,7 +134,7 @@ public:
   /* implicit */ String(double  n);
   /* implicit */ String(const char* s)
   : m_str(LIKELY((bool)s) ? StringData::Make(s, CopyString)
-                          : nullptr, IsUnowned{}) { }
+                           : nullptr, NoIncRef{}) { }
 
   String(const String& str) : m_str(str.m_str) { }
   /* implicit */ String(const StaticString& str);
@@ -156,34 +157,34 @@ public:
   String& operator=(Variant&& src);
 
   /* implicit */ String(const std::string &s)
-  : m_str(StringData::Make(s.data(), s.size(), CopyString), IsUnowned{}) { }
+  : m_str(StringData::Make(s.data(), s.size(), CopyString), NoIncRef{}) { }
 
   // attach to null terminated malloc'ed string, maybe free it now.
   String(char* s, AttachStringMode mode)
-  : m_str(LIKELY((bool)s) ? StringData::Make(s, mode) : nullptr, IsUnowned{}) {}
+  : m_str(LIKELY((bool)s) ? StringData::Make(s, mode) : nullptr, NoIncRef{}) {}
 
   // copy a null terminated string
   String(const char *s, CopyStringMode mode)
-  : m_str(LIKELY((bool)s) ? StringData::Make(s, mode) : nullptr, IsUnowned{}) {}
+  : m_str(LIKELY((bool)s) ? StringData::Make(s, mode) : nullptr, NoIncRef{}) {}
 
   // attach to binary malloc'ed string
   String(char* s, size_t length, AttachStringMode mode)
   : m_str(LIKELY((bool)s) ? StringData::Make(s, length, mode)
-                          : nullptr, IsUnowned{}) { }
+                          : nullptr, NoIncRef{}) { }
 
   // make copy of binary binary string
   String(const char *s, size_t length, CopyStringMode mode)
   : m_str(LIKELY((bool)s) ? StringData::Make(s, length, mode)
-                          : nullptr, IsUnowned{}) { }
+                          : nullptr, NoIncRef{}) { }
 
   // force a copy of a String
   String(const String& s, CopyStringMode mode)
   : m_str(LIKELY((bool)s) ? StringData::Make(s.c_str(), s.size(), mode)
-                          : nullptr, IsUnowned{}) {}
+                          : nullptr, NoIncRef{}) {}
 
   // make an empty string with cap reserve bytes, plus 1 for '\0'
   String(size_t cap, ReserveStringMode mode)
-  : m_str(StringData::Make(cap), IsUnowned{}) { }
+  : m_str(StringData::Make(cap), NoIncRef{}) { }
 
   static String attach(StringData* sd) {
     return String(sd, NoIncRef{});
@@ -210,7 +211,7 @@ public:
   const String& shrink(size_t len) {
     assert(m_str);
     if (m_str->capacity() - len > kMinShrinkThreshold) {
-      m_str = m_str->shrinkImpl(len);
+      m_str = req::ptr<StringData>::attach(m_str->shrinkImpl(len));
     } else {
       assert(len < StringData::MaxSize);
       m_str->setSize(len);
@@ -220,7 +221,9 @@ public:
   MutableSlice reserve(size_t size) {
     if (!m_str) return MutableSlice("", 0);
     auto const tmp = m_str->reserve(size);
-    if (UNLIKELY(tmp != m_str)) m_str = std::move(tmp);
+    if (UNLIKELY(tmp != m_str)) {
+      m_str = req::ptr<StringData>::attach(tmp);
+    }
     return m_str->bufferSlice();
   }
   const char *c_str() const {
@@ -418,8 +421,8 @@ public:
   void dump() const;
 
  private:
-  static SmartPtr<StringData> buildString(int n);
-  static SmartPtr<StringData> buildString(int64_t n);
+  static req::ptr<StringData> buildString(int n);
+  static req::ptr<StringData> buildString(int64_t n);
 
   String rvalAtImpl(int key) const {
     if (m_str) {
@@ -429,7 +432,7 @@ public:
   }
 
   static void compileTimeAssertions() {
-    static_assert(sizeof(String) == sizeof(SmartPtr<StringData>), "");
+    static_assert(sizeof(String) == sizeof(req::ptr<StringData>), "");
   }
 };
 
@@ -575,7 +578,7 @@ public:
   StaticString(const char* s, int length); // binary string
   explicit StaticString(std::string s);
   ~StaticString() {
-    // prevent ~SmartPtr from destroying contents.
+    // prevent ~req::ptr from destroying contents.
     detach();
   }
   StaticString& operator=(const StaticString &str);
@@ -596,7 +599,7 @@ inline String::String(const StaticString& str) :
 }
 
 inline String& String::operator=(const StaticString& v) {
-  m_str = SmartPtr<StringData>::attach(v.m_str.get());
+  m_str = req::ptr<StringData>::attach(v.m_str.get());
   return *this;
 }
 
@@ -608,6 +611,20 @@ ALWAYS_INLINE String empty_string() {
 
 //////////////////////////////////////////////////////////////////////
 
+}
+
+namespace folly {
+template<> struct FormatValue<HPHP::String> {
+  explicit FormatValue(const HPHP::String& str) : m_val(str) {}
+
+  template<typename Callback>
+  void format(FormatArg& arg, Callback& cb) const {
+    FormatValue<HPHP::StringData*>(m_val.get()).format(arg, cb);
+  }
+
+ private:
+  const HPHP::String& m_val;
+};
 }
 
 #endif

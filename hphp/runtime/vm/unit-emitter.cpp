@@ -27,6 +27,7 @@
 #include "hphp/runtime/base/runtime-option.h"
 #include "hphp/runtime/base/static-string-table.h"
 #include "hphp/runtime/base/typed-value.h"
+#include "hphp/runtime/base/variable-serializer.h"
 
 #include "hphp/runtime/ext/std/ext_std_variable.h"
 
@@ -128,7 +129,7 @@ const StringData* UnitEmitter::lookupLitstr(Id id) const {
 
 const ArrayData* UnitEmitter::lookupArray(Id id) const {
   assert(id < m_arrays.size());
-  return m_arrays[id].array;
+  return m_arrays[id];
 }
 
 Id UnitEmitter::mergeLitstr(const StringData* litstr) {
@@ -152,20 +153,19 @@ Id UnitEmitter::mergeUnitLitstr(const StringData* litstr) {
 }
 
 Id UnitEmitter::mergeArray(const ArrayData* a) {
-  Variant v(const_cast<ArrayData*>(a));
-  auto key = HHVM_FN(serialize)(v).toCppString();
+  auto key = ArrayData::GetScalarArrayKey(const_cast<ArrayData*>(a));
   return mergeArray(a, key);
 }
 
-Id UnitEmitter::mergeArray(const ArrayData* a, const std::string& key) {
+Id UnitEmitter::mergeArray(const ArrayData* a,
+                           const ArrayData::ScalarArrayKey& key) {
   auto const it = m_array2id.find(key);
   if (it != m_array2id.end()) {
     return it->second;
   }
-  a = ArrayData::GetScalarArray(const_cast<ArrayData*>(a), key);
+  auto sa = ArrayData::GetScalarArray(const_cast<ArrayData*>(a), key);
   Id id = m_arrays.size();
-  ArrayVecElm ave = {key, a};
-  m_arrays.push_back(ave);
+  m_arrays.push_back(sa);
   m_array2id[key] = id;
   return id;
 }
@@ -223,15 +223,9 @@ void UnitEmitter::recordFunction(FuncEmitter* fe) {
 }
 
 Func* UnitEmitter::newFunc(const FuncEmitter* fe, Unit& unit,
-                           PreClass* preClass, int line1, int line2,
-                           Offset base, Offset past,
-                           const StringData* name, Attr attrs, bool top,
-                           const StringData* docComment, int numParams,
-                           bool needsNextClonedClosure) {
-  Func* f = new (Func::allocFuncMem(name, numParams,
-                                    needsNextClonedClosure,
-                                    !preClass))
-    Func(unit, name, attrs);
+                           const StringData* name, Attr attrs,
+                           int numParams) {
+  auto f = new (Func::allocFuncMem(numParams)) Func(unit, name, attrs);
   m_fMap[fe] = f;
   return f;
 }
@@ -322,13 +316,13 @@ LineTable createLineTable(SrcLoc& srcLoc, Offset bclen) {
 
 }
 
-void UnitEmitter::recordSourceLocation(const Location* sLoc, Offset start) {
+void UnitEmitter::recordSourceLocation(const Location::Range& sLoc,
+                                       Offset start) {
   // Some byte codes, such as for the implicit "return 0" at the end of a
   // a source file do not have valid source locations. This check makes
   // sure we don't record a (dummy) source location in this case.
-  if (start > 0 && sLoc->line0 == 1 && sLoc->char0 == 1 &&
-    sLoc->line1 == 1 && sLoc->char1 == 1 && strlen(sLoc->file) == 0) return;
-  SourceLoc newLoc(*sLoc);
+  if (start > 0 && sLoc.line0 == -1) return;
+  SourceLoc newLoc(sLoc);
   if (!m_sourceLocTab.empty()) {
     if (m_sourceLocTab.back().second == newLoc) {
       // Combine into the interval already at the back of the vector.
@@ -427,8 +421,9 @@ bool UnitEmitter::insert(UnitOrigin unitOrigin, RepoTxn& txn) {
       urp.insertUnitLitstr[repoId].insert(txn, usn, i, m_litstrs[i]);
     }
     for (unsigned i = 0; i < m_arrays.size(); ++i) {
-      urp.insertUnitArray[repoId].insert(txn, usn, i,
-                                         m_arrays[i].serialized);
+      VariableSerializer vs(VariableSerializer::Type::Serialize);
+      urp.insertUnitArray[repoId].insert(
+        txn, usn, i, vs.serialize(VarNR(m_arrays[i]), true).toCppString());
     }
     for (auto& fe : m_fes) {
       fe->commit(txn);
@@ -521,7 +516,7 @@ std::unique_ptr<Unit> UnitEmitter::create() {
   u->m_arrays = [&]() -> std::vector<const ArrayData*> {
     auto ret = std::vector<const ArrayData*>{};
     for (unsigned i = 0; i < m_arrays.size(); ++i) {
-      ret.push_back(m_arrays[i].array);
+      ret.push_back(m_arrays[i]);
     }
     return ret;
   }();
@@ -936,7 +931,9 @@ void UnitRepoProxy::GetUnitArraysStmt
       Id arrayId;        /**/ query.getId(0, arrayId);
       std::string key;   /**/ query.getStdString(1, key);
       Variant v = unserialize_from_buffer(key.data(), key.size());
-      Id id UNUSED = ue.mergeArray(v.asArrRef().get(), key);
+      Id id UNUSED = ue.mergeArray(
+        v.asArrRef().get(),
+        ArrayData::GetScalarArrayKey(key.c_str(), key.size()));
       assert(id == arrayId);
     }
   } while (!query.done());

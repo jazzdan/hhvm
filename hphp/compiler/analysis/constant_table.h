@@ -54,29 +54,19 @@ public:
   /**
    * Explicitly setting a constant to be dynamic, mainly for "Dynamic" note.
    */
-  void setDynamic(AnalysisResultConstPtr ar, const std::string &name,
-                  bool forceVariant);
+  void setDynamic(AnalysisResultConstPtr ar, const std::string &name);
 
   /**
    * Called when a constant is declared (l-value).
    */
-  TypePtr add(const std::string &name, TypePtr type, ExpressionPtr exp,
-              AnalysisResultConstPtr ar, ConstructPtr construct);
+  void add(const std::string &name, ExpressionPtr exp,
+           AnalysisResultConstPtr ar, ConstructPtr construct);
 
   /**
-   * Called after a constant is type-inferred
+   * Called after a constants value is determined
    */
   void setValue(AnalysisResultConstPtr ar, const std::string &name,
                 ExpressionPtr value);
-
-  /**
-   * Called when a constant is used or being evaluated (r-value).
-   */
-  TypePtr check(BlockScopeRawPtr context,
-                const std::string &name, TypePtr type, bool coerce,
-                AnalysisResultConstPtr ar, ConstructPtr construct,
-                const std::vector<std::string> &bases,
-                BlockScope *&defScope);
 
   /**
    * Generate all constant declarations for this symbol table.

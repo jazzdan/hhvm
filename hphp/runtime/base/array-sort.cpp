@@ -96,7 +96,7 @@ done:
 void MixedArray::postSort(bool resetKeys) {   // nothrow guarantee
   assert(m_size > 0);
   auto const ht = hashTab();
-  initHash(ht, hashSize());
+  initHash(ht, m_scale);
   if (resetKeys) {
     for (uint32_t pos = 0; pos < m_used; ++pos) {
       auto& e = data()[pos];
@@ -123,7 +123,7 @@ ArrayData* MixedArray::EscalateForSort(ArrayData* ad, SortFunction sf) {
   // }
   if (UNLIKELY(hasUserDefinedCmp(sf) || a->hasMultipleRefs())) {
     auto ret = a->copyMixed();
-    assert(ret->getCount() == 0);
+    assert(ret->hasExactlyOneRef());
     return ret;
   } else {
     return a;
@@ -140,7 +140,7 @@ ArrayData* PackedArray::EscalateForSort(ArrayData* ad, SortFunction sf) {
   if (isSortFamily(sf)) {               // sort/rsort/usort
     if (UNLIKELY(ad->hasMultipleRefs())) {
       auto ret = PackedArray::Copy(ad);
-      assert(ret->getCount() == 0);
+      assert(ret->hasExactlyOneRef());
       return ret;
     } else {
       return ad;
@@ -148,7 +148,7 @@ ArrayData* PackedArray::EscalateForSort(ArrayData* ad, SortFunction sf) {
   }
   assert(checkInvariants(ad));
   auto ret = ToMixedCopy(ad);
-  assert(ret->getCount() == 0);
+  assert(ret->hasExactlyOneRef());
   return ret;
 }
 

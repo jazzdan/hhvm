@@ -30,7 +30,7 @@ class StreamContext;
 class UserFSNode {
 public:
   explicit UserFSNode(Class* cls,
-                      const SmartPtr<StreamContext>& context = nullptr);
+                      const req::ptr<StreamContext>& context = nullptr);
 
 protected:
   Variant invoke(const Func* func, const String& name, const Array& args,
@@ -45,7 +45,7 @@ protected:
   template <typename F> friend void scan(const UserFSNode&, F&);
 
   const Func* m_Call;
-  LowClassPtr m_cls;
+  LowPtr<Class> m_cls;
   Object m_obj;
 };
 

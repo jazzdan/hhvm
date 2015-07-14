@@ -32,9 +32,6 @@ namespace HPHP {
 
 //////////////////////////////////////////////////////////////////////
 
-TypePtr ClosureExpression::s_ClosureType =
-  Type::CreateObjectType("closure"); // needs lower case
-
 ClosureExpression::ClosureExpression(
     EXPRESSION_CONSTRUCTOR_PARAMETERS,
     ClosureType type,
@@ -57,7 +54,7 @@ ClosureExpression::ClosureExpression(
 
 void ClosureExpression::initializeFromUseList(ExpressionListPtr vars) {
   m_vars = ExpressionListPtr(
-    new ExpressionList(vars->getScope(), vars->getLocation()));
+    new ExpressionList(vars->getScope(), vars->getRange()));
 
   // Because PHP is insane you can have a use variable with the same
   // name as a param name.
@@ -86,14 +83,14 @@ void ClosureExpression::initializeValuesFromVars() {
   if (!m_vars) return;
 
   m_values = ExpressionListPtr
-    (new ExpressionList(m_vars->getScope(), m_vars->getLocation()));
+    (new ExpressionList(m_vars->getScope(), m_vars->getRange()));
   for (int i = 0; i < m_vars->getCount(); i++) {
     ParameterExpressionPtr param =
       dynamic_pointer_cast<ParameterExpression>((*m_vars)[i]);
     const string &name = param->getName();
 
     SimpleVariablePtr var(new SimpleVariable(param->getScope(),
-                                             param->getLocation(),
+                                             param->getRange(),
                                              name));
     if (param->isRef()) {
       var->setContext(RefValue);
@@ -234,7 +231,7 @@ void ClosureExpression::setCaptureList(
   if (captureNames.empty()) return;
 
   m_vars = ExpressionListPtr(
-    new ExpressionList(getOriginalScope(), getLocation()));
+    new ExpressionList(getScope(), getRange()));
 
   for (auto const& name : captureNames) {
     if (name == "this") {
@@ -242,9 +239,9 @@ void ClosureExpression::setCaptureList(
       continue;
     }
 
-    auto expr = ParameterExpressionPtr(new ParameterExpression(
-      BlockScopePtr(getOriginalScope()),
-      getLocation(),
+    auto expr = std::make_shared<ParameterExpression>(
+      BlockScopePtr(getScope()),
+      getRange(),
       TypeAnnotationPtr(),
       true /* hhType */,
       name,
@@ -252,7 +249,7 @@ void ClosureExpression::setCaptureList(
       0 /* token modifier thing */,
       ExpressionPtr(),
       ExpressionPtr()
-    ));
+    );
     m_vars->insertElement(expr);
   }
 
@@ -314,7 +311,7 @@ void ClosureExpression::outputCodeModel(CodeGenerator &cg) {
     cg.printExpressionVector(m_vars);
   }
   cg.printPropertyHeader("sourceLocation");
-  cg.printLocation(this->getLocation());
+  cg.printLocation(this);
   cg.printObjectFooter();
 }
 

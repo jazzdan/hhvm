@@ -317,7 +317,7 @@ Variant HHVM_FUNCTION(apc_add,
         errors.add(key, -1);
       }
     }
-    return errors.create();
+    return errors.toVariant();
   }
 
   if (!key_or_array.isString()) {
@@ -352,7 +352,7 @@ Variant HHVM_FUNCTION(apc_fetch,
       }
     }
     success = tmp;
-    return init.create();
+    return init.toVariant();
   }
 
   if (apc_store().get(key.toString(), v)) {
@@ -380,7 +380,7 @@ Variant HHVM_FUNCTION(apc_delete,
         init.append(k);
       }
     }
-    return init.create();
+    return init.toVariant();
   } else if(key.is(KindOfObject)) {
     if (!key.getObjectData()->getVMClass()->
          classof(SystemLib::s_APCIteratorClass)) {
@@ -459,7 +459,7 @@ Variant HHVM_FUNCTION(apc_exists,
         init.append(strKey);
       }
     }
-    return init.create();
+    return init.toVariant();
   }
 
   return apc_store().exists(key.toString());
@@ -504,7 +504,8 @@ Variant HHVM_FUNCTION(apc_cache_info,
     PackedArrayInit ents(entries.size());
     for (auto& entry : entries) {
       ArrayInit ent(kEntryInfoSize, ArrayInit::Map{});
-      ent.add(s_entry_name, StringData::Make(entry.key.c_str()));
+      ent.add(s_entry_name,
+              Variant::attach(StringData::Make(entry.key.c_str())));
       ent.add(s_in_memory, entry.inMem);
       ent.add(s_ttl, entry.ttl);
       ent.add(s_mem_size, entry.size);
@@ -1298,7 +1299,7 @@ int apc_rfc1867_progress(apc_rfc1867_data *rfc1867ApcData,
       track.set(s_name, rfc1867ApcData->name);
       track.set(s_done, 0);
       track.set(s_start_time, rfc1867ApcData->start_time);
-      HHVM_FN(apc_store)(rfc1867ApcData->tracking_key, track.create(), 3600);
+      HHVM_FN(apc_store)(rfc1867ApcData->tracking_key, track.toVariant(), 3600);
     }
     break;
 
@@ -1320,7 +1321,7 @@ int apc_rfc1867_progress(apc_rfc1867_data *rfc1867ApcData,
             track.set(s_name, rfc1867ApcData->name);
             track.set(s_done, 0);
             track.set(s_start_time, rfc1867ApcData->start_time);
-            HHVM_FN(apc_store)(rfc1867ApcData->tracking_key, track.create(),
+            HHVM_FN(apc_store)(rfc1867ApcData->tracking_key, track.toVariant(),
                                3600);
           }
           rfc1867ApcData->prev_bytes_processed =
@@ -1346,7 +1347,7 @@ int apc_rfc1867_progress(apc_rfc1867_data *rfc1867ApcData,
       track.set(s_cancel_upload, rfc1867ApcData->cancel_upload);
       track.set(s_done, 0);
       track.set(s_start_time, rfc1867ApcData->start_time);
-      HHVM_FN(apc_store)(rfc1867ApcData->tracking_key, track.create(), 3600);
+      HHVM_FN(apc_store)(rfc1867ApcData->tracking_key, track.toVariant(), 3600);
     }
     break;
 
@@ -1370,7 +1371,8 @@ int apc_rfc1867_progress(apc_rfc1867_data *rfc1867ApcData,
         track.set(s_cancel_upload, rfc1867ApcData->cancel_upload);
         track.set(s_done, 1);
         track.set(s_start_time, rfc1867ApcData->start_time);
-        HHVM_FN(apc_store)(rfc1867ApcData->tracking_key, track.create(), 3600);
+        HHVM_FN(apc_store)(rfc1867ApcData->tracking_key, track.toVariant(),
+                           3600);
       }
     }
     break;

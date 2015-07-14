@@ -36,7 +36,6 @@ namespace jit {
 struct IRUnit;
 struct IRInstruction;
 struct SSATmp;
-struct LocalStateHook;
 struct FrameStateMgr;
 
 //////////////////////////////////////////////////////////////////////
@@ -167,6 +166,16 @@ bool isDblQueryOp(Opcode opc);
 Opcode queryToDblQueryOp(Opcode opc);
 
 /*
+ * Return true if opc is a str comparison operator
+ */
+bool isStrQueryOp(Opcode opc);
+
+/*
+ * Return the str-query opcode for the given non-str-query opcode
+ */
+Opcode queryToStrQueryOp(Opcode opc);
+
+/*
  * Return the opcode that corresponds to negation of opc.
  */
 Opcode negateQueryOp(Opcode opc);
@@ -196,7 +205,6 @@ enum OpcodeFlag : uint64_t {
   NaryDest         = 1ULL <<  8, // has 0 or more destinations
   HasExtra         = 1ULL <<  9,
   Passthrough      = 1ULL << 10,
-  KillsSources     = 1ULL << 11,
 };
 
 bool hasEdges(Opcode opc);

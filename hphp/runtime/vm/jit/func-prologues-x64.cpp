@@ -39,6 +39,15 @@ TRACE_SET_MOD(mcg);
 
 namespace {
 
+// Generate an if-then block into a.  thenBlock is executed if cc is true.
+template <class Then>
+void ifThen(jit::X64Assembler& a, ConditionCode cc, Then thenBlock) {
+  Label done;
+  a.jcc8(ccNegate(cc), done);
+  thenBlock(a);
+  asm_label(a, done);
+}
+
 void emitStackCheck(X64Assembler& a, int funcDepth, Offset pc) {
   using reg::rax;
   assertx(kScratchCrossTraceRegs.contains(rax));
@@ -221,7 +230,7 @@ SrcKey emitPrologueWork(TransID transID, Func* func, int nPassed) {
   if (func->isClosureBody()) {
     // Closure object properties are the use vars followed by the
     // static locals (which are per-instance).
-    auto const numUseVars = func->cls()->numDeclProperties() -
+    auto const numUseVars = func->baseCls()->numDeclProperties() -
                             func->numStaticLocals();
 
     assertx(kScratchCrossTraceRegs.contains(rcx));
@@ -233,7 +242,7 @@ SrcKey emitPrologueWork(TransID transID, Func* func, int nPassed) {
     a.  loadq  (rClosure[c_Closure::ctxOffset()], rax);
     a.  storeq (rax, rVmFp[AROFF(m_this)]);
 
-    if (!(func->attrs() & AttrStatic)) {
+    if (!func->isStatic()) {
       a.shrq   (1, rax);
       ifThen(a, CC_NBE, [&] (Asm& a) {
         a.shlq (1, rax);
@@ -241,12 +250,8 @@ SrcKey emitPrologueWork(TransID transID, Func* func, int nPassed) {
       });
     }
 
-    // Put in the correct context
-    a.  loadq  (rClosure[c_Closure::funcOffset()], rax);
-    a.  storeq (rax, rVmFp[AROFF(m_func)]);
-
     // Copy in all the use vars
-    int baseUVOffset = sizeof(ObjectData) + func->cls()->builtinODTailSize();
+    int baseUVOffset = sizeof(ObjectData) + func->baseCls()->builtinODTailSize();
     for (int i = 0; i < numUseVars + 1; i++) {
       int fpOffset = -cellsToBytes(i + 1 + numLocals);
 
@@ -324,7 +329,7 @@ SrcKey emitPrologueWork(TransID transID, Func* func, int nPassed) {
         a.  emitImmReg((intptr_t)func, argNumToRegName[0]);
         a.  emitImmReg(nPassed, argNumToRegName[1]);
         emitCall(a, TCA(raiseMissingArgument), argSet(2));
-        mcg->recordSyncPoint(a.frontier(), fixup.pcOffset, fixup.spOffset);
+        mcg->recordSyncPoint(a.frontier(), fixup);
         break;
       }
     }
@@ -333,26 +338,25 @@ SrcKey emitPrologueWork(TransID transID, Func* func, int nPassed) {
   // Check surprise flags in the same place as the interpreter: after
   // setting up the callee's frame but before executing any of its
   // code
-  emitCheckSurpriseFlagsEnter(mcg->code.main(), mcg->code.cold(), rVmTl,
-                              fixup);
+  {
+    Asm acold { mcg->code.cold() };
+    a.    cmpq    (rVmFp, rVmTl[rds::kSurpriseFlagsOff]);
+    a.    jnbe    (acold.frontier());
 
-  if (func->isClosureBody() && func->cls()) {
-    int entry = nPassed <= numNonVariadicParams
-      ? nPassed : numNonVariadicParams + 1;
-    a.    loadq   (rVmFp[AROFF(m_func)], rax); // XXX: redundant load; we just
-                                               // stored this
-    a.    loadq   (rax[Func::prologueTableOff() + sizeof(TCA)*entry], rax);
-    a.    jmp     (rax);
-  } else {
-    emitBindJ(
-      mcg->code.main(),
-      mcg->code.frozen(),
-      CC_None,
-      funcBody,
-      FPInvOffset{func->numSlotsInFrame()},
-      TransFlags{}
-    );
+    emitCall(acold, mcg->tx().uniqueStubs.functionEnterHelper, argSet(0));
+    mcg->recordSyncPoint(acold.frontier(), fixup);
+    acold.    jmp   (a.frontier());
   }
+
+  emitBindJ(
+    mcg->code.main(),
+    mcg->code.frozen(),
+    CC_None,
+    funcBody,
+    FPInvOffset{func->numSlotsInFrame()},
+    TransFlags{}
+  );
+
   return funcBody;
 }
 
@@ -518,8 +522,8 @@ SrcKey emitMagicFuncPrologue(TransID transID, Func* func, int nPassed,
 
   if (RuntimeOption::HHProfServerEnabled && callFixup) {
     mcg->recordSyncPoint(callFixup,
-                         skFuncBody.offset() - func->base(),
-                         func->numSlotsInFrame());
+                         Fixup{skFuncBody.offset() - func->base(),
+                               func->numSlotsInFrame()});
   }
 
   return skFuncBody;

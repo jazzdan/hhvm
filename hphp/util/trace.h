@@ -92,7 +92,9 @@ namespace Trace {
       TM(atomicvector)  \
       TM(bcinterp)      \
       TM(bisector)      \
+      TM(class_load)     \
       TM(datablock)     \
+      TM(decreftype)    \
       TM(debugger)      \
       TM(debuggerflow)  \
       TM(debuginfo)     \
@@ -108,19 +110,25 @@ namespace Trace {
       TM(hhbbc_emit)    \
       TM(hhbbc_index)   \
       TM(hhbbc_time)    \
+      TM(hhbbc_iface)   \
       TM(hhbc)          \
       TM(vasm)          \
       TM(vasm_copy)     \
+      TM(vasm_phi)      \
       TM(hhir)          \
       TM(hhirTracelets) \
       TM(hhir_cfg)      \
+      TM(hhir_checkhoist) \
       TM(hhir_dce)      \
       TM(hhir_store)    \
       TM(hhir_alias)    \
+      TM(hhir_loop)     \
       TM(hhir_load)     \
       TM(hhir_refineTmps) \
       TM(hhir_gvn)      \
       TM(hhir_refcount) \
+      TM(layout)        \
+      TM(hhir_licm)     \
       TM(llvm)          \
       TM(llvm_count)    \
       TM(inlining)      \
@@ -138,11 +146,12 @@ namespace Trace {
       TM(refcount)      \
       TM(regalloc)      \
       TM(region)        \
+      TM(reusetc)       \
       TM(ringbuffer)    \
       TM(runtime)       \
       TM(servicereq)    \
       TM(simplify)      \
-      TM(smartalloc)    \
+      TM(mm)            \
       TM(heaptrace)     \
       TM(stat)          \
       TM(statgroups)    \
@@ -375,6 +384,7 @@ void dumpRingbuffer();
   DEBUG_ONLY static const HPHP::Trace::Module TRACEMOD = HPHP::Trace::name;
 
 #define ITRACE(...)     do { } while (0)
+#define ITRACE_MOD(...) do { } while (0)
 struct Indent {
   Indent() {
     always_assert(true && "If this struct is completely empty we get unused "

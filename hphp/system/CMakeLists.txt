@@ -4,7 +4,7 @@ auto_sources(IDL_SRCS "*.idl.json" "RECURSE"
 add_custom_command(
   OUTPUT "class_map.cpp" "constants.h"
   DEPENDS ${IDL_SRCS} gen-class-map
-  COMMAND "${CMAKE_CURRENT_BINARY_DIR}/../tools/bootstrap/gen-class-map"
+  COMMAND gen-class-map
   ARGS "--system"
        "${CMAKE_CURRENT_BINARY_DIR}/class_map.cpp"
        "${CMAKE_CURRENT_BINARY_DIR}/constants.h"
@@ -20,6 +20,9 @@ if (ENABLE_ASYNC_MYSQL)
 endif ()
 
 auto_sources(files "*.h" "${CMAKE_CURRENT_SOURCE_DIR}")
+# constants.h doesn't exist until build time,
+# so we need to manually inject it here
+list(APPEND files "${CMAKE_CURRENT_SOURCE_DIR}/constants.h")
 HHVM_PUBLIC_HEADERS(system ${files})
 
 # Needed to force system/constants.h to generate prior to files which need it

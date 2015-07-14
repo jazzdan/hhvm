@@ -24,6 +24,7 @@
 #include "hphp/runtime/vm/jit/print.h"
 #include "hphp/runtime/vm/jit/simplify.h"
 #include "hphp/runtime/vm/jit/timer.h"
+#include "hphp/runtime/vm/jit/dce.h"
 
 #include "hphp/util/trace.h"
 
@@ -31,93 +32,109 @@
 
 namespace HPHP { namespace jit {
 
+namespace {
+
 //////////////////////////////////////////////////////////////////////
 
+enum class DCE { None, Minimal, Full };
+
+template<class PassFN>
+void doPass(IRUnit& unit, PassFN fn, DCE dce) {
+  fn(unit);
+  switch (dce) {
+  case DCE::Minimal:  mandatoryDCE(unit); break;
+  case DCE::Full:     fullDCE(unit); // fallthrough
+  case DCE::None:     assertx(checkEverything(unit)); break;
+  }
+}
+
+void removeExitPlaceholders(IRUnit& unit) {
+  for (auto& block : rpoSortCfg(unit)) {
+    if (block->back().is(ExitPlaceholder)) {
+      unit.replace(&block->back(), Jmp, block->next());
+    }
+  }
+}
+
+//////////////////////////////////////////////////////////////////////
+
+}
+
 void optimize(IRUnit& unit, IRBuilder& irBuilder, TransKind kind) {
-  Timer _t(Timer::optimize);
+  Timer timer(Timer::optimize);
 
-  auto const finishPass = [&] (const char* msg) {
-    if (msg) {
-      printUnit(6, unit, folly::format("after {}", msg).str().c_str());
-    }
-    assertx(checkCfg(unit));
-    assertx(checkTmpsSpanningCalls(unit));
-    if (debug) {
-      forEachInst(rpoSortCfg(unit), [&](IRInstruction* inst) {
-        assertx(checkOperandTypes(inst, &unit));
-      });
-    }
-  };
-
-  auto const doPass = [&] (void (*fn)(IRUnit&), const char* msg = nullptr) {
-    fn(unit);
-    finishPass(msg);
-  };
-
-  auto const dce = [&] (const char* which) {
-    if (!RuntimeOption::EvalHHIRDeadCodeElim) return;
-    eliminateDeadCode(unit);
-    finishPass(folly::format("{} DCE", which).str().c_str());
-  };
+  assertx(checkEverything(unit));
 
   auto const hasLoop = RuntimeOption::EvalJitLoops && cfgHasLoop(unit);
 
-  auto const traceMode = kind != TransKind::Optimize ||
-                         RuntimeOption::EvalJitPGORegionSelector == "hottrace";
-
-  // TODO (#5792564): Guard relaxation doesn't work with loops.
-  // TODO (#6599498): Guard relaxation is broken in wholecfg mode.
-  if (shouldHHIRRelaxGuards() && !hasLoop && traceMode) {
+  if (shouldHHIRRelaxGuards() && !hasLoop) {
     Timer _t(Timer::optimize_relaxGuards);
-    const bool simple = kind == TransKind::Profile &&
-                        (RuntimeOption::EvalJitRegionSelector == "tracelet" ||
-                         RuntimeOption::EvalJitRegionSelector == "method");
+    const bool simple = kind == TransKind::Profile;
     RelaxGuardsFlags flags = (RelaxGuardsFlags)
       (RelaxReflow | (simple ? RelaxSimple : RelaxNormal));
     auto changed = relaxGuards(unit, *irBuilder.guards(), flags);
-    if (changed) finishPass("guard relaxation");
+    if (changed) {
+      printUnit(6, unit, "after guard relaxation");
+      mandatoryDCE(unit);  // relaxGuards can leave unreachable preds.
+    }
 
     if (RuntimeOption::EvalHHIRSimplification) {
-      doPass(simplify, "guard relaxation simplify");
-      doPass(cleanCfg);
+      doPass(unit, simplifyPass, DCE::Minimal);
+      doPass(unit, cleanCfg, DCE::None);
     }
   }
 
-  dce("initial");
+  fullDCE(unit);
+  printUnit(6, unit, " after initial DCE ");
+  assertx(checkEverything(unit));
+
+  if (RuntimeOption::EvalHHIRTypeCheckHoisting) {
+    doPass(unit, hoistTypeChecks, DCE::Minimal);
+  }
+  doPass(unit, removeExitPlaceholders, DCE::Minimal);
 
   if (RuntimeOption::EvalHHIRPredictionOpts) {
-    doPass(optimizePredictions, "prediction opts");
+    doPass(unit, optimizePredictions, DCE::None);
   }
 
   if (RuntimeOption::EvalHHIRSimplification) {
-    doPass(simplify, "simplify");
-    dce("simplify");
-    doPass(cleanCfg);
+    doPass(unit, simplifyPass, DCE::Full);
+    doPass(unit, cleanCfg, DCE::None);
   }
 
   if (RuntimeOption::EvalHHIRGlobalValueNumbering) {
-    doPass(gvn);
-    dce("gvn");
+    doPass(unit, gvn, DCE::Full);
   }
 
   if (kind != TransKind::Profile && RuntimeOption::EvalHHIRMemoryOpts) {
-    doPass(optimizeLoads);
-    dce("loadelim");
+    doPass(unit, optimizeLoads, DCE::Full);
   }
 
   if (kind != TransKind::Profile && RuntimeOption::EvalHHIRMemoryOpts) {
-    doPass(optimizeStores);
-    dce("storeelim");
+    doPass(unit, optimizeStores, DCE::Full);
   }
 
   if (kind != TransKind::Profile && RuntimeOption::EvalHHIRRefcountOpts) {
-    doPass(optimizeRefcounts2);
-    dce("refcount");
+    doPass(unit, optimizeRefcounts2, DCE::Full);
+  }
+
+  if (RuntimeOption::EvalHHIRLICM) {
+    if (kind != TransKind::Profile && hasLoop) {
+      // The clean pass is just to stress lack of pre_headers for now, since
+      // LICM is a disabled prototype pass.
+      doPass(unit, cleanCfg, DCE::None);
+      doPass(unit, optimizeLoopInvariantCode, DCE::Minimal);
+    }
+    doPass(unit, removeExitPlaceholders, DCE::Full);
   }
 
   if (RuntimeOption::EvalHHIRGenerateAsserts) {
-    doPass(insertAsserts);
+    doPass(unit, insertAsserts, DCE::None);
   }
+
+  // Perform a final clean pass to collapse any critical edges that were
+  // split.
+  doPass(unit, cleanCfg, DCE::None);
 }
 
 //////////////////////////////////////////////////////////////////////

@@ -26,7 +26,7 @@
 #include "hphp/runtime/base/array-data-defs.h"
 #include "hphp/runtime/base/repo-auth-type-array.h"
 #include "hphp/runtime/base/type-conversions.h"
-#include "hphp/runtime/ext/ext_collections.h"
+#include "hphp/runtime/ext/collections/ext_collections-idl.h"
 #include "hphp/runtime/vm/hhbc.h"
 #include "hphp/runtime/vm/jit/analysis.h"
 #include "hphp/runtime/vm/jit/containers.h"
@@ -53,6 +53,10 @@ const StaticString s_count("count");
 const StaticString s_1("1");
 const StaticString s_empty("");
 const StaticString s_invoke("__invoke");
+const StaticString s_isFinished("isFinished");
+const StaticString s_isSucceeded("isSucceeded");
+const StaticString s_isFailed("isFailed");
+const StaticString s_WaitHandle("HH\\WaitHandle");
 
 //////////////////////////////////////////////////////////////////////
 
@@ -110,6 +114,19 @@ template<class... Args>
 SSATmp* gen(State& env, Opcode op, Args&&... args) {
   assertx(!env.insts.empty());
   return gen(env, op, env.insts.top()->marker(), std::forward<Args>(args)...);
+}
+
+bool arrayKindNeedsVsize(const ArrayData::ArrayKind kind) {
+  switch (kind) {
+    case ArrayData::kPackedKind:
+    case ArrayData::kStructKind:
+    case ArrayData::kMixedKind:
+    case ArrayData::kEmptyKind:
+    case ArrayData::kApcKind:
+      return false;
+    default:
+      return true;
+  }
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -323,7 +340,7 @@ SSATmp* simplifyLdObjInvoke(State& env, const IRInstruction* inst) {
   if (!rds::isPersistentHandle(cls->classHandle())) return nullptr;
 
   auto const meth = cls->getCachedInvoke();
-  return meth == nullptr ? nullptr : cns(env, meth.get());
+  return meth == nullptr ? nullptr : cns(env, meth);
 }
 
 SSATmp* simplifyGetCtxFwdCall(State& env, const IRInstruction* inst) {
@@ -868,18 +885,26 @@ template<class T, class U>
 static typename std::common_type<T,U>::type cmpOp(Opcode opName, T a, U b) {
   switch (opName) {
   case GtInt:
+  case GtStr:
   case Gt:   return a > b;
   case GteInt:
+  case GteStr:
   case Gte:  return a >= b;
   case LtInt:
+  case LtStr:
   case Lt:   return a < b;
   case LteInt:
+  case LteStr:
   case Lte:  return a <= b;
   case Same:
+  case SameStr:
   case EqInt:
+  case EqStr:
   case Eq:   return a == b;
   case NSame:
+  case NSameStr:
   case NeqInt:
+  case NeqStr:
   case Neq:  return a != b;
   default:
     not_reached();
@@ -914,25 +939,30 @@ SSATmp* cmpImpl(State& env,
   }
 
   // OpSame and OpNSame have some special rules
-  if (opName == Same || opName == NSame) {
+  if (opName == Same || opName == NSame ||
+      opName == SameStr || opName == NSameStr) {
     // OpSame and OpNSame do not perform type juggling
     if (type1.toDataType() != type2.toDataType() &&
         !(type1 <= TStr && type2 <= TStr)) {
-      return cns(env, opName == NSame);
+      return cns(env, bool(cmpOp(opName, 0, 1)));
     }
     // Here src1 and src2 are same type, treating Str and StaticStr as the
     // same.
 
-    // Constant fold if they are both constant strings.
     if (type1 <= TStr && type2 <= TStr) {
+      // Constant fold if they are both constant strings.
       if (src1->hasConstVal() && src2->hasConstVal()) {
         auto const str1 = src1->strVal();
         auto const str2 = src2->strVal();
         bool same = str1->same(str2);
         return cns(env, bool(cmpOp(opName, same, 1)));
+      } else if (!isStrQueryOp(opName)) {
+        // Otherwise, lower to str comparison if possible.
+        return newInst(queryToStrQueryOp(opName), src1, src2);
       }
       return nullptr;
     }
+    assertx(opName != SameStr && opName != NSameStr);
 
     // If type is a primitive type - simplify to Eq/Neq.  Str was already
     // removed above.
@@ -1016,6 +1046,11 @@ SSATmp* cmpImpl(State& env,
     return newInst(queryToDblQueryOp(opName),
                    gen(env, ConvCellToDbl, src1),
                    gen(env, ConvCellToDbl, src2));
+  }
+
+  // Lower to str-comparison if possible.
+  if (!isStrQueryOp(opName) && type1 <= TStr && type2 <= TStr) {
+    return newInst(queryToStrQueryOp(opName), src1, src2);
   }
 
   // ---------------------------------------------------------------------
@@ -1147,6 +1182,14 @@ X(EqInt)
 X(NeqInt)
 X(Same)
 X(NSame)
+X(GtStr)
+X(GteStr)
+X(LtStr)
+X(LteStr)
+X(EqStr)
+X(NeqStr)
+X(SameStr)
+X(NSameStr)
 
 #undef X
 
@@ -1265,10 +1308,9 @@ SSATmp* simplifyConvStrToArr(State& env, const IRInstruction* inst) {
 
 SSATmp* simplifyConvArrToBool(State& env, const IRInstruction* inst) {
   auto const src = inst->src(0);
-  if (src->hasConstVal()) {
-    // const_cast is safe. We're only making use of a cell helper.
-    auto arr = const_cast<ArrayData*>(src->arrVal());
-    return cns(env, cellToBool(make_tv<KindOfArray>(arr)));
+  auto const kind = src->type().arrSpec().kind();
+  if (src->isA(TStaticArr) || (kind && !arrayKindNeedsVsize(*kind))) {
+    return gen(env, ConvIntToBool, gen(env, CountArrayFast, src));
   }
   return nullptr;
 }
@@ -1377,7 +1419,7 @@ SSATmp* simplifyConvBoolToStr(State& env, const IRInstruction* inst) {
 SSATmp* simplifyConvDblToStr(State& env, const IRInstruction* inst) {
   auto const src = inst->src(0);
   if (src->hasConstVal()) {
-    String dblStr(buildStringData(src->dblVal()));
+    auto dblStr = String::attach(buildStringData(src->dblVal()));
     return cns(env, makeStaticString(dblStr));
   }
   return nullptr;
@@ -1547,8 +1589,7 @@ SSATmp* simplifyCoerceCellToDbl(State& env, const IRInstruction* inst) {
   return nullptr;
 }
 
-template<class Oper>
-SSATmp* roundImpl(State& env, const IRInstruction* inst, Oper op) {
+SSATmp* roundImpl(State& env, const IRInstruction* inst, double (*op)(double)) {
   auto const src  = inst->src(0);
 
   if (src->hasConstVal()) {
@@ -1618,9 +1659,12 @@ SSATmp* simplifyCheckType(State& env, const IRInstruction* inst) {
   auto const srcType = inst->src(0)->type();
 
   if (!srcType.maybe(typeParam) || inst->next() == inst->taken()) {
-    // Convert the check into a Jmp.
+    /*
+     * Convert the check into a Jmp.  The dest of the CheckType (which would've
+     * been Bottom) is now never going to be defined, so we return a Bottom.
+     */
     gen(env, Jmp, inst->taken());
-    return inst->src(0);
+    return cns(env, TBottom);
   }
 
   auto const newType = srcType & typeParam;
@@ -1663,6 +1707,10 @@ SSATmp* simplifyCheckStaticLocInit(State& env, const IRInstruction* inst) {
 }
 
 SSATmp* simplifyCheckRefInner(State& env, const IRInstruction* inst) {
+  // Ref inner cells are at worst InitCell, so don't bother checking for that.
+  if (TInitCell <= inst->typeParam()) {
+    return gen(env, Nop);
+  }
   return mergeBranchDests(env, inst);
 }
 
@@ -1770,11 +1818,11 @@ SSATmp* simplifyCheckPackedArrayBounds(State& env, const IRInstruction* inst) {
   auto const idx   = inst->src(1);
   if (!idx->hasConstVal()) return mergeBranchDests(env, inst);
 
-  auto const idxVal = (uint64_t)idx->intVal();
-  auto const check = packedArrayBoundsStaticCheck(array->type(), idxVal);
-  if (check.hasValue()) {
-    if (check.value()) return gen(env, Nop);
-    return gen(env, Jmp, inst->taken());
+  auto const idxVal = idx->intVal();
+  switch (packedArrayBoundsStaticCheck(array->type(), idxVal)) {
+  case PackedBounds::In:       return gen(env, Nop);
+  case PackedBounds::Out:      return gen(env, Jmp, inst->taken());
+  case PackedBounds::Unknown:  break;
   }
 
   return mergeBranchDests(env, inst);
@@ -1832,6 +1880,25 @@ SSATmp* simplifyCount(State& env, const IRInstruction* inst) {
   return nullptr;
 }
 
+SSATmp* simplifyCountArrayFast(State& env, const IRInstruction* inst) {
+  auto const src = inst->src(0);
+  if (inst->src(0)->hasConstVal(TArr)) return cns(env, src->arrVal()->size());
+  auto const arrSpec = src->type().arrSpec();
+  auto const at = arrSpec.type();
+  if (!at) return nullptr;
+  using A = RepoAuthType::Array;
+  switch (at->tag()) {
+  case A::Tag::Packed:
+    if (at->emptiness() == A::Empty::No) {
+      return cns(env, at->size());
+    }
+    break;
+  case A::Tag::PackedN:
+    break;
+  }
+  return nullptr;
+}
+
 SSATmp* simplifyCountArray(State& env, const IRInstruction* inst) {
   auto const src = inst->src(0);
   auto const ty = src->type();
@@ -1840,18 +1907,10 @@ SSATmp* simplifyCountArray(State& env, const IRInstruction* inst) {
 
   auto const kind = ty.arrSpec().kind();
 
-  if (!kind || mightRelax(env, src)) return nullptr;
-
-  switch (*kind) {
-    case ArrayData::kPackedKind:
-    case ArrayData::kStructKind:
-    case ArrayData::kMixedKind:
-    case ArrayData::kEmptyKind:
-    case ArrayData::kApcKind:
-      return gen(env, CountArrayFast, src);
-    default:
-      return nullptr;
-  }
+  if (kind && !mightRelax(env, src) && !arrayKindNeedsVsize(*kind))
+    return gen(env, CountArrayFast, src);
+  else
+    return nullptr;
 }
 
 SSATmp* simplifyLdClsName(State& env, const IRInstruction* inst) {
@@ -1878,6 +1937,32 @@ SSATmp* simplifyCallBuiltin(State& env, const IRInstruction* inst) {
     if (callee->name()->isame(s_count.get())) {
       FTRACE(3, "simplifying collection: {}\n", callee->name()->data());
       return gen(env, CountCollection, args[2]);
+    }
+  }
+
+  bool const arg2IsWaitHandle = !arg2IsCollection &&
+    args.size() == 3 &&
+    args[2]->isA(TObj) &&
+    args[2]->type().clsSpec() &&
+    args[2]->type().clsSpec().cls()->classof(c_WaitHandle::classof()) &&
+    !mightRelax(env, args[2]);
+
+  if (arg2IsWaitHandle) {
+    const auto genState = [&] (Opcode op, int64_t whstate) -> SSATmp* {
+      // these methods all spring from the base class
+      assert(callee->cls()->name()->isame(s_WaitHandle.get()));
+      const auto state = gen(env, LdWHState, args[2]);
+      return gen(env, op, state, cns(env, whstate));
+    };
+    const auto methName = callee->name();
+    if (methName->isame(s_isFinished.get())) {
+      return genState(LteInt, int64_t{c_WaitHandle::STATE_FAILED});
+    }
+    if (methName->isame(s_isSucceeded.get())) {
+      return genState(EqInt, int64_t{c_WaitHandle::STATE_SUCCEEDED});
+    }
+    if (methName->isame(s_isFailed.get())) {
+      return genState(EqInt, int64_t{c_WaitHandle::STATE_FAILED});
     }
   }
 
@@ -1923,6 +2008,43 @@ SSATmp* simplifyLdLoc(State& env, const IRInstruction* inst) {
 
 SSATmp* simplifyLdStk(State& env, const IRInstruction* inst) {
   return ldImpl(env, inst);
+}
+
+SSATmp* simplifyJmpSwitchDest(State& env, const IRInstruction* inst) {
+  auto const index = inst->src(0);
+  if (!index->hasConstVal(TInt)) return nullptr;
+
+  auto indexVal = index->intVal();
+  auto const sp = inst->src(1);
+  auto const fp = inst->src(2);
+  auto const& extra = *inst->extra<JmpSwitchDest>();
+
+  if (indexVal < 0 || indexVal >= extra.cases) {
+    // Instruction is unreachable.
+    return gen(env, Halt);
+  }
+
+  auto const newExtra = ReqBindJmpData{extra.targets[indexVal], extra.invSPOff,
+                                       extra.irSPOff, TransFlags{}};
+  return gen(env, ReqBindJmp, newExtra, sp, fp);
+}
+
+SSATmp* simplifyCheckRange(State& env, const IRInstruction* inst) {
+  auto val = inst->src(0);
+  auto limit = inst->src(1);
+
+  // CheckRange returns (0 <= val < limit).
+  if (val->hasConstVal(TInt)) {
+    if (val->intVal() < 0) return cns(env, false);
+
+    if (limit->hasConstVal(TInt)) {
+      return cns(env, val->intVal() < limit->intVal());
+    }
+  }
+
+  if (limit->hasConstVal(TInt) && limit->intVal() <= 0) return cns(env, false);
+
+  return nullptr;
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -1987,6 +2109,7 @@ SSATmp* simplifyWork(State& env, const IRInstruction* inst) {
   X(ConvStrToInt)
   X(Count)
   X(CountArray)
+  X(CountArrayFast)
   X(DecRef)
   X(DecRefNZ)
   X(DefLabel)
@@ -2041,10 +2164,20 @@ SSATmp* simplifyWork(State& env, const IRInstruction* inst) {
   X(NeqInt)
   X(Same)
   X(NSame)
+  X(GtStr)
+  X(GteStr)
+  X(LtStr)
+  X(LteStr)
+  X(EqStr)
+  X(NeqStr)
+  X(SameStr)
+  X(NSameStr)
   X(ArrayGet)
   X(OrdStr)
   X(LdLoc)
   X(LdStk)
+  X(JmpSwitchDest)
+  X(CheckRange)
   default: break;
   }
 #undef X
@@ -2190,10 +2323,36 @@ void simplify(IRUnit& unit, IRInstruction* origInst) {
   auto const pos = ++block->iteratorTo(origInst);
 
   if (need_mov) {
-    unit.replace(origInst, Mov, res.dst);
-
-    // Force the existing dst type to match that of `res.dst'.
-    origInst->dst()->setType(res.dst->type());
+    /*
+     * In `killed_edge_defining' we have the case that an instruction defining
+     * a temp on an edge (like CheckType) determined it can never define that
+     * tmp.  In this situation we just Nop out the instruction and leave the
+     * old tmp dangling.  The reason this is ok is that one of the following
+     * two things are happening:
+     *
+     *    o The old next() block is becoming unreachable.  It's ok not to make
+     *      a new definition of this tmp, because the code running simplify is
+     *      going to have to track unreachable blocks and avoid looking at
+     *      them.  It will also have to remove unreachable blocks when it's
+     *      finished to maintain IR invariants (e.g. through DCE::Minimal),
+     *      which will mean the uses of the no-longer-defined tmp will go away.
+     *
+     *    o The old next() block is still reachable (e.g. if we're removing a
+     *      CheckType because it had next == taken).  But in this case, the
+     *      next() edge must have been a critical edge, and therefore nothing
+     *      could have any use of the old destination of the CheckType, or the
+     *      program would already not have been in SSA, because it was only
+     *      defined in blocks dominated by the next edge.
+     */
+    auto const killed_edge_defining = res.dst->type() <= TBottom &&
+      origInst->isBlockEnd();
+    if (killed_edge_defining) {
+      origInst->convertToNop();
+    } else {
+      unit.replace(origInst, Mov, res.dst);
+      // Force the existing dst type to match that of `res.dst'.
+      origInst->dst()->setType(res.dst->type());
+    }
   } else {
     if (out_size == 1) {
       assertx(origInst->dst() == last->dst());
@@ -2212,6 +2371,7 @@ void simplify(IRUnit& unit, IRInstruction* origInst) {
       last->convertToNop();
       return;
     }
+
     origInst->convertToNop();
   }
 
@@ -2226,21 +2386,19 @@ void simplify(IRUnit& unit, IRInstruction* origInst) {
 
 //////////////////////////////////////////////////////////////////////
 
-void simplify(IRUnit& unit) {
-  boost::dynamic_bitset<> reachable(unit.numBlocks());
+void simplifyPass(IRUnit& unit) {
+  auto reachable = boost::dynamic_bitset<>(unit.numBlocks());
   reachable.set(unit.entry()->id());
 
-  auto const blocks = rpoSortCfg(unit);
-
-  for (auto block : blocks) {
+  for (auto block : rpoSortCfg(unit)) {
     if (!reachable.test(block->id())) continue;
 
     for (auto& inst : *block) simplify(unit, &inst);
 
-    if (auto const b = block->back().next())  reachable.set(b->id());
-    if (auto const b = block->back().taken()) reachable.set(b->id());
+    if (auto const b = block->next())  reachable.set(b->id());
+    if (auto const b = block->taken()) reachable.set(b->id());
   }
-};
+}
 
 //////////////////////////////////////////////////////////////////////
 
@@ -2251,37 +2409,39 @@ void copyProp(IRInstruction* inst) {
 
     if (srcInst->is(Mov)) {
       inst->setSrc(i, srcInst->src(0));
-    }
+      }
 
     // We're assuming that all of our src instructions have already been
     // copyPropped.
     assertx(!inst->src(i)->inst()->is(Mov));
+    }
   }
-}
 
-folly::Optional<bool>
-packedArrayBoundsStaticCheck(Type arrayType, int64_t idxVal) {
-  if (idxVal < 0 || idxVal > PackedArray::MaxSize) return false;
+PackedBounds packedArrayBoundsStaticCheck(Type arrayType, int64_t idxVal) {
+  if (idxVal < 0 || idxVal > PackedArray::MaxSize) return PackedBounds::Out;
 
   if (arrayType.hasConstVal()) {
-    return idxVal < arrayType.arrVal()->size();
+    return idxVal < arrayType.arrVal()->size()
+      ? PackedBounds::In
+      : PackedBounds::Out;
   }
 
   auto const at = arrayType.arrSpec().type();
-  if (!at) return folly::none;
+  if (!at) return PackedBounds::Unknown;
 
   using A = RepoAuthType::Array;
   switch (at->tag()) {
   case A::Tag::Packed:
     if (idxVal < at->size() && at->emptiness() == A::Empty::No) {
-      return true;
+      return PackedBounds::In;
     }
+    // fallthrough
   case A::Tag::PackedN:
     if (idxVal == 0 && at->emptiness() == A::Empty::No) {
-      return true;
+      return PackedBounds::In;
     }
   }
-  return folly::none;
+  return PackedBounds::Unknown;
 }
 
 Type packedArrayElemType(SSATmp* arr, SSATmp* idx) {

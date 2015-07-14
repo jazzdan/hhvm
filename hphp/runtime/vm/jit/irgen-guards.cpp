@@ -100,7 +100,7 @@ void checkTypeLocal(IRGS& env, uint32_t locId, Type type, Offset dest,
 void assertTypeStack(IRGS& env, BCSPOffset idx, Type type) {
   if (idx.offset < env.irb->evalStack().size()) {
     // We're asserting a new type so we don't care about the previous type.
-    auto const tmp = top(env, TStkElem, idx, DataTypeGeneric);
+    auto const tmp = top(env, idx, DataTypeGeneric);
     assertx(tmp);
     env.irb->evalStack().replace(idx.offset, gen(env, AssertType, type, tmp));
   } else {
@@ -116,9 +116,11 @@ void checkTypeStack(IRGS& env,
                     bool outerOnly) {
   assertx(type <= TCell || type <= TBoxedInitCell);
 
+  auto exit = env.irb->guardFailBlock();
+  if (exit == nullptr) exit = makeExit(env, dest);
+
   if (type <= TBoxedInitCell) {
     spillStack(env); // don't bother with the case that it's not spilled.
-    auto const exit = makeExit(env, dest);
     auto const soff = RelOffsetData { idx, offsetFromIRSP(env, idx) };
     profiledGuard(env, TBoxedInitCell, ProfGuard::CheckStk,
                   idx.offset, exit);
@@ -136,18 +138,15 @@ void checkTypeStack(IRGS& env,
     return;
   }
 
-  auto exit = env.irb->guardFailBlock();
-  if (exit == nullptr) exit = makeExit(env, dest);
-
   if (idx.offset < env.irb->evalStack().size()) {
     FTRACE(1, "checkTypeStack({}): generating CheckType for {}\n",
            idx.offset, type.toString());
     // CheckType only cares about its input type if the simplifier does
     // something with it and that's handled if and when it happens.
-    auto const tmp = top(env, TStkElem, idx, DataTypeGeneric);
+    auto const tmp = top(env, idx, DataTypeGeneric);
     assertx(tmp);
-    env.irb->evalStack().replace(idx.offset,
-                                 gen(env, CheckType, type, exit, tmp));
+    auto const ctype = gen(env, CheckType, type, exit, tmp);
+    env.irb->evalStack().replace(idx.offset, ctype);
     return;
   }
   FTRACE(1, "checkTypeStack({}): no tmp: {}\n", idx.offset, type.toString());
@@ -159,9 +158,9 @@ void checkTypeStack(IRGS& env,
 void predictTypeStack(IRGS& env, BCSPOffset offset, Type type) {
   assert(type <= TGen);
 
-  auto stackOff = IRSPOffsetData { offsetFromIRSP(env, offset) };
+  auto const irSPOff = offsetFromIRSP(env, offset);
   if (offset.offset < env.irb->evalStack().size()) {
-    auto const tmp = top(env, TStkElem, offset, DataTypeGeneric);
+    auto const tmp = top(env, offset, DataTypeGeneric);
     assertx(tmp);
     auto oldType = env.irb->evalStack().topPredictedType(offset.offset);
     auto newType = refinePredictedType(oldType, type, tmp->type());
@@ -169,12 +168,12 @@ void predictTypeStack(IRGS& env, BCSPOffset offset, Type type) {
     return;
   }
 
-  gen(env, PredictStk, type, stackOff, sp(env));
+  env.irb->fs().refineStackPredictedType(irSPOff, type);
 }
 
 void predictTypeLocal(IRGS& env, uint32_t locId, Type type) {
   assert(type <= TGen);
-  gen(env, PredictLoc, type, LocalId { locId }, fp(env));
+  env.irb->fs().refineLocalPredictedType(locId, type);
 }
 
 void predictTypeLocation(
@@ -226,6 +225,10 @@ void checkTypeLocation(IRGS& env,
   }
 }
 
+void makeExitPlaceholder(IRGS& env) {
+  gen(env, ExitPlaceholder, makeGuardExit(env, TransFlags{}));
+}
+
 void checkRefs(IRGS& env,
                int64_t entryArDelta,
                const std::vector<bool>& mask,
@@ -233,7 +236,7 @@ void checkRefs(IRGS& env,
                Offset dest) {
   auto const actRecOff = entryArDelta + offsetFromIRSP(env, BCSPOffset{0});
   auto const funcPtr = gen(env, LdARFuncPtr,
-                           StackOffset { actRecOff.offset }, sp(env));
+                           IRSPOffsetData { actRecOff }, sp(env));
   SSATmp* nParams = nullptr;
 
   for (unsigned i = 0; i < mask.size(); i += 64) {

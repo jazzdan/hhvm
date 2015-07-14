@@ -11,31 +11,18 @@
 open Utils
 open Typing_defs
 
-module Class : sig type t = class_type val prefix : Prefix.t end
-module Fun : sig type t = decl fun_type val prefix : Prefix.t end
-module Typedef :
-  sig
-    type visibility = Public | Private
-    type tdef =
-        visibility * tparam list * decl ty option *
-        decl ty * Pos.t
-    type tdef_or_error = Error | Ok of tdef
-    type t = tdef_or_error
-    val prefix : Prefix.t
-  end
-module GConst : sig type t = decl ty val prefix : Prefix.t end
-
-module Funs : module type of SharedMem.WithCache (String) (Fun)
-module Classes : module type of SharedMem.WithCache (String) (Class)
-module Typedefs : module type of SharedMem.WithCache (String) (Typedef)
-module GConsts : module type of SharedMem.WithCache (String) (GConst)
+module Funs : module type of Typing_heap.Funs
+module Classes : module type of Typing_heap.Classes
+module Typedefs : module type of Typing_heap.Typedefs
+module GConsts : module type of Typing_heap.GConsts
 
 type fake_members = {
   last_call : Pos.t option;
   invalid : SSet.t;
   valid : SSet.t;
 }
-type local = locl ty list * locl ty
+type expression_id = Ident.t
+type local = locl ty list * locl ty * expression_id
 type local_env = fake_members * local IMap.t
 type env = {
   pos : Pos.t;
@@ -58,7 +45,7 @@ val rename : env -> int -> int -> env
 val add : env -> int -> locl ty -> env
 val get_type : env -> int -> env * locl ty
 val get_type_unsafe : env -> int -> env * locl ty
-val expand_type : env -> 'a ty -> env * 'a ty
+val expand_type : env -> locl ty -> env * locl ty
 val expand_type_recorded : env -> ISet.t -> locl ty -> env * ISet.t * locl ty
 val make_ft : Pos.t -> decl fun_params -> decl ty -> decl fun_type
 val get_shape_field_name : Nast.shape_field_name -> string
@@ -68,7 +55,7 @@ val empty_fake_members : fake_members
 val empty_local : local_env
 val empty : TypecheckerOptions.t -> Relative_path.t -> env
 val add_class : Classes.key -> Classes.t -> unit
-val add_typedef : Typedefs.key -> Typedef.tdef -> unit
+val add_typedef : Typedefs.key -> Typing_heap.Typedef.tdef -> unit
 val is_typedef : Typedefs.key -> bool
 val get_enum : Classes.key -> Classes.t option
 val is_enum : Classes.key -> bool
@@ -98,6 +85,7 @@ val grow_super : env -> bool
 val invert_grow_super : env -> (env -> env) -> env
 val get_self : env -> locl ty
 val get_self_id : env -> string
+val is_outside_class : env -> bool
 val get_parent : env -> decl ty
 val get_fn_kind : env -> Ast.fun_kind
 val get_file : env -> Relative_path.t
@@ -113,8 +101,6 @@ val set_parent : env -> decl ty -> env
 val set_static : env -> env
 val set_mode : env -> FileInfo.mode -> env
 val set_root : env -> Typing_deps.Dep.variant -> env
-val set_is_constructor : env -> env
-val is_constructor : env -> bool
 val get_mode : env -> FileInfo.mode
 val is_strict : env -> bool
 val is_decl : env -> bool
@@ -136,6 +122,8 @@ module FakeMembers :
 val unbind : env -> locl ty -> env * locl ty
 val set_local : env -> Ident.t -> locl ty -> env
 val get_local : env -> Ident.t -> env * locl ty
+val set_local_expr_id : env -> Ident.t -> expression_id -> env
+val get_local_expr_id : env -> Ident.t -> expression_id option
 val freeze_local_env : env -> env
 val anon : local_env -> env -> (env -> env * locl ty) -> env * locl ty
 val in_loop : env -> (env -> env) -> env

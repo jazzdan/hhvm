@@ -329,7 +329,7 @@ public:
 
   CLASSNAME_IS("PageletTask");
   // overriding ResourceData
-  virtual const String& o_getClassNameHook() const { return classnameof(); }
+  const String& o_getClassNameHook() const override { return classnameof(); }
 
 private:
   PageletTransport *m_job;
@@ -400,7 +400,7 @@ Resource PageletServer::TaskStart(
       return Resource();
     }
   }
-  auto task = makeSmartPtr<PageletTask>(url, headers, remote_host, post_data,
+  auto task = req::make<PageletTask>(url, headers, remote_host, post_data,
                                         get_uploaded_files(), files,
                                         timeoutSeconds);
   PageletTransport *job = task->getJob();

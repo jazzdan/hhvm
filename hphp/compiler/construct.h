@@ -17,6 +17,7 @@
 #ifndef incl_HPHP_CONSTRUCT_H_
 #define incl_HPHP_CONSTRUCT_H_
 
+#include "hphp/parser/location.h"
 #include "hphp/compiler/json.h"
 #include <memory>
 #include "hphp/compiler/code_generator.h"
@@ -29,7 +30,6 @@ namespace HPHP {
 class Variant;
 DECLARE_BOOST_TYPES(StatementList);
 DECLARE_BOOST_TYPES(IParseHandler);
-DECLARE_BOOST_TYPES(Location);
 DECLARE_BOOST_TYPES(AnalysisResult);
 DECLARE_BOOST_TYPES(BlockScope);
 DECLARE_BOOST_TYPES(ClassScope);
@@ -60,7 +60,8 @@ public:
    * (eg) a method, the ClassScope doesnt exist. So we wait until onParse
    * is called for the class, and it calls onParseRecur for its children.
    */
-  virtual void onParseRecur(AnalysisResultConstPtr ar, ClassScopePtr scope) {
+  virtual void onParseRecur(AnalysisResultConstPtr ar, FileScopeRawPtr fs,
+                            ClassScopePtr scope) {
     always_assert(0);
   }
 };
@@ -161,7 +162,7 @@ public:
 #undef DEC_STATEMENT_ENUM
 
 protected:
-  Construct(BlockScopePtr scope, LocationPtr loc, KindOf);
+  Construct(BlockScopePtr scope, const Location::Range& loc, KindOf);
 
 public:
   /**
@@ -208,8 +209,11 @@ public:
     UnknownEffect = 0xfff        // any of the above
   };
 
-  LocationPtr getLocation() const { return m_loc;}
-  void setLocation(LocationPtr loc) { m_loc = loc;}
+  void copyLocationTo(ConstructPtr other);
+  const Location::Range& getRange() const { return m_r; }
+  int line0() const { return m_r.line0; }
+  int line1() const { return m_r.line1; }
+  void setFirst(int line0, int char0) { m_r.line0 = line0; m_r.char0 = char0; }
   void setFileLevel() { m_flags.topLevel = m_flags.fileLevel = true;}
   void setTopLevel() { m_flags.topLevel = true;}
   void setVisited() { m_flags.visited = true;}
@@ -265,6 +269,9 @@ public:
   bool maybeInited() const {
     return !(m_flags.inited & 2) || (m_flags.inited & 1);
   }
+  void setIsUnpack() { m_flags.unpack = 1; }
+  bool isUnpack() const { return m_flags.unpack; }
+  void clearIsUnpack() { m_flags.unpack = 0; }
 
   void setKilled() { m_flags.killed = true; }
   void clearKilled() { m_flags.killed = false; }
@@ -281,9 +288,9 @@ public:
   ClassScopeRawPtr getClassScope() const {
     return m_blockScope->getContainingClass();
   }
-  void resetScope(BlockScopeRawPtr scope, bool resetOrigScope=false);
-  void parseTimeFatal(Compiler::ErrorType error, const char *fmt, ...)
-    ATTRIBUTE_PRINTF(3,4);
+  void resetScope(BlockScopeRawPtr scope);
+  void parseTimeFatal(FileScopeRawPtr fs, Compiler::ErrorType error,
+                      const char *fmt, ...) ATTRIBUTE_PRINTF(4,5);
   void analysisTimeFatal(Compiler::ErrorType error, const char *fmt, ...)
     ATTRIBUTE_PRINTF(3,4);
   virtual int getLocalEffects() const { return UnknownEffect;}
@@ -332,14 +339,6 @@ public:
   virtual int getKidCount() const = 0;
 
   // helpers for GDB
-  void dump(int spc, AnalysisResultPtr ar) {
-    AnalysisResultConstPtr arp(ar);
-    dump(spc, arp);
-  }
-  void dumpNode(int spc, AnalysisResultPtr ar) {
-    AnalysisResultConstPtr arp(ar);
-    dumpNode(spc, arp);
-  }
   void dumpNode(int spc);
   void dumpNode(int spc) const;
 
@@ -368,10 +367,8 @@ public:
   /**
    * Get canonicalized PHP source code for this construct.
    */
-  std::string getText(bool useCache, bool translate = false,
-                      AnalysisResultPtr ar = AnalysisResultPtr());
+  std::string getText(AnalysisResultPtr ar = AnalysisResultPtr());
 
-  std::string getText() { return getText(false); }
   void recomputeEffects();
 
   /**
@@ -383,7 +380,6 @@ public:
   ExpressionPtr makeScalarExpression(AnalysisResultConstPtr ar,
                                      const Variant &value) const;
 private:
-  std::string m_text;
   BlockScopeRawPtr m_blockScope;
   union {
     unsigned m_flagsVal;
@@ -404,11 +400,12 @@ private:
       unsigned killed              : 1;
       unsigned refCounted          : 2; // high bit indicates whether its valid
       unsigned inited              : 2; // high bit indicates whether its valid
+      unsigned unpack              : 1; // is this an unpack (only on params)
     } m_flags;
   };
+  Location::Range m_r;
 protected:
   KindOf m_kindOf;
-  LocationPtr m_loc;
   mutable int m_containedEffects;
   mutable int m_effectsTag;
 };
@@ -430,10 +427,10 @@ protected:
 };
 
 #define DECL_AND_IMPL_LOCAL_EFFECTS_METHODS \
-  virtual int getLocalEffects() const { \
+  int getLocalEffects() const override { \
     return LocalEffectsContainer::getLocalEffects(); \
   } \
-  virtual void effectsCallback() { recomputeEffects(); }
+  void effectsCallback() override { recomputeEffects(); }
 
 ///////////////////////////////////////////////////////////////////////////////
 }

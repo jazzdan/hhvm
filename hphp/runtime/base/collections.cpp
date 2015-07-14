@@ -18,7 +18,7 @@
 #include "hphp/runtime/base/array-init.h"
 #include "hphp/runtime/base/variable-serializer.h"
 #include "hphp/runtime/base/variable-unserializer.h"
-#include "hphp/runtime/ext/ext_collections.h"
+#include "hphp/runtime/ext/collections/ext_collections-idl.h"
 
 namespace HPHP { namespace collections {
 /////////////////////////////////////////////////////////////////////////////
@@ -30,44 +30,34 @@ COLLECTIONS_ALL_TYPES(X)
 /////////////////////////////////////////////////////////////////////////////
 // Constructor/Initializer
 
-template<bool inc> ObjectData* allocPair(uint32_t ignored) {
-  auto ret = newobj<c_Pair>(c_Pair::NoInit{});
-  if (inc) ret->incRefCount();
-  return ret;
+ObjectData* allocEmptyPair() {
+  return newCollectionObj<c_Pair>(c_Pair::NoInit{});
 }
 
 #define X(type) \
-template<bool inc> ObjectData* alloc##type(uint32_t size) { \
-  auto ret = newobj<c_##type>(c_##type::classof(), size); \
-  if (inc) ret->incRefCount(); \
-  return ret; \
-} \
-template<bool inc> ObjectData* allocFromArray##type(ArrayData* arr) { \
-  auto ret = newobj<c_##type>(c_##type::classof(), arr); \
-  if (inc) ret->incRefCount(); \
-  return ret; \
+ObjectData* allocEmpty##type() {                                        \
+  return newCollectionObj<c_##type>(c_##type::classof());               \
+}                                                                       \
+ObjectData* allocFromArray##type(ArrayData* arr) {                      \
+  return newCollectionObj<c_##type>(c_##type::classof(), arr);          \
 }
 COLLECTIONS_PAIRED_TYPES(X)
 #undef X
 
-newInstanceFunc allocFunc(CollectionType ctype, bool inc /*=false*/) {
+newFromArrayFunc allocFromArrayFunc(CollectionType ctype) {
   switch (ctype) {
-#define X(type) case CollectionType::type: \
-                  return inc ? alloc##type<true> : alloc##type<false>;
-COLLECTIONS_ALL_TYPES(X)
+#define X(type) case CollectionType::type: return allocFromArray##type;
+COLLECTIONS_PAIRED_TYPES(X)
 #undef X
+    case CollectionType::Pair: not_reached();
   }
   not_reached();
 }
 
-newFromArrayFunc allocFromArrayFunc(CollectionType ctype, bool inc /*=false*/) {
+newEmptyInstanceFunc allocEmptyFunc(CollectionType ctype) {
   switch (ctype) {
-#define X(type) case CollectionType::type: \
-                  return inc ? allocFromArray##type<true> \
-                             : allocFromArray##type<false>;
-COLLECTIONS_PAIRED_TYPES(X)
-    case CollectionType::Pair:
-      assertx(false);
+#define X(type) case CollectionType::type: return allocEmpty##type;
+COLLECTIONS_ALL_TYPES(X)
 #undef X
   }
   not_reached();
@@ -245,6 +235,23 @@ ObjectData* clone(ObjectData* obj) {
 #define X(type) case CollectionType::type: return c_##type::Clone(obj);
 COLLECTIONS_ALL_TYPES(X)
 #undef X
+  }
+  not_reached();
+}
+
+ArrayData* asArray(ObjectData* obj) {
+  assertx(obj->isCollection());
+  switch (obj->collectionType()) {
+  case CollectionType::ImmVector:
+  case CollectionType::Vector:
+    return static_cast<BaseVector*>(obj)->arrayData();
+  case CollectionType::ImmMap:
+  case CollectionType::Map:
+  case CollectionType::ImmSet:
+  case CollectionType::Set:
+    return static_cast<HashCollection*>(obj)->arrayData()->asArrayData();
+  case CollectionType::Pair:
+    return nullptr;
   }
   not_reached();
 }

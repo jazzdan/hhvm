@@ -324,7 +324,8 @@ static Array get_object_props(ObjectData* obj) {
   // Grab the properties on the object. o_toIterArray does this for us.
   auto const cls = obj->getVMClass();
   auto const cls_name = cls->name();
-  auto props = obj->o_toIterArray(String(const_cast<StringData*>(cls_name)));
+  auto props = obj->o_toIterArray(String(const_cast<StringData*>(cls_name)),
+                                  ObjectData::EraseRefs);
 
   // Grab the static properties from the class.
   auto const staticProperties = cls->staticProperties();
@@ -479,7 +480,7 @@ xdebug_xml_node* xdebug_var_export_xml_node(const char* name,
     // Done at this level
     exporter.level--;
   } else if (var.isResource()) {
-    ResourceData* res = var.toResource().get();
+    auto res = var.toResource();
     xdebug_xml_add_attribute(node, "type", "resource");
     const char* text = xdebug_sprintf("resource id='%ld' type='%s'",
                                       res->o_getId(),

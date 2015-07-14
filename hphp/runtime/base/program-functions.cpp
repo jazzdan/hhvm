@@ -69,6 +69,7 @@
 #include "hphp/runtime/vm/runtime.h"
 #include "hphp/runtime/vm/treadmill.h"
 #include "hphp/system/constants.h"
+#include "hphp/util/code-cache.h"
 #include "hphp/util/compatibility.h"
 #include "hphp/util/capability.h"
 #include "hphp/util/current-executable.h"
@@ -101,7 +102,6 @@
 
 
 #if (defined(__CYGWIN__) || defined(__MINGW__) || defined(_MSC_VER))
-#undef NOUSER
 #include <windows.h>
 #include <winuser.h>
 #endif
@@ -418,7 +418,7 @@ static void handle_exception_helper(bool& ret,
                                     bool& error,
                                     bool richErrorMsg) {
   // Clear oom/timeout while handling exception and restore them afterwards.
-  auto& flags = surpriseFlags();
+  auto& flags = stackLimitAndSurprise();
   auto const origFlags = flags.load() & ResourceFlags;
   flags.fetch_and(~ResourceFlags);
 
@@ -435,7 +435,7 @@ static void handle_exception_helper(bool& ret,
       ret = false;
     } else if (where != ContextOfException::Handler &&
         !context->getExitCallback().isNull() &&
-        HHVM_FN(is_callable)(context->getExitCallback())) {
+        is_callable(context->getExitCallback())) {
       Array stack = e.getBacktrace();
       Array argv = make_packed_array(ExitException::ExitCode.load(), stack);
       vm_call_user_func(context->getExitCallback(), argv);
@@ -643,7 +643,7 @@ void execute_command_line_begin(int argc, char **argv, int xhprof,
     }
     String file = empty_string();
     if (argc > 0) {
-      file = StringData::Make(argv[0], CopyString);
+      file = String::attach(StringData::Make(argv[0], CopyString));
     }
     serverArr.set(s_REQUEST_START_TIME, now);
     serverArr.set(s_REQUEST_TIME, now);
@@ -697,7 +697,7 @@ void execute_command_line_begin(int argc, char **argv, int xhprof,
 
 void execute_command_line_end(int xhprof, bool coverage, const char *program) {
   MM().collect();
-  if (RuntimeOption::EvalDumpTC) {
+  if (RuntimeOption::EvalDumpTC || RuntimeOption::EvalDumpIR) {
     HPHP::jit::tc_dump();
   }
   if (xhprof) {
@@ -716,16 +716,6 @@ void execute_command_line_end(int xhprof, bool coverage, const char *program) {
     ti.m_coverage->Report(RuntimeOption::CodeCoverageOutputFile);
   }
 }
-
-#if defined(__APPLE__) || defined(__CYGWIN__)
-const void* __hot_start = nullptr;
-const void* __hot_end = nullptr;
-#else
-extern "C" {
-void __attribute__((__weak__)) __hot_start();
-void __attribute__((__weak__)) __hot_end();
-}
-#endif
 
 #if FACEBOOK && defined USE_SSECRC
 // Overwrite the functiosn
@@ -846,19 +836,24 @@ static void pagein_self(void) {
       auto endPtr = (char*)end;
       auto hotStart = (char*)__hot_start;
       auto hotEnd = (char*)__hot_end;
-      const size_t hugeBytes = 2L * 1024 * 1024;
+      const size_t hugePageBytes = 2L * 1024 * 1024;
 
       if (mlock(beginPtr, end - begin) == 0) {
-        if (RuntimeOption::EvalMapHotTextHuge &&
+        if (RuntimeOption::EvalMaxHotTextHugePages > 0 &&
             __hot_start &&
             __hot_end &&
             hugePagesSupported() &&
             beginPtr <= hotStart &&
             hotEnd <= endPtr) {
 
-          char* from = hotStart - ((intptr_t)hotStart & (hugeBytes - 1));
-          char* to = hotEnd + (hugeBytes - 1);
-          to -= (intptr_t)to & (hugeBytes - 1);
+          char* from = hotStart - ((intptr_t)hotStart & (hugePageBytes - 1));
+          char* to = hotEnd + (hugePageBytes - 1);
+          to -= (intptr_t)to & (hugePageBytes - 1);
+          const size_t maxHugeHotTextBytes =
+            RuntimeOption::EvalMaxHotTextHugePages * hugePageBytes;
+          if (to - from >  maxHugeHotTextBytes) {
+            to = from + maxHugeHotTextBytes;
+          }
           if (to < (void*)hugifyText) {
             hugifyText(from, to);
           }
@@ -1430,7 +1425,7 @@ static int execute_program_impl(int argc, char** argv) {
   }
 
   if (!po.show.empty()) {
-    auto f = makeSmartPtr<PlainFile>();
+    auto f = req::make<PlainFile>();
     f->open(po.show, "r");
     if (!f->valid()) {
       Logger::Error("Unable to open file %s", po.show.c_str());
@@ -1471,8 +1466,9 @@ static int execute_program_impl(int argc, char** argv) {
   for (auto& filename : po.config) {
     Config::ParseConfigFile(filename, ini, config);
   }
+  std::vector<std::string> messages;
   // Now, take care of CLI options and then officially load and bind things
-  RuntimeOption::Load(ini, config, po.iniStrings, po.confStrings);
+  RuntimeOption::Load(ini, config, po.iniStrings, po.confStrings, &messages);
 
   vector<string> badnodes;
   config.lint(badnodes);
@@ -1512,6 +1508,11 @@ static int execute_program_impl(int argc, char** argv) {
   }
 
   open_server_log_file();
+  if (RuntimeOption::ServerExecutionMode()) {
+    for (auto const& m : messages) {
+      Logger::Info(m);
+    }
+  }
 
   // Defer the initialization of light processes until the log file handle is
   // created, so that light processes can log to the right place. If we ever
@@ -2048,9 +2049,9 @@ void hphp_memory_cleanup() {
   // I considered just clearing the inited flags; which works for some
   // RequestEventHandlers - but its a disaster for others. So just fail hard
   // here.
-  always_assert(!g_context->hasRequestEventHandlers());
+  always_assert(g_context.isNull() || !g_context->hasRequestEventHandlers());
 
-  // g_context is smart allocated, and has some members that need
+  // g_context is request allocated, and has some members that need
   // cleanup, so destroy it before its too late
   g_context.destroy();
 

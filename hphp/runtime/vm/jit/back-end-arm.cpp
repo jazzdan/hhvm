@@ -182,11 +182,6 @@ struct BackEnd final : jit::BackEnd {
     return arm::funcPrologueToGuard(prologue, func);
   }
 
-  SrcKey emitFuncPrologue(TransID transID, Func* func, int argc,
-                          TCA& start) override {
-    return arm::emitFuncPrologue(transID, func, argc, start);
-  }
-
   TCA emitCallArrayPrologue(Func* func, DVFuncletsVec& dvs) override {
     return arm::emitCallArrayPrologue(func, dvs);
   }
@@ -433,7 +428,7 @@ struct BackEnd final : jit::BackEnd {
     }
   }
 
-  void genCodeImpl(IRUnit& unit, AsmInfo*) override;
+  void genCodeImpl(IRUnit& unit, CodeKind, AsmInfo*) override;
 
 private:
   void do_moveToAlign(CodeBlock& cb, MoveToAlignFlags alignment) override {
@@ -474,7 +469,7 @@ static size_t genBlock(CodegenState& state, Vout& v, Vout& vc, Block* block) {
   return hhir_count;
 }
 
-void BackEnd::genCodeImpl(IRUnit& unit, AsmInfo* asmInfo) {
+void BackEnd::genCodeImpl(IRUnit& unit, CodeKind kind, AsmInfo* asmInfo) {
   Timer _t(Timer::codeGen);
   CodeBlock& mainCodeIn   = mcg->code.main();
   CodeBlock& coldCodeIn   = mcg->code.cold();

@@ -24,15 +24,15 @@
 #include "hphp/runtime/base/externals.h"
 #include "hphp/runtime/base/memory-profile.h"
 #include "hphp/runtime/base/runtime-error.h"
-#include "hphp/runtime/base/smart-containers.h"
+#include "hphp/runtime/base/req-containers.h"
 #include "hphp/runtime/base/type-conversions.h"
 #include "hphp/runtime/base/variable-serializer.h"
 #include "hphp/runtime/base/mixed-array-defs.h"
 
 #include "hphp/runtime/ext/ext_closure.h"
-#include "hphp/runtime/ext/ext_collections.h"
-#include "hphp/runtime/ext/ext_generator.h"
-#include "hphp/runtime/ext/ext_simplexml.h"
+#include "hphp/runtime/ext/collections/ext_collections-idl.h"
+#include "hphp/runtime/ext/generator/ext_generator.h"
+#include "hphp/runtime/ext/simplexml/ext_simplexml.h"
 #include "hphp/runtime/ext/datetime/ext_datetime.h"
 
 #include "hphp/runtime/vm/class.h"
@@ -84,60 +84,124 @@ static_assert(sizeof(ObjectData) == (use_lowptr ? 16 : 24),
 
 //////////////////////////////////////////////////////////////////////
 
-template<bool forExit>
-ALWAYS_INLINE bool ObjectData::destructImpl() {
-  if (UNLIKELY(RuntimeOption::EnableObjDestructCall && m_cls->getDtor())) {
-    g_context->m_liveBCObjs.erase(this);
+ALWAYS_INLINE
+static void invoke_destructor(ObjectData* obj, const Func* dtor) {
+  try {
+    // Call the destructor method
+    g_context->invokeMethodV(obj, dtor);
+  } catch (...) {
+    // Swallow any exceptions that escape the __destruct method
+    handle_destructor_exception();
   }
-
-  if (!noDestruct()) {
-    setNoDestruct();
-    if (auto meth = m_cls->getDtor()) {
-      if (!forExit) {
-        // We don't run PHP destructors while we're unwinding for a C++
-        // exception.  We want to minimize the PHP code we run while propagating
-        // fatals, so we do this check here on a very common path, in the
-        // relativley slower case.
-        auto& faults = g_context->m_faults;
-        if (!faults.empty()) {
-          if (faults.back().m_faultType == Fault::Type::CppException) {
-            return true;
-          }
-        }
-
-        // Some decref paths call release() when --count == 0 and some call it
-        // when count == 1. This difference only matters for objects that
-        // resurrect themselves in their destructors, so make sure count is
-        // consistent here.
-        assert(!hasMultipleRefs());
-        m_hdr.count = 0;
-      } else {
-        assert(g_context->m_faults.empty());
-      }
-
-      // We raise the refcount around the call to __destruct(). This is to
-      // prevent the refcount from going to zero when the destructor returns.
-      CountableHelper h(this);
-      try {
-        // Call the destructor method
-        g_context->invokeMethodV(this, meth);
-      } catch (...) {
-        // Swallow any exceptions that escape the __destruct method
-        handle_destructor_exception();
-      }
-
-      return getCount() == 1;
-    }
-  }
-  return true;
 }
 
-bool ObjectData::destruct() {
-  return destructImpl<false>();
+NEVER_INLINE bool ObjectData::destructImpl() {
+  setNoDestruct();
+  auto const dtor = m_cls->getDtor();
+  if (!dtor) return true;
+
+  // We don't run PHP destructors while we're unwinding for a C++
+  // exception.  We want to minimize the PHP code we run while propagating
+  // fatals, so we do this check here on a very common path, in the
+  // relatively slower case.
+  if (g_context->m_unwindingCppException) return true;
+
+  // Some decref paths call release() when --count == 0 and some call it
+  // when count == 1. This difference only matters for objects that
+  // resurrect themselves in their destructors, so make sure count is
+  // consistent here.
+  assert(!hasMultipleRefs());
+  m_hdr.count = 0;
+
+  // We raise the refcount around the call to __destruct(). This is to
+  // prevent the refcount from going to zero when the destructor returns.
+  CountableHelper h(this);
+  invoke_destructor(this, dtor);
+  return getCount() == 1;
 }
 
 void ObjectData::destructForExit() {
-  destructImpl<true>();
+  assert(RuntimeOption::EnableObjDestructCall);
+  auto const dtor = m_cls->getDtor();
+  if (dtor) {
+    g_context->m_liveBCObjs.erase(this);
+  }
+
+  if (noDestruct()) return;
+  setNoDestruct();
+
+  // We're exiting, so there should not be any live faults.
+  assert(g_context->m_faults.empty());
+  assert(!g_context->m_unwindingCppException);
+
+  CountableHelper h(this);
+  invoke_destructor(this, dtor);
+}
+
+NEVER_INLINE
+static void freeDynPropArray(ObjectData* inst) {
+  auto& table = g_context->dynPropTable;
+  auto it = table.find(inst);
+  assert(it != end(table));
+  it->second.destroy();
+  table.erase(it);
+}
+
+NEVER_INLINE
+void ObjectData::releaseNoObjDestructCheck() noexcept {
+  assert(!hasMultipleRefs());
+
+  auto const attrs = getAttributes();
+
+  if (UNLIKELY(!(attrs & Attribute::NoDestructor))) {
+    if (UNLIKELY(!destructImpl())) return;
+  }
+
+  auto const cls = getVMClass();
+
+  if (UNLIKELY(attrs & InstanceDtor))  return cls->instanceDtor()(this, cls);
+
+  assert(!cls->preClass()->builtinObjSize());
+  assert(!cls->preClass()->builtinODOffset());
+
+  // `this' is being torn down now---be careful about where/how you dereference
+  // this from here on.
+
+  auto const nProps = size_t{cls->numDeclProperties()};
+  auto prop = reinterpret_cast<TypedValue*>(this + 1);
+  auto const stop = prop + nProps;
+  for (; prop != stop; ++prop) {
+    tvRefcountedDecRef(prop);
+  }
+
+  // Deliberately reload `attrs' to check for dynamic properties.  This made
+  // gcc generate better code at the time it was done (saving a spill).
+  if (UNLIKELY(getAttributes() & HasDynPropArr)) freeDynPropArray(this);
+
+  auto& pmax = os_max_id;
+  if (o_id && o_id == pmax) --pmax;
+
+  auto const size =
+    reinterpret_cast<char*>(stop) - reinterpret_cast<char*>(this);
+  assert(size == sizeForNProps(nProps));
+  if (LIKELY(size <= kMaxSmallSize)) {
+    return MM().freeSmallSize(this, size);
+  }
+  MM().freeBigSize(this, size);
+}
+
+NEVER_INLINE
+static void tail_call_remove_live_bc_obj(ObjectData* obj) {
+  g_context->m_liveBCObjs.erase(obj);
+  return obj->releaseNoObjDestructCheck();
+}
+
+void ObjectData::release() noexcept {
+  assert(!hasMultipleRefs());
+  if (UNLIKELY(RuntimeOption::EnableObjDestructCall && m_cls->getDtor())) {
+    return tail_call_remove_live_bc_obj(this);
+  }
+  releaseNoObjDestructCheck();
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -204,6 +268,13 @@ Object ObjectData::iterableObject(bool& isIterable,
     }
     obj = o;
   }
+  if (!isIterator() && obj->instanceof(c_SimpleXMLElement::classof())) {
+    auto iterator = cast<c_SimpleXMLElement>(obj)
+      ->t_getiterator()
+      .toObject();
+    isIterable = true;
+    return iterator;
+  }
   isIterable = false;
   return obj;
 }
@@ -215,7 +286,9 @@ Array& ObjectData::dynPropArray() const {
 }
 
 Array& ObjectData::reserveProperties(int numDynamic /* = 2 */) {
-  if (getAttribute(HasDynPropArr)) return dynPropArray();
+  if (getAttribute(HasDynPropArr)) {
+    return dynPropArray();
+  }
 
   assert(!g_context->dynPropTable.count(this));
   auto& arr = g_context->dynPropTable[this].arr();
@@ -224,8 +297,9 @@ Array& ObjectData::reserveProperties(int numDynamic /* = 2 */) {
   return arr;
 }
 
-Variant* ObjectData::o_realProp(const String& propName, int flags,
-                                const String& context /* = null_string */) {
+Variant* ObjectData::realPropImpl(const String& propName, int flags,
+                                  const String& context,
+                                  bool copyDynArray) {
   /*
    * Returns a pointer to a place for a property value. This should never
    * call the magic methods __get or __set. The flags argument describes the
@@ -237,7 +311,7 @@ Variant* ObjectData::o_realProp(const String& propName, int flags,
     ctx = Unit::lookupClass(context.get());
   }
 
-  auto const lookup = getProp(ctx, propName.get());
+  auto const lookup = getPropImpl(ctx, propName.get(), copyDynArray);
   auto const prop = lookup.prop;
 
   if (!prop) {
@@ -256,6 +330,17 @@ Variant* ObjectData::o_realProp(const String& propName, int flags,
   }
 }
 
+Variant* ObjectData::o_realProp(const String& propName, int flags,
+                                const String& context /* = null_string */) {
+  return realPropImpl(propName, flags, context, true);
+}
+
+const Variant* ObjectData::o_realProp(const String& propName, int flags,
+                                      const String& context) const {
+  return const_cast<ObjectData*>(this)->realPropImpl(propName, flags, context,
+                                                     false);
+}
+
 inline Variant ObjectData::o_getImpl(const String& propName,
                                      int flags,
                                      bool error /* = true */,
@@ -264,7 +349,7 @@ inline Variant ObjectData::o_getImpl(const String& propName,
     throw_invalid_property_name(propName);
   }
 
-  if (Variant* t = o_realProp(propName, flags, context)) {
+  if (const Variant* t = o_realProp(propName, flags, context)) {
     if (t->isInitialized())
       return *t;
   }
@@ -361,6 +446,11 @@ void ObjectData::o_setArray(const Array& properties) {
 }
 
 void ObjectData::o_getArray(Array& props, bool pubOnly /* = false */) const {
+  // Fast path for classes with no declared properties
+  if (!m_cls->numDeclProperties() && getAttribute(HasDynPropArr)) {
+    props = dynPropArray();
+    return;
+  }
   // The declared properties in the resultant array should be a permutation of
   // propVec. They appear in the following order: go most-to-least-derived in
   // the inheritance hierarchy, inserting properties in declaration order (with
@@ -414,7 +504,7 @@ Array ObjectData::toArray(bool pubOnly /* = false */) const {
 
     if (UNLIKELY(flags->m_type == KindOfInt64 &&
                  flags->m_data.num == ARRAYOBJ_STD_PROP_LIST)) {
-      Array ret(ArrayData::Create());
+      auto ret = Array::Create();
       o_getArray(ret, true);
       return ret;
     }
@@ -426,7 +516,7 @@ Array ObjectData::toArray(bool pubOnly /* = false */) const {
   } else if (UNLIKELY(instanceof(DateTimeData::getClass()))) {
     return Native::data<DateTimeData>(this)->getDebugInfo();
   } else {
-    Array ret(ArrayData::Create());
+    auto ret = Array::Create();
     o_getArray(ret, pubOnly);
     return ret;
   }
@@ -437,20 +527,22 @@ namespace {
 size_t getPropertyIfAccessible(ObjectData* obj,
                                const Class* ctx,
                                const StringData* key,
-                               bool getRef,
+                               ObjectData::IterMode mode,
                                Array& properties,
                                size_t propLeft) {
-  auto const lookup = obj->getProp(ctx, key);
+  auto const lookup = obj->getPropImpl(ctx, key, false);
   auto const val = lookup.prop;
 
   if (lookup.accessible && val->m_type != KindOfUninit) {
     --propLeft;
-    if (getRef) {
+    if (mode == ObjectData::CreateRefs) {
       if (val->m_type != KindOfRef) tvBox(val);
 
       properties.setRef(StrNR(key), tvAsVariant(val), true /* isKey */);
-    } else {
+    } else if (mode == ObjectData::EraseRefs) {
       properties.set(StrNR(key), tvAsCVarRef(val), true /* isKey */);
+    } else {
+      properties.setWithRef(VarNR(key), tvAsCVarRef(val), true /* isKey */);
     }
   }
   return propLeft;
@@ -458,8 +550,12 @@ size_t getPropertyIfAccessible(ObjectData* obj,
 
 }
 
-Array ObjectData::o_toIterArray(const String& context,
-                                bool getRef /* = false */) {
+Array ObjectData::o_toIterArray(const String& context, IterMode mode) {
+  if (mode == PreserveRefs && !m_cls->numDeclProperties()) {
+    if (getAttribute(HasDynPropArr)) return dynPropArray();
+    return Array::Create();
+  }
+
   Array* dynProps = nullptr;
   size_t accessibleProps = m_cls->declPropNumAccessible();
   size_t size = accessibleProps;
@@ -484,7 +580,7 @@ Array ObjectData::o_toIterArray(const String& context,
     for (size_t i = 0; i < numProps; ++i) {
       auto key = const_cast<StringData*>(props[i].name());
       accessibleProps = getPropertyIfAccessible(
-          this, ctx, key, getRef, retArray, accessibleProps);
+          this, ctx, key, mode, retArray, accessibleProps);
     }
     klass = klass->parent();
   }
@@ -496,7 +592,7 @@ Array ObjectData::o_toIterArray(const String& context,
       const auto* key = props[i].m_name.get();
       if (!retArray.get()->exists(key)) {
         accessibleProps = getPropertyIfAccessible(
-            this, ctx, key, getRef, retArray, accessibleProps);
+            this, ctx, key, mode, retArray, accessibleProps);
         if (accessibleProps == 0) break;
       }
     }
@@ -517,23 +613,37 @@ Array ObjectData::o_toIterArray(const String& context,
       // property with a non-string name.
       if (UNLIKELY(!IS_STRING_TYPE(key.m_type))) {
         assert(key.m_type == KindOfInt64);
-        if (getRef) {
+        switch (mode) {
+        case CreateRefs: {
           auto& lval = dynProps->lvalAt(key.m_data.num);
           retArray.setRef(key.m_data.num, lval);
-        } else {
+        }
+        case EraseRefs: {
           auto const val = dynProps->get()->nvGet(key.m_data.num);
           retArray.set(key.m_data.num, tvAsCVarRef(val));
+        }
+        case PreserveRefs: {
+          auto const val = dynProps->get()->nvGet(key.m_data.num);
+          retArray.setWithRef(key.m_data.num, tvAsCVarRef(val));
+        }
         }
         continue;
       }
 
       auto const strKey = key.m_data.pstr;
-      if (getRef) {
+      switch (mode) {
+      case CreateRefs: {
         auto& lval = dynProps->lvalAt(StrNR(strKey), AccessFlags::Key);
         retArray.setRef(StrNR(strKey), lval, true /* isKey */);
-      } else {
+      }
+      case EraseRefs: {
         auto const val = dynProps->get()->nvGet(strKey);
         retArray.set(StrNR(strKey), tvAsCVarRef(val), true /* isKey */);
+      }
+      case PreserveRefs: {
+        auto const val = dynProps->get()->nvGet(strKey);
+        retArray.setWithRef(VarNR(strKey), tvAsCVarRef(val), true /* isKey */);
+      }
       }
       decRefStr(strKey);
     }
@@ -683,7 +793,7 @@ inline Array getSerializeProps(const ObjectData* obj,
     // When ArrayIterator is cast to an array, it returns its array object,
     // however when it's being var_dump'd or print_r'd, it shows its properties
     if (UNLIKELY(obj->instanceof(SystemLib::s_ArrayIteratorClass))) {
-      Array ret(ArrayData::Create());
+      auto ret = Array::Create();
       obj->o_getArray(ret);
       return ret;
     }
@@ -691,7 +801,7 @@ inline Array getSerializeProps(const ObjectData* obj,
     // Same with Closure, since it's a dynamic object but still has its own
     // different behavior for var_dump and cast to array
     if (UNLIKELY(obj->instanceof(SystemLib::s_ClosureClass))) {
-      Array ret(ArrayData::Create());
+      auto ret = Array::Create();
       obj->o_getArray(ret);
       return ret;
     }
@@ -863,8 +973,7 @@ void ObjectData::serializeImpl(VariableSerializer* serializer) const {
         }
       }
       if (serializer->getType() == VariableSerializer::Type::DebuggerDump) {
-        Variant* debugDispVal = const_cast<ObjectData*>(this)->  // XXX
-          o_realProp(s_PHP_DebugDisplay, 0);
+        const Variant* debugDispVal = o_realProp(s_PHP_DebugDisplay, 0);
         if (debugDispVal) {
           serializeVariant(*debugDispVal, serializer, false, false, true);
           return;
@@ -872,8 +981,7 @@ void ObjectData::serializeImpl(VariableSerializer* serializer) const {
       }
       if (serializer->getType() != VariableSerializer::Type::VarDump &&
           className.asString() == s_PHP_Incomplete_Class) {
-        Variant* cname = const_cast<ObjectData*>(this)-> // XXX
-          o_realProp(s_PHP_Incomplete_Class_Name, 0);
+        const Variant* cname = o_realProp(s_PHP_Incomplete_Class_Name, 0);
         if (cname && cname->isString()) {
           serializer->pushObjectInfo(cname->toCStrRef(), getId(), 'O');
           properties.remove(s_PHP_Incomplete_Class_Name, true);
@@ -898,14 +1006,11 @@ ObjectData* ObjectData::clone() {
       return collections::clone(this);
     } else if (instanceof(c_Closure::classof())) {
       return c_Closure::Clone(this);
-    } else if (instanceof(c_Generator::classof())) {
-      return c_Generator::Clone(this);
     } else if (instanceof(c_SimpleXMLElement::classof())) {
       return c_SimpleXMLElement::Clone(this);
     }
     always_assert(false);
   }
-
   return cloneImpl();
 }
 
@@ -963,42 +1068,37 @@ ObjectData* ObjectData::callCustomInstanceInit() {
   auto const init = m_cls->lookupMethod(s___init__.get());
   assert(init);
 
-  // We need to incRef/decRef here because we're still a new (count == 0)
-  // object and invokeMethod is going to expect us to have a reasonable
-  // refcount.
+  // No need to inc-ref here because we're a newly created object and our
+  // ref-count starts at 1.
   try {
-    incRefCount();
     DEBUG_ONLY auto const tv = g_context->invokeMethod(this, init);
     assert(!IS_REFCOUNTED_TYPE(tv.m_type));
-    decRefCount();
   } catch (...) {
     this->setNoDestruct();
     decRefObj(this);
     throw;
   }
+
   return this;
 }
 
 // called from jit code
 ObjectData* ObjectData::newInstanceRaw(Class* cls, uint32_t size) {
-  return new (MM().smartMallocSize(size)) ObjectData(cls, NoInit{});
+  auto o = new (MM().mallocSmallSize(size)) ObjectData(cls, NoInit{});
+  assert(o->hasExactlyOneRef());
+  return o;
 }
 
 // called from jit code
 ObjectData* ObjectData::newInstanceRawBig(Class* cls, size_t size) {
-  return new (MM().smartMallocSizeBig<false>(size).ptr)
+  auto o = new (MM().mallocBigSize<false>(size).ptr)
     ObjectData(cls, NoInit{});
+  assert(o->hasExactlyOneRef());
+  return o;
 }
 
-NEVER_INLINE
-static void freeDynPropArray(ObjectData* inst) {
-  auto& table = g_context->dynPropTable;
-  auto it = table.find(inst);
-  assert(it != end(table));
-  it->second.destroy();
-  table.erase(it);
-}
-
+// Note: the normal object destruction path does not actually call this
+// destructor.  See ObjectData::release.
 ObjectData::~ObjectData() {
   int& pmax = os_max_id;
   if (o_id && o_id == pmax) {
@@ -1007,54 +1107,10 @@ ObjectData::~ObjectData() {
   if (UNLIKELY(getAttribute(HasDynPropArr))) freeDynPropArray(this);
 }
 
-void ObjectData::DeleteObject(ObjectData* objectData) {
-  auto const cls = objectData->getVMClass();
-
-  if (UNLIKELY(objectData->getAttribute(InstanceDtor))) {
-    return cls->instanceDtor()(objectData, cls);
-  }
-
-  assert(!cls->preClass()->builtinObjSize());
-  assert(!cls->preClass()->builtinODOffset());
-
-  // ObjectData subobject is logically destructed now---don't access
-  // objectData->foo for anything.
-
-  auto const nProps = size_t{cls->numDeclProperties()};
-  auto prop = reinterpret_cast<TypedValue*>(objectData + 1);
-  auto const stop = prop + nProps;
-  for (; prop != stop; ++prop) {
-    tvRefcountedDecRef(prop);
-  }
-
-  objectData->~ObjectData();
-
-  auto const size = sizeForNProps(nProps);
-  if (LIKELY(size <= kMaxSmartSize)) {
-    return MM().smartFreeSize(objectData, size);
-  }
-  MM().smartFreeSizeBig(objectData, size);
-}
-
 Object ObjectData::FromArray(ArrayData* properties) {
-  ObjectData* retval = ObjectData::newInstance(SystemLib::s_stdclassClass);
-  auto& dynArr = retval->reserveProperties(properties->size());
-  auto pos_limit = properties->iter_end();
-  for (ssize_t pos = properties->iter_begin();
-       pos != pos_limit;
-       pos = properties->iter_advance(pos)) {
-    auto const value = properties->getValueRef(pos);
-    TypedValue key;
-    properties->nvGetKey(&key, pos);
-    if (key.m_type == KindOfInt64) {
-      dynArr.set(key.m_data.num, value);
-    } else {
-      assert(IS_STRING_TYPE(key.m_type));
-      StringData* strKey = key.m_data.pstr;
-      dynArr.set(StrNR(strKey), value, true /* isKey */);
-      decRefStr(strKey);
-    }
-  }
+  Object retval{SystemLib::s_stdclassClass};
+  retval->setAttribute(HasDynPropArr);
+  g_context->dynPropTable.emplace(retval.get(), properties);
   return retval;
 }
 
@@ -1069,9 +1125,10 @@ Slot ObjectData::declPropInd(TypedValue* prop) const {
   }
 }
 
-ObjectData::PropLookup<TypedValue*> ObjectData::getProp(
+ObjectData::PropLookup<TypedValue*> ObjectData::getPropImpl(
   const Class* ctx,
-  const StringData* key
+  const StringData* key,
+  bool copyDynArray
 ) {
   auto const lookup = m_cls->getDeclPropIndex(ctx, key);
   auto const propIdx = lookup.prop;
@@ -1094,14 +1151,15 @@ ObjectData::PropLookup<TypedValue*> ObjectData::getProp(
   // We could not find a visible declared property. We need to check for a
   // dynamic property with this name.
   if (UNLIKELY(getAttribute(HasDynPropArr))) {
-    if (auto const prop = dynPropArray()->nvGet(key)) {
+    if (auto prop = dynPropArray()->nvGet(key)) {
+      // If we may write to the property we need to allow the array to escalate
+      if (copyDynArray) {
+        prop = dynPropArray().lvalAt(StrNR(key),
+                                     AccessFlags::Key).asTypedValue();
+      }
+
       // Returning a non-declared property, we know that it is accessible since
       // all dynamic properties are.
-
-      assert(!dynPropArray()->hasMultipleRefs());
-      assert(dynPropArray()->isMixed());
-      // We are using a MixedArray for storage, but not really treating it as a
-      // normal array, so this cast is safe in this situation.
       return PropLookup<TypedValue*> { const_cast<TypedValue*>(prop), true };
     }
   }
@@ -1109,11 +1167,19 @@ ObjectData::PropLookup<TypedValue*> ObjectData::getProp(
   return PropLookup<TypedValue*> { nullptr, false };
 }
 
+ObjectData::PropLookup<TypedValue*> ObjectData::getProp(
+  const Class* ctx,
+  const StringData* key
+) {
+  return getPropImpl(ctx, key, true);
+}
+
 ObjectData::PropLookup<const TypedValue*> ObjectData::getProp(
   const Class* ctx,
   const StringData* key
 ) const {
-  auto const lookup = const_cast<ObjectData*>(this)->getProp(ctx, key);
+  auto const lookup = const_cast<ObjectData*>(this)->
+    getPropImpl(ctx, key, false);
   return PropLookup<const TypedValue*> { lookup.prop, lookup.accessible };
 }
 
@@ -1162,8 +1228,7 @@ struct PropAccessInfo::Hash {
 };
 
 struct PropRecurInfo {
-  typedef smart::hash_set<PropAccessInfo,PropAccessInfo::Hash> RecurSet;
-
+  typedef req::hash_set<PropAccessInfo,PropAccessInfo::Hash> RecurSet;
   const PropAccessInfo* activePropInfo;
   RecurSet* activeSet;
 };
@@ -1177,7 +1242,7 @@ bool magic_prop_impl(TypedValue* retval,
                      Invoker invoker) {
   if (UNLIKELY(propRecurInfo.activePropInfo != nullptr)) {
     if (!propRecurInfo.activeSet) {
-      propRecurInfo.activeSet = smart_new<PropRecurInfo::RecurSet>();
+      propRecurInfo.activeSet = req::make_raw<PropRecurInfo::RecurSet>();
       propRecurInfo.activeSet->insert(*propRecurInfo.activePropInfo);
     }
     if (!propRecurInfo.activeSet->insert(info).second) {
@@ -1196,7 +1261,7 @@ bool magic_prop_impl(TypedValue* retval,
   SCOPE_EXIT {
     propRecurInfo.activePropInfo = nullptr;
     if (UNLIKELY(propRecurInfo.activeSet != nullptr)) {
-      smart_delete(propRecurInfo.activeSet);
+      req::destroy_raw(propRecurInfo.activeSet);
       propRecurInfo.activeSet = nullptr;
     }
   };
@@ -1414,7 +1479,7 @@ TypedValue* ObjectData::propWD(
 }
 
 bool ObjectData::propIsset(const Class* ctx, const StringData* key) {
-  auto const lookup = getProp(ctx, key);
+  auto const lookup = getPropImpl(ctx, key, false);
   auto const prop = lookup.prop;
 
   if (prop && lookup.accessible && prop->m_type != KindOfUninit) {
@@ -1435,7 +1500,7 @@ bool ObjectData::propIsset(const Class* ctx, const StringData* key) {
 }
 
 bool ObjectData::propEmptyImpl(const Class* ctx, const StringData* key) {
-  auto const lookup = getProp(ctx, key);
+  auto const lookup = getPropImpl(ctx, key, false);
   auto const prop = lookup.prop;
 
   if (prop && lookup.accessible && prop->m_type != KindOfUninit) {
@@ -1924,57 +1989,26 @@ void ObjectData::cloneSet(ObjectData* clone) {
     tvDupFlattenVars(&propVec()[i], &clonePropVec[i]);
   }
   if (UNLIKELY(getAttribute(HasDynPropArr))) {
-    auto& dynProps = dynPropArray();
-    auto& cloneProps = clone->reserveProperties(dynProps.size());
-
-    auto const props = dynProps.get();
-    ssize_t iter = props->iter_begin();
-    auto pos_limit = props->iter_end();
-    while (iter != pos_limit) {
-      assert(MixedArray::asMixed(props));
-
-      TypedValue key;
-      MixedArray::NvGetKey(props, &key, iter);
-
-      const TypedValue* val;
-      TypedValue* ret;
-      switch (key.m_type) {
-      case HPHP::KindOfString: {
-        StringData* str = key.m_data.pstr;
-        val = MixedArray::NvGetStr(props, str);
-        ret = cloneProps.lvalAt(String(str), AccessFlags::Key).asTypedValue();
-        decRefStr(str);
-        break;
-      }
-      case HPHP::KindOfInt64: {
-        int64_t num = key.m_data.num;
-        val = MixedArray::NvGetInt(props, num);
-        ret = cloneProps.lvalAt(num, AccessFlags::Key).asTypedValue();
-        break;
-      }
-      default:
-        always_assert(false);
-      }
-
-      tvDupFlattenVars(val, ret, cloneProps.get());
-      iter = MixedArray::IterAdvance(props, iter);
-    }
+    clone->setAttribute(HasDynPropArr);
+    g_context->dynPropTable.emplace(clone, dynPropArray().get());
   }
 }
 
 ObjectData* ObjectData::cloneImpl() {
-  ObjectData* obj;
-  Object o = obj = ObjectData::newInstance(m_cls);
-  cloneSet(obj);
+  ObjectData* obj = instanceof(Generator::getClass())
+                    ? Generator::allocClone(this)
+                    : ObjectData::newInstance(m_cls);
+  Object o = Object::attach(obj);
+  cloneSet(o.get());
   if (UNLIKELY(getAttribute(HasNativeData))) {
-    Native::nativeDataInstanceCopy(obj, this);
+    Native::nativeDataInstanceCopy(o.get(), this);
   }
 
   auto const hasCloneBit = getAttribute(HasClone);
 
   if (!hasCloneBit) return o.detach();
 
-  auto const method = obj->m_cls->lookupMethod(s_clone.get());
+  auto const method = o->m_cls->lookupMethod(s_clone.get());
 
   // PHP classes that inherit from cpp builtins that have special clone
   // functionality *may* also define a __clone method, but it's totally
@@ -1982,7 +2016,7 @@ ObjectData* ObjectData::cloneImpl() {
   if (!method && getAttribute(IsCppBuiltin)) return o.detach();
   assert(method);
 
-  g_context->invokeMethodV(obj, method);
+  g_context->invokeMethodV(o.get(), method);
 
   return o.detach();
 }

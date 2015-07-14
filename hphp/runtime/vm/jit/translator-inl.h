@@ -34,7 +34,13 @@ inline SrcRec* Translator::getSrcRec(SrcKey sk) {
   // XXX: Add a insert-or-find primitive to THM.
   if (SrcRec* r = m_srcDB.find(sk)) return r;
   assertx(s_writeLease.amOwner());
-  return m_srcDB.insert(sk);
+
+  auto rec = m_srcDB.insert(sk);
+  if (RuntimeOption::EvalEnableReusableTC) {
+    recordFuncSrcRec(sk.func(), rec);
+  }
+
+  return rec;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -60,7 +66,9 @@ inline void Translator::setUseAHot(bool val) {
 // TransDB.
 
 inline bool Translator::isTransDBEnabled() {
-  return debug || RuntimeOption::EvalDumpTC;
+  return debug ||
+         RuntimeOption::EvalDumpTC ||
+         RuntimeOption::EvalDumpIR;
 }
 
 inline const TransRec* Translator::getTransRec(TCA tca) const {
@@ -101,10 +109,15 @@ inline TransContext::TransContext(TransID id, SrcKey sk, FPInvOffset spOff)
   , initSpOffset(spOff)
   , func(sk.valid() ? sk.func() : nullptr)
   , initBcOffset(sk.offset())
+  , prologue(sk.prologue())
   , resumed(sk.resumed())
 {}
 
 inline SrcKey TransContext::srcKey() const {
+  if (prologue) {
+    assertx(!resumed);
+    return SrcKey { func, initBcOffset, SrcKey::PrologueTag{} };
+  }
   return SrcKey { func, initBcOffset, resumed };
 }
 

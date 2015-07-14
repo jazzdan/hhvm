@@ -49,7 +49,7 @@ public:
 
   CLASSNAME_IS("mcrypt");
   // overriding ResourceData
-  virtual const String& o_getClassNameHook() const { return classnameof(); }
+  const String& o_getClassNameHook() const override { return classnameof(); }
 
   DECLARE_RESOURCE_ALLOCATION(MCrypt)
 
@@ -245,7 +245,7 @@ Variant HHVM_FUNCTION(mcrypt_module_open, const String& algorithm,
     return false;
   }
 
-  return Variant(makeSmartPtr<MCrypt>(td));
+  return Variant(req::make<MCrypt>(td));
 }
 
 bool HHVM_FUNCTION(mcrypt_module_close, const Resource& td) {

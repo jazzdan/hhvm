@@ -69,7 +69,7 @@ public:
     static const StaticString result("DateInterval");
     return result;
   }
-  const String& o_getClassNameHook() const { return classnameof(); }
+  const String& o_getClassNameHook() const override { return classnameof(); }
 
   DateInterval();
   explicit DateInterval(const String& date_interval, bool date_string = false);
@@ -103,7 +103,7 @@ public:
   String format(const String& format_spec);
 
   bool isValid() const { return get(); }
-  SmartPtr<DateInterval> cloneDateInterval() const;
+  req::ptr<DateInterval> cloneDateInterval() const;
 
 protected:
   friend class DateTime;

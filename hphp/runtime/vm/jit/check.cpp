@@ -36,7 +36,11 @@
 #include <string>
 #include <unordered_set>
 
+#include <boost/dynamic_bitset.hpp>
+
 namespace HPHP { namespace jit {
+
+//////////////////////////////////////////////////////////////////////
 
 namespace {
 
@@ -122,9 +126,54 @@ bool checkBlock(Block* b) {
   return true;
 }
 
+///////////////////////////////////////////////////////////////////////////////
+
+/*
+ * Check some invariants around InitCtx:
+ * 1. At most one should exist in a given unit.
+ * 2. If present, InitCtx must dominate all occurrences of LdCtx and LdCctx.
+ */
+bool checkInitCtxInvariants(const IRUnit& unit) {
+  auto const blocks = rpoSortCfg(unit);
+
+  const Block* init_ctx_block = nullptr;
+
+  for (auto& blk : blocks) {
+    for (auto& inst : blk->instrs()) {
+      if (!inst.is(InitCtx)) continue;
+      if (init_ctx_block) return false;
+      init_ctx_block = blk;
+    }
+  }
+
+  if (!init_ctx_block) return true;
+
+  auto const rpoIDs = numberBlocks(unit, blocks);
+  auto const idoms = findDominators(unit, blocks, rpoIDs);
+
+  for (auto& blk : blocks) {
+    bool found_init_ctx = false;
+
+    for (auto& inst : blk->instrs()) {
+      if (inst.is(InitCtx)) {
+        found_init_ctx = true;
+        continue;
+      }
+      if (!inst.is(LdCtx, LdCctx)) continue;
+
+      if (init_ctx_block == blk && !found_init_ctx) return false;
+      if (!dominates(init_ctx_block, blk, idoms)) return false;
+    }
+  }
+
+  return true;
 }
 
-//////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////
+
+}
+
+///////////////////////////////////////////////////////////////////////////////
 
 /*
  * Build the CFG, then the dominator tree, then use it to validate SSA.
@@ -141,31 +190,35 @@ bool checkBlock(Block* b) {
 bool checkCfg(const IRUnit& unit) {
   auto const blocks = rpoSortCfg(unit);
   auto const rpoIDs = numberBlocks(unit, blocks);
-  auto edges        = jit::hash_set<const Edge*>{};
+  auto reachable    = boost::dynamic_bitset<>(unit.numBlocks());
 
   // Entry block can't have predecessors.
   always_assert(unit.entry()->numPreds() == 0);
 
-  // Entry block starts with DefFP
+  // Entry block starts with DefFP.
   always_assert(!unit.entry()->empty() &&
                 unit.entry()->begin()->op() == DefFP);
 
-  // Check valid successor/predecessor edges.
+  // Check valid successor/predecessor edges, and identify reachable blocks.
   for (Block* b : blocks) {
+    reachable.set(b->id());
     auto checkEdge = [&] (const Edge* e) {
       always_assert(e->from() == b);
-      edges.insert(e);
       for (auto& p : e->to()->preds()) if (&p == e) return;
       always_assert(false); // did not find edge.
     };
     checkBlock(b);
-    if (auto *e = b->nextEdge())  checkEdge(e);
-    if (auto *e = b->takenEdge()) checkEdge(e);
+    if (auto e = b->nextEdge())  checkEdge(e);
+    if (auto e = b->takenEdge()) checkEdge(e);
   }
   for (Block* b : blocks) {
-    for (auto const &e : b->preds()) {
+    for (auto const& e : b->preds()) {
       always_assert(&e == e.inst()->takenEdge() || &e == e.inst()->nextEdge());
       always_assert(e.to() == b);
+
+      // Invariant #5
+      always_assert_flog(reachable.test(e.from()->id()),
+        "unreachable: B{}\n", e.from()->id());
     }
   }
 
@@ -498,5 +551,18 @@ bool checkOperandTypes(const IRInstruction* inst, const IRUnit* unit) {
   return true;
 }
 
-///////////////////////////////////////////////////////////////////////////////
+bool checkEverything(const IRUnit& unit) {
+  assertx(checkCfg(unit));
+  assertx(checkTmpsSpanningCalls(unit));
+  assertx(checkInitCtxInvariants(unit));
+  if (debug) {
+    forEachInst(rpoSortCfg(unit), [&](IRInstruction* inst) {
+      assertx(checkOperandTypes(inst, &unit));
+    });
+  }
+  return true;
+}
+
+//////////////////////////////////////////////////////////////////////
+
 }}

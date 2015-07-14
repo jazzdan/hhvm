@@ -45,19 +45,19 @@ let error el =
 
 (*****************************************************************************)
 
-let type_fun x fn =
+let type_fun nenv x fn =
   try
-    let tenv = Typing_env.empty TypecheckerOptions.permissive fn in
+    let tenv = Typing_env.empty (Naming.typechecker_options nenv) fn in
     let fun_ = Naming_heap.FunHeap.find_unsafe x in
-    Typing.fun_def tenv x fun_;
+    Typing.fun_def tenv nenv x fun_;
   with Not_found ->
     ()
 
-let type_class x fn =
+let type_class nenv x fn =
   try
+    let tenv = Typing_env.empty (Naming.typechecker_options nenv) fn in
     let class_ = Naming_heap.ClassHeap.find_unsafe x in
-    let tenv = Typing_env.empty TypecheckerOptions.permissive fn in
-    Typing.class_def tenv x class_
+    Typing.class_def tenv nenv x class_
   with Not_found ->
     ()
 
@@ -175,13 +175,21 @@ let hh_check fn =
           SMap.add cname (Relative_path.Set.singleton fn) acc
         end classes SMap.empty in
         Typing_decl.make_env nenv all_classes fn;
-        List.iter (fun (_, fname) -> type_fun fname fn) funs;
-        List.iter (fun (_, cname) -> type_class cname fn) classes;
+        List.iter (fun (_, fname) -> type_fun nenv fname fn) funs;
+        List.iter (fun (_, cname) -> type_class nenv cname fn) classes;
         error []
         end
         begin fun l ->
           error [l]
         end
+
+let hh_check_syntax fn content =
+  let fn = Relative_path.create Relative_path.Root fn in
+  let errors, _ = Errors.do_ begin fun () ->
+    Parser_hack.program fn content
+  end in
+  error errors
+
 
 let permissive_empty_envs fn =
   let tcopt = TypecheckerOptions.permissive in
@@ -200,13 +208,13 @@ let hh_auto_complete fn =
         | Ast.Fun f ->
             let nenv, tenv = permissive_empty_envs fn in
             let f = Naming.fun_ nenv f in
-            Typing.fun_def tenv (snd f.Nast.f_name) f
+            Typing.fun_def tenv nenv (snd f.Nast.f_name) f
         | Ast.Class c ->
             let nenv, tenv = permissive_empty_envs fn in
             let tcopt = Naming.typechecker_options nenv in
             let c = Naming.class_ nenv c in
             Typing_decl.class_decl tcopt c;
-            let res = Typing.class_def tenv (snd c.Nast.c_name) c in
+            let res = Typing.class_def tenv nenv (snd c.Nast.c_name) c in
             res
         | _ -> ()
       end ast;
@@ -246,11 +254,11 @@ let hh_get_method_at_position fn line char =
         | Ast.Fun f ->
             let nenv, tenv = permissive_empty_envs fn in
             let f = Naming.fun_ nenv f in
-            Typing.fun_def tenv (snd f.Nast.f_name) f
+            Typing.fun_def tenv nenv (snd f.Nast.f_name) f
         | Ast.Class c ->
             let nenv, tenv = permissive_empty_envs fn in
             let c = Naming.class_ nenv c in
-            let res = Typing.class_def tenv (snd c.Nast.c_name) c in
+            let res = Typing.class_def tenv nenv (snd c.Nast.c_name) c in
             res
         | _ -> ()
       end ast;
@@ -438,16 +446,14 @@ let hh_arg_info fn line char =
   let _, funs, classes = Hashtbl.find globals fn in
   Errors.ignore_ begin fun () ->
     List.iter begin fun (_, f_name) ->
-      let tcopt = TypecheckerOptions.permissive in
-      let tenv = Typing_env.empty tcopt fn in
+      let nenv, tenv = permissive_empty_envs fn in
       let f = Naming_heap.FunHeap.find_unsafe f_name in
-      Typing.fun_def tenv f_name f
+      Typing.fun_def tenv nenv f_name f
     end funs;
     List.iter begin fun (_, c_name) ->
-      let tcopt = TypecheckerOptions.permissive in
-      let tenv = Typing_env.empty tcopt fn in
+      let nenv, tenv = permissive_empty_envs fn in
       let c = Naming_heap.ClassHeap.find_unsafe c_name in
-      Typing.class_def tenv c_name c
+      Typing.class_def tenv nenv c_name c
     end classes;
   end;
   let result = ArgumentInfoService.get_result() in
@@ -464,7 +470,7 @@ let hh_arg_info fn line char =
 let hh_format contents start end_ =
   let modes = [Some FileInfo.Mstrict; Some FileInfo.Mpartial] in
   let result =
-    Format_hack.region modes Relative_path.default start end_ contents in
+    Format_hack.region modes Path.dummy_path start end_ contents in
   let error, result, internal_error = match result with
     | Format_hack.Disabled_mode -> "Php_or_decl", "", false
     | Format_hack.Parsing_error _ -> "Parsing_error", "", false
@@ -493,8 +499,9 @@ let js_wrap_string_2 func =
   Js.wrap_callback f
 
 let () =
-  Relative_path.set_path_prefix Relative_path.Root "/";
+  Relative_path.set_path_prefix Relative_path.Root (Path.make "/");
   Js.Unsafe.set Js.Unsafe.global "hh_check_file" (js_wrap_string_1 hh_check);
+  Js.Unsafe.set Js.Unsafe.global "hh_check_syntax" (js_wrap_string_2 hh_check_syntax);
   Js.Unsafe.set Js.Unsafe.global "hh_add_file" (js_wrap_string_2 hh_add_file);
   Js.Unsafe.set Js.Unsafe.global "hh_add_dep" (js_wrap_string_2 hh_add_dep);
   Js.Unsafe.set Js.Unsafe.global "hh_auto_complete" (js_wrap_string_1 hh_auto_complete);

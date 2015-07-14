@@ -51,6 +51,7 @@ module type MapSig = sig
   val find_unsafe: key -> 'a t -> 'a
   val is_empty: 'a t -> bool
   val union: 'a t -> 'a t -> 'a t
+  val partition: (key -> 'a -> bool) -> 'a t -> 'a t * 'a t
   val cardinal: 'a t -> int
   val compare: 'a t -> 'a t -> int
   val equal: 'a t -> 'a t -> bool
@@ -327,6 +328,18 @@ let str_ends_with long short =
     long = short
   with Invalid_argument _ ->
     false
+
+(* Return a copy of the string with prefixing string removed.
+ * The function is a no-op if it s does not start with prefix.
+ * Modeled after Python's string.lstrip.
+ *)
+let lstrip s prefix =
+  let prefix_length = String.length prefix in
+  if str_starts_with s prefix
+  then String.sub s prefix_length (String.length s - prefix_length)
+  else s
+
+let string_of_char = String.make 1
 
 (*****************************************************************************)
 (* Same as List.iter2, except that we only iterate as far as the shortest

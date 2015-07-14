@@ -46,7 +46,7 @@
 #include "hphp/runtime/base/php-globals.h"
 #include "hphp/runtime/base/zend-math.h"
 #include "hphp/runtime/ext/std/ext_std_function.h"
-#include "hphp/runtime/ext/ext_hash.h"
+#include "hphp/runtime/ext/hash/ext_hash.h"
 #include "hphp/runtime/ext/extension-registry.h"
 #include "hphp/runtime/ext/std/ext_std_misc.h"
 #include "hphp/runtime/ext/std/ext_std_options.h"
@@ -279,7 +279,7 @@ static StaticString s_write("write");
 static StaticString s_gc("gc");
 static StaticString s_destroy("destroy");
 
-LowClassPtr SystemlibSessionModule::s_SHIClass = nullptr;
+LowPtr<Class> SystemlibSessionModule::s_SHIClass = nullptr;
 
 /**
  * Relies on the fact that only one SessionModule will be active
@@ -358,7 +358,7 @@ const Object& SystemlibSessionModule::getObject() {
   if (!m_cls) {
     lookupClass();
   }
-  s_obj->setObject(ObjectData::newInstance(m_cls));
+  s_obj->setObject(Object{m_cls});
   const auto& obj = s_obj->getObject();
   g_context->invokeFuncFew(ret.asTypedValue(), m_ctor, obj.get());
   return obj;
@@ -1118,7 +1118,7 @@ public:
   WddxSessionSerializer() : SessionSerializer("wddx") {}
 
   virtual String encode() {
-    auto wddxPacket = makeSmartPtr<WddxPacket>(empty_string_variant_ref,
+    auto wddxPacket = req::make<WddxPacket>(empty_string_variant_ref,
                                                true, true);
     for (ArrayIter iter(php_global(s__SESSION).toArray()); iter; ++iter) {
       Variant key = iter.first();

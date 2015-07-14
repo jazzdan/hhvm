@@ -18,7 +18,7 @@
 #define incl_HPHP_OBJECT_H_
 
 #include "hphp/runtime/base/object-data.h"
-#include "hphp/runtime/base/smart-ptr.h"
+#include "hphp/runtime/base/req-ptr.h"
 #include "hphp/runtime/base/typed-value.h"
 #include "hphp/runtime/base/types.h"
 
@@ -33,8 +33,9 @@ namespace HPHP {
  * Object type wrapping around ObjectData to implement reference count.
  */
 class Object {
-  SmartPtr<ObjectData> m_obj;
+  req::ptr<ObjectData> m_obj;
 
+  using NoIncRef = req::ptr<ObjectData>::NoIncRef;
 public:
   Object() {}
 
@@ -50,39 +51,62 @@ public:
   /**
    * Constructors
    */
-  /* implicit */ Object(ObjectData *data) : m_obj(data) { }
-  /* implicit */ Object(const Object& src) : m_obj(src.m_obj) { }
+  /* implicit */ Object(ObjectData *data) : m_obj(data) {
+    // The object must have at least two refs here. One pre-existing ref, and
+    // one caused by placing it under m_obj's control.
+    assert(!data || data->hasMultipleRefs());
+  }
+  /* implicit */ Object(const Object& src) : m_obj(src.m_obj) {
+    assert(!m_obj || m_obj->hasMultipleRefs());
+  }
 
   template <typename T>
-  explicit Object(const SmartPtr<T> &ptr) : m_obj(ptr) { }
+  explicit Object(const req::ptr<T> &ptr) : m_obj(ptr) {
+    assert(!m_obj || m_obj->hasMultipleRefs());
+  }
 
   template <typename T>
-  explicit Object(SmartPtr<T>&& ptr) : m_obj(std::move(ptr)) { }
+  explicit Object(req::ptr<T>&& ptr) : m_obj(std::move(ptr)) {
+    assert(!m_obj || m_obj->getCount() > 0);
+  }
+
+  explicit Object(Class* cls)
+    : m_obj(ObjectData::newInstance(cls), NoIncRef{}) {
+    // References to the object can escape inside newInstance, so we only know
+    // that the ref-count is at least 1 here.
+    assert(!m_obj || m_obj->getCount() > 0);
+  }
 
   // Move ctor
-  Object(Object&& src) noexcept : m_obj(std::move(src.m_obj)) { }
+  Object(Object&& src) noexcept : m_obj(std::move(src.m_obj)) {
+    assert(!m_obj || m_obj->getCount() > 0);
+  }
 
   // Regular assign
   Object& operator=(const Object& src) {
     m_obj = src.m_obj;
+    assert(!m_obj || m_obj->hasMultipleRefs());
     return *this;
   }
 
   template <typename T>
-  Object& operator=(const SmartPtr<T>& src) {
+  Object& operator=(const req::ptr<T>& src) {
     m_obj = src;
+    assert(!m_obj || m_obj->hasMultipleRefs());
     return *this;
   }
 
   // Move assign
   Object& operator=(Object&& src) {
     m_obj = std::move(src.m_obj);
+    assert(!m_obj || m_obj->getCount() > 0);
     return *this;
   }
 
   template <typename T>
-  Object& operator=(SmartPtr<T>&& src) {
+  Object& operator=(req::ptr<T>&& src) {
     m_obj = std::move(src);
+    assert(!m_obj || m_obj->getCount() > 0);
     return *this;
   }
 
@@ -113,7 +137,7 @@ public:
    */
   template<typename T>
   [[deprecated("Please use one of the cast family of functions instead.")]]
-  SmartPtr<T> getTyped(bool nullOkay = false, bool badTypeOkay = false) const {
+  req::ptr<T> getTyped(bool nullOkay = false, bool badTypeOkay = false) const {
     static_assert(std::is_base_of<ObjectData, T>::value, "");
 
     ObjectData *cur = get();
@@ -130,7 +154,7 @@ public:
       return nullptr;
     }
 
-    return SmartPtr<T>(static_cast<T*>(cur));
+    return req::ptr<T>(static_cast<T*>(cur));
   }
 
   template<typename T>
@@ -178,7 +202,8 @@ public:
 
   // Take ownership of a reference without touching the ref count
   static Object attach(ObjectData *object) {
-    return Object(SmartPtr<ObjectData>::attach(object));
+    assert(!object || object->getCount() > 0);
+    return Object{req::ptr<ObjectData>::attach(object)};
   }
 
 private:

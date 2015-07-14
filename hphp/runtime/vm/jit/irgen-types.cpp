@@ -36,6 +36,86 @@ const StaticString s_WaitHandle("HH\\WaitHandle");
 
 //////////////////////////////////////////////////////////////////////
 
+/*
+ * Returns a {Cls|Nullptr} suitable for use in instance checks. If knownCls is
+ * not null and is safe to use, that will be returned. Otherwise, className
+ * will be used to look up a class.
+ */
+SSATmp* ldClassSafe(IRGS& env, const StringData* className,
+                    const Class* knownCls = nullptr) {
+  if (!knownCls) knownCls = Unit::lookupClassOrUniqueClass(className);
+
+  // We can only burn in the Class* if it's unique or in the inheritance
+  // hierarchy of our context. If we can't burn in the class, use
+  // LdClsCachedSafe - InstanceOfD and Verify(Ret|Param)Type don't invoke
+  // autoload.
+  return classIsUniqueOrCtxParent(env, knownCls)
+    ? cns(env, knownCls)
+    : gen(env, LdClsCachedSafe, cns(env, className));
+}
+
+/*
+ * Returns a Bool value indicating if src (which must be <= TObj) is an
+ * instance of the class given in className, or nullptr if we don't have an
+ * efficient translation of the required check. checkCls must be the TCls for
+ * className (but it doesn't have to be constant).
+ */
+SSATmp* implInstanceCheck(IRGS& env, SSATmp* src, const StringData* className,
+                          SSATmp* checkCls) {
+  assert(src->isA(TObj));
+  if (s_WaitHandle.get()->isame(className)) {
+    return gen(env, IsWaitHandle, src);
+  }
+
+  auto knownCls = checkCls->hasConstVal(TCls) ? checkCls->clsVal() : nullptr;
+  assert(IMPLIES(knownCls, classIsUniqueOrCtxParent(env, knownCls)));
+  assert(IMPLIES(knownCls, knownCls->name()->isame(className)));
+
+  auto const srcType = src->type();
+
+  /*
+   * If the value is a specialized object type and we don't have to constrain a
+   * guard to get it, we can avoid emitting runtime checks if we know the
+   * result is true. If we don't know, we still have to emit a runtime check
+   * because src might be a subtype of the specialized type.
+   */
+  if (srcType < TObj && srcType.clsSpec()) {
+    auto const cls = srcType.clsSpec().cls();
+    if (!env.irb->constrainValue(src, TypeConstraint(cls).setWeak()) &&
+        ((knownCls && cls->classof(knownCls)) ||
+         cls->name()->isame(className))) {
+      return cns(env, true);
+    }
+  }
+
+  // Every case after this point requires knowing things about knownCls.
+  if (knownCls == nullptr) return nullptr;
+
+  auto const ssaClassName = cns(env, className);
+  auto const objClass     = gen(env, LdObjClass, src);
+
+  InstanceBits::init();
+  if (InstanceBits::lookup(className) != 0) {
+    return gen(env, InstanceOfBitmask, objClass, ssaClassName);
+  }
+
+  // If the class is an interface, we can just hit the class's vtable or
+  // interface map and call it a day.
+  if (isInterface(knownCls)) {
+    auto const slot = knownCls->preClass()->ifaceVtableSlot();
+    if (slot != kInvalidSlot && RuntimeOption::RepoAuthoritative) {
+      return gen(env, InstanceOfIfaceVtable, ClassData{knownCls}, objClass);
+    }
+
+    return gen(env, InstanceOfIface, objClass, ssaClassName);
+  }
+
+  // If knownCls isn't a normal class, our caller may want to do something
+  // different.
+  return isNormalClass(knownCls) ? gen(env, ExtendsClass, objClass, checkCls)
+                                 : nullptr;
+}
+
 void verifyTypeImpl(IRGS& env, int32_t const id) {
   const bool isReturnType = (id == HPHP::TypeConstraint::ReturnId);
   if (isReturnType && !RuntimeOption::EvalCheckReturnTypeHints) return;
@@ -60,18 +140,6 @@ void verifyTypeImpl(IRGS& env, int32_t const id) {
   }();
 
   if (!valType.isKnownDataType()) {
-    if (!isReturnType) {
-      // This is supposed to be impossible, but it does happen in a rare case
-      // with the legacy region selector. Until it's figured out, punt in
-      // release builds. t3412704
-      assert_log(
-        false,
-        [&] {
-          return folly::sformat("Bad type {} for local {}:\n\n{}\n",
-                                valType, id, show(env.irb->unit()));
-        }
-      );
-    }
     interpOne(env, 0);
     return;
   }
@@ -108,15 +176,24 @@ void verifyTypeImpl(IRGS& env, int32_t const id) {
   assertx(result == AnnotAction::ObjectCheck);
 
   if (!(valType <= TObj)) {
-    // For RepoAuthoritative mode, if tc is a type alias we can optimize
-    // in some cases
+    // For RepoAuthoritative mode, if tc is a type alias we can optimize in
+    // some cases
     if (tc.isObject() && RuntimeOption::RepoAuthoritative) {
       auto const td = tc.namedEntity()->getCachedTypeAlias();
       if (tc.namedEntity()->isPersistentTypeAlias() && td &&
           ((td->nullable && valType <= TNull) ||
            annotCompat(valType.toDataType(), td->type,
              td->klass ? td->klass->name() : nullptr) == AnnotAction::Pass)) {
-        env.irb->constrainValue(val, TypeConstraint(DataTypeSpecific));
+        env.irb->constrainValue(val, DataTypeSpecific);
+        return;
+      }
+      auto cachedClass = tc.namedEntity()->getCachedClass();
+      if (cachedClass && classHasPersistentRDS(cachedClass) &&
+          cachedClass->enumBaseTy() &&
+          annotCompat(valType.toDataType(),
+                      dataTypeToAnnotType(*cachedClass->enumBaseTy()),
+                      nullptr) == AnnotAction::Pass) {
+        env.irb->constrainValue(val, DataTypeSpecific);
         return;
       }
     }
@@ -129,8 +206,16 @@ void verifyTypeImpl(IRGS& env, int32_t const id) {
   const StringData* clsName;
   const Class* knownConstraint = nullptr;
   if (tc.isObject()) {
-    clsName = tc.typeName();
-    knownConstraint = Unit::lookupClass(clsName);
+    auto const td = tc.namedEntity()->getCachedTypeAlias();
+    if (RuntimeOption::RepoAuthoritative && td &&
+        tc.namedEntity()->isPersistentTypeAlias() &&
+        td->klass) {
+      clsName = td->klass->name();
+      knownConstraint = td->klass;
+    } else {
+      clsName = tc.typeName();
+      knownConstraint = Unit::lookupClassOrUniqueClass(clsName);
+    }
   } else {
     if (tc.isSelf()) {
       tc.selfToClass(curFunc(env), &knownConstraint);
@@ -152,64 +237,34 @@ void verifyTypeImpl(IRGS& env, int32_t const id) {
   }
   assertx(clsName);
 
-  // We can only burn in the Class* if it's unique or in the
-  // inheritance hierarchy of our context. It's ok if the class isn't
-  // defined yet - all paths below are tolerant of a null constraint.
-  if (!classIsUniqueOrCtxParent(env, knownConstraint)) {
-    knownConstraint = nullptr;
-  }
-
   // For "self" and "parent", knownConstraint should always be
   // non-null at this point
   assertx(IMPLIES(tc.isSelf() || tc.isParent(), knownConstraint != nullptr));
 
-  /*
-   * If the local is a specialized object type and we don't have to constrain a
-   * guard to get it, we can avoid emitting runtime checks if we know the thing
-   * would pass. If we don't know, we still have to emit them because valType
-   * might be a subtype of its specialized object type.
-   */
-  if (valType < TObj && valType.clsSpec()) {
-    auto const cls = valType.clsSpec().cls();
-    if (!env.irb->constrainValue(val, TypeConstraint(cls).setWeak()) &&
-        ((knownConstraint && cls->classof(knownConstraint)) ||
-         cls->name()->isame(clsName))) {
-      return;
-    }
-  }
-
-  InstanceBits::init();
-  auto const haveBit = InstanceBits::lookup(clsName) != 0;
-  auto const constraint = knownConstraint
-    ? cns(env, knownConstraint)
-    : gen(env, LdClsCachedSafe, cns(env, clsName));
-  auto const objClass = gen(env, LdObjClass, val);
-  if (haveBit || classIsUniqueNormalClass(knownConstraint)) {
-    auto const isInstance = haveBit
-      ? gen(env, InstanceOfBitmask, objClass, cns(env, clsName))
-      : gen(env, ExtendsClass, objClass, constraint);
+  auto const checkCls = ldClassSafe(env, clsName, knownConstraint);
+  auto const fastIsInstance = implInstanceCheck(env, val, clsName, checkCls);
+  if (fastIsInstance) {
     ifThen(
       env,
       [&] (Block* taken) {
-        gen(env, JmpZero, taken, isInstance);
+        gen(env, JmpZero, taken, fastIsInstance);
       },
       [&] { // taken: the param type does not match
         hint(env, Block::Hint::Unlikely);
-        if (isReturnType) {
-          gen(env, VerifyRetFail, val);
-        } else {
-          gen(env, VerifyParamFail, cns(env, id));
-        }
+        if (isReturnType) gen(env, VerifyRetFail, val);
+        else              gen(env, VerifyParamFail, cns(env, id));
       }
     );
+    return;
+  }
+
+  auto const objClass = gen(env, LdObjClass, val);
+  if (isReturnType) {
+    gen(env, VerifyRetCls, objClass, checkCls,
+        cns(env, uintptr_t(&tc)), val);
   } else {
-    if (isReturnType) {
-      gen(env, VerifyRetCls, objClass, constraint,
-          cns(env, uintptr_t(&tc)), val);
-    } else {
-      gen(env, VerifyParamCls, objClass, constraint,
-          cns(env, uintptr_t(&tc)), cns(env, id));
-    }
+    gen(env, VerifyParamCls, objClass, checkCls,
+        cns(env, uintptr_t(&tc)), cns(env, id));
   }
 }
 
@@ -238,6 +293,10 @@ void implIsScalarC(IRGS& env) {
   auto const src = popC(env);
   push(env, gen(env, IsScalarType, src));
   gen(env, DecRef, src);
+}
+
+//////////////////////////////////////////////////////////////////////
+
 }
 
 /*
@@ -311,17 +370,13 @@ folly::Optional<Type> ratToAssertType(IRGS& env, RepoAuthType rat) {
 
 //////////////////////////////////////////////////////////////////////
 
-}
-
-//////////////////////////////////////////////////////////////////////
-
 SSATmp* implInstanceOfD(IRGS& env, SSATmp* src, const StringData* className) {
   /*
    * InstanceOfD is always false if it's not an object.
    *
-   * We're prepared to generate translations for known non-object
-   * types, but if it's Gen/Cell we're going to PUNT because it's
-   * natural to translate that case with control flow TODO(#2020251)
+   * We're prepared to generate translations for known non-object types, but if
+   * it's Gen/Cell we're going to PUNT because it's natural to translate that
+   * case with control flow TODO(#2020251)
    */
   if (TObj < src->type()) {
     PUNT(InstanceOfD_MaybeObj);
@@ -334,45 +389,12 @@ SSATmp* implInstanceOfD(IRGS& env, SSATmp* src, const StringData* className) {
     return cns(env, res);
   }
 
-  if (s_WaitHandle.get()->isame(className)) {
-    return gen(env, IsWaitHandle, src);
+  auto const checkCls = ldClassSafe(env, className);
+  if (auto isInstance = implInstanceCheck(env, src, className, checkCls)) {
+    return isInstance;
   }
 
-  auto const objClass     = gen(env, LdObjClass, src);
-  auto const ssaClassName = cns(env, className);
-
-  InstanceBits::init();
-  const bool haveBit = InstanceBits::lookup(className) != 0;
-
-  auto const maybeCls = Unit::lookupClassOrUniqueClass(className);
-  const bool isNormalClass = classIsUniqueNormalClass(maybeCls);
-  const bool isUnique = classIsUnique(maybeCls);
-
-  /*
-   * If the class is a unique interface, we can just hit the class's
-   * interfaces map and call it a day.
-   */
-  if (!haveBit && classIsUniqueInterface(maybeCls)) {
-    return gen(env, InstanceOfIface, objClass, ssaClassName);
-  }
-
-  /*
-   * If the class is unique or a parent of the current context, we
-   * don't need to load it out of RDS because it must already exist
-   * and be defined.
-   *
-   * Otherwise, we only use LdClsCachedSafe---instanceof with an
-   * undefined class doesn't invoke autoload.
-   */
-  auto const checkClass =
-    isUnique || (maybeCls && curClass(env) && curClass(env)->classof(maybeCls))
-      ? cns(env, maybeCls)
-      : gen(env, LdClsCachedSafe, ssaClassName);
-
-  return
-    haveBit ? gen(env, InstanceOfBitmask, objClass, ssaClassName) :
-    isUnique && isNormalClass ? gen(env, ExtendsClass, objClass, checkClass) :
-    gen(env, InstanceOf, objClass, checkClass);
+  return gen(env, InstanceOf, gen(env, LdObjClass, src), checkCls);
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -515,4 +537,3 @@ void emitAssertRATStk(IRGS& env, int32_t offset, RepoAuthType rat) {
 //////////////////////////////////////////////////////////////////////
 
 }}}
-

@@ -70,26 +70,27 @@ RegionMode regionMode() {
   return RegionMode::None;
 }
 
-enum class PGORegionMode {
-  Hottrace, // Select a long region, using profile counters to guide the trace
-  Hotblock, // Select a single block
-  WholeCFG, // Select the entire CFG that has been profiled
-};
-
-PGORegionMode pgoRegionMode() {
-  auto& s = RuntimeOption::EvalJitPGORegionSelector;
-  if (s == "hottrace") return PGORegionMode::Hottrace;
-  if (s == "hotblock") return PGORegionMode::Hotblock;
-  if (s == "wholecfg") return PGORegionMode::WholeCFG;
-  FTRACE(1, "unknown pgo region mode {}: using hottrace\n", s);
-  assertx(false);
-  return PGORegionMode::Hottrace;
-}
-
 template<typename Container>
 void truncateMap(Container& c, SrcKey final) {
   c.erase(c.upper_bound(final), c.end());
 }
+}
+
+//////////////////////////////////////////////////////////////////////
+
+PGORegionMode pgoRegionMode(const Func& func) {
+  auto& s = RuntimeOption::EvalJitPGORegionSelector;
+  if ((s == "wholecfg" || s == "hotcfg") &&
+      RuntimeOption::EvalJitPGOCFGHotFuncOnly && !(func.attrs() & AttrHot)) {
+    return PGORegionMode::Hottrace;
+  }
+  if (s == "hottrace") return PGORegionMode::Hottrace;
+  if (s == "hotblock") return PGORegionMode::Hotblock;
+  if (s == "hotcfg")   return PGORegionMode::HotCFG;
+  if (s == "wholecfg") return PGORegionMode::WholeCFG;
+  FTRACE(1, "unknown pgo region mode {}: using hottrace\n", s);
+  assertx(false);
+  return PGORegionMode::Hottrace;
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -201,11 +202,16 @@ void RegionDesc::addArc(BlockId srcId, BlockId dstId) {
   data(dstId).preds.insert(srcId);
 }
 
+void RegionDesc::removeArc(BlockId srcID, BlockId dstID) {
+  data(srcID).succs.erase(dstID);
+  data(dstID).preds.erase(srcID);
+}
+
 void RegionDesc::renumberBlock(BlockId oldId, BlockId newId) {
   assertx( hasBlock(oldId));
   assertx(!hasBlock(newId));
 
-  block(oldId)->setId(newId);
+  block(oldId)->setID(newId);
   m_data[newId] = m_data[oldId];
   m_data.erase(oldId);
 
@@ -395,7 +401,7 @@ void RegionDesc::chainRetransBlocks() {
   auto profData = mcg->tx().profData();
 
   auto weight = [&](RegionDesc::BlockId bid) {
-    return hasTransId(bid) ? profData->absTransCounter(getTransId(bid)) : 0;
+    return hasTransID(bid) ? profData->absTransCounter(getTransID(bid)) : 0;
   };
 
   auto sortGeneral = [&](RegionDesc::BlockId bid1, RegionDesc::BlockId bid2) {
@@ -474,12 +480,12 @@ std::string RegionDesc::toString() const {
  */
 RegionDesc::BlockId RegionDesc::Block::s_nextId = -2;
 
-TransID getTransId(RegionDesc::BlockId blockId) {
-  assertx(TransID(blockId) != kInvalidTransID);
+TransID getTransID(RegionDesc::BlockId blockId) {
+  assertx(hasTransID(blockId));
   return TransID(blockId);
 }
 
-bool hasTransId(RegionDesc::BlockId blockId) {
+bool hasTransID(RegionDesc::BlockId blockId) {
   return blockId >= 0;
 }
 
@@ -498,6 +504,7 @@ RegionDesc::Block::Block(const Func* func,
   , m_initialSpOffset(initSpOff)
   , m_inlinedCallee(nullptr)
   , m_inlineLevel(inlineLevel)
+  , m_profTransID(kInvalidTransID)
 {
   assertx(length >= 0);
   if (length > 0) {
@@ -540,7 +547,8 @@ void RegionDesc::Block::truncateAfter(SrcKey final) {
   m_length = newLen;
   m_last = final.offset();
 
-  truncateMap(m_typePreds, final);
+  truncateMap(m_typePredictions, final);
+  truncateMap(m_typePreConditions, final);
   truncateMap(m_byRefs, final);
   truncateMap(m_refPreds, final);
   truncateMap(m_knownFuncs, final);
@@ -549,11 +557,20 @@ void RegionDesc::Block::truncateAfter(SrcKey final) {
   checkMetadata();
 }
 
-void RegionDesc::Block::addPredicted(SrcKey sk, TypePred pred) {
-  FTRACE(2, "Block::addPredicted({}, {})\n", showShort(sk), show(pred));
-  assertx(pred.type <= TStkElem);
+void RegionDesc::Block::addPredicted(SrcKey sk, TypedLocation locType) {
+  FTRACE(2, "Block::addPredicted({}, {})\n", showShort(sk), show(locType));
+  assertx(locType.type != TBottom);
+  assertx(locType.type <= TStkElem);
   assertx(contains(sk));
-  m_typePreds.insert(std::make_pair(sk, pred));
+  m_typePredictions.insert(std::make_pair(sk, locType));
+}
+
+void RegionDesc::Block::addPreCondition(SrcKey sk, TypedLocation locType) {
+  FTRACE(2, "Block::addPreCondition({}, {})\n", showShort(sk), show(locType));
+  assertx(locType.type != TBottom);
+  assertx(locType.type <= TStkElem);
+  assertx(contains(sk));
+  m_typePreConditions.insert(std::make_pair(sk, locType));
 }
 
 void RegionDesc::Block::setParamByRef(SrcKey sk, bool byRef) {
@@ -587,7 +604,7 @@ void RegionDesc::Block::setKnownFunc(SrcKey sk, const Func* func) {
   m_knownFuncs.insert(std::make_pair(sk, func));
 }
 
-void RegionDesc::Block::setPostConditions(const PostConditions& conds) {
+void RegionDesc::Block::setPostConds(const PostConditions& conds) {
   m_postConds = conds;
 }
 
@@ -628,8 +645,8 @@ void RegionDesc::Block::checkInstruction(Op op) const {
 /*
  * Check invariants about the metadata for this Block.
  *
- * 1. Each SrcKey in m_typePreds, m_byRefs, m_refPreds, and m_knownFuncs is
- *    within the bounds of the block.
+ * 1. Each SrcKey in m_typePredictions, m_preConditions, m_byRefs, m_refPreds,
+ *    and m_knownFuncs is within the bounds of the block.
  *
  * 2. Each local id referred to in the type prediction list is valid.
  *
@@ -644,16 +661,22 @@ void RegionDesc::Block::checkMetadata() const {
       assertx(!"Region::Block contained out-of-range metadata");
     }
   };
-  for (auto& tpred : m_typePreds) {
-    rangeCheck("type prediction", tpred.first.offset());
-    auto& loc = tpred.second.location;
-    switch (loc.tag()) {
-    case Location::Tag::Local: assertx(loc.localId() < m_func->numLocals());
-                               break;
-    case Location::Tag::Stack: // Unchecked
-                               break;
+
+  auto checkTypedLocations = [&](const char* msg, const TypedLocMap& map) {
+    for (auto& typedLoc : map) {
+      rangeCheck("type prediction", typedLoc.first.offset());
+      auto& loc = typedLoc.second.location;
+      switch (loc.tag()) {
+      case Location::Tag::Local: assertx(loc.localId() < m_func->numLocals());
+                                 break;
+      case Location::Tag::Stack: // Unchecked
+                                 break;
+      }
     }
-  }
+  };
+
+  checkTypedLocations("type prediction", m_typePredictions);
+  checkTypedLocations("type precondition", m_typePreConditions);
 
   for (auto& byRef : m_byRefs) {
     rangeCheck("parameter reference flag", byRef.first.offset());
@@ -708,13 +731,14 @@ RegionDescPtr selectHotRegion(TransID transId,
   assertx(RuntimeOption::EvalJitPGO);
 
   const ProfData* profData = mcg->tx().profData();
-  FuncId funcId = profData->transFuncId(transId);
+  auto const& func = *(profData->transFunc(transId));
+  FuncId funcId = func.getFuncId();
   TransCFG cfg(funcId, profData, mcg->tx().getSrcDB(),
                mcg->getJmpToTransIDMap());
   TransIDSet selectedTIDs;
   assertx(regionMode() != RegionMode::Method);
   RegionDescPtr region;
-  switch (pgoRegionMode()) {
+  switch (pgoRegionMode(func)) {
     case PGORegionMode::Hottrace:
       region = selectHotTrace(transId, profData, cfg, selectedTIDs);
       break;
@@ -724,7 +748,8 @@ RegionDescPtr selectHotRegion(TransID transId,
       break;
 
     case PGORegionMode::WholeCFG:
-      region = selectWholeCFG(transId, profData, cfg, selectedTIDs);
+    case PGORegionMode::HotCFG:
+      region = selectHotCFG(transId, profData, cfg, selectedTIDs);
       break;
   }
   assertx(region);
@@ -746,18 +771,18 @@ RegionDescPtr selectHotRegion(TransID transId,
 
 //////////////////////////////////////////////////////////////////////
 
-static bool postCondMismatch(const RegionDesc::TypePred& postCond,
-                             const RegionDesc::TypePred& preCond) {
+static bool postCondMismatch(const RegionDesc::TypedLocation& postCond,
+                             const RegionDesc::TypedLocation& preCond) {
   return postCond.location == preCond.location &&
          !preCond.type.maybe(postCond.type);
 }
 
 bool preCondsAreSatisfied(const RegionDesc::BlockPtr& block,
-                          const PostConditions& prevPostConds) {
-  const auto& preConds = block->typePreds();
+                          const TypedLocations& prevPostConds) {
+  const auto& preConds = block->typePreConditions();
   for (const auto& it : preConds) {
     for (const auto& post : prevPostConds) {
-      const RegionDesc::TypePred& preCond = it.second;
+      const RegionDesc::TypedLocation& preCond = it.second;
       if (postCondMismatch(post, preCond)) {
         FTRACE(6, "preCondsAreSatisfied: postcondition check failed!\n"
                "  postcondition was {}, precondition was {}\n",
@@ -769,16 +794,14 @@ bool preCondsAreSatisfied(const RegionDesc::BlockPtr& block,
   return true;
 }
 
-bool breaksRegion(Op opc) {
-  switch (opc) {
+bool breaksRegion(SrcKey sk) {
+  switch (sk.op()) {
     case Op::MIterNext:
     case Op::MIterNextK:
-    case Op::Switch:
     case Op::SSwitch:
     case Op::CreateCont:
     case Op::Yield:
     case Op::YieldK:
-    case Op::Await:
     case Op::RetC:
     case Op::RetV:
     case Op::Exit:
@@ -792,6 +815,12 @@ bool breaksRegion(Op opc) {
     case Op::Eval:
     case Op::NativeImpl:
       return true;
+
+    case Op::Await:
+      // We break regions at resumed Await instructions, to avoid
+      // duplicating the translation of the resumed SrcKey after the
+      // Await.
+      return sk.resumed();
 
     default:
       return false;
@@ -992,7 +1021,7 @@ std::string show(RegionDesc::Location l) {
   not_reached();
 }
 
-std::string show(RegionDesc::TypePred ta) {
+std::string show(RegionDesc::TypedLocation ta) {
   return folly::format(
     "{} :: {}",
     show(ta.location),
@@ -1002,8 +1031,11 @@ std::string show(RegionDesc::TypePred ta) {
 
 std::string show(const PostConditions& pconds) {
   std::string ret;
-  for (const auto& postCond : pconds) {
-    folly::toAppend("  postcondition: ", show(postCond), "\n", &ret);
+  for (const auto& postCond : pconds.changed) {
+    folly::toAppend("  changed postcondition: ", show(postCond), "\n", &ret);
+  }
+  for (const auto& postCond : pconds.refined) {
+    folly::toAppend("  refined postcondition: ", show(postCond), "\n", &ret);
   }
   return ret;
 }
@@ -1029,7 +1061,7 @@ std::string show(RegionContext::PreLiveAR ar) {
   return folly::format(
     "AR@{}: {} ({})",
     ar.stackOff,
-    ar.func->fullName()->data(),
+    ar.func->fullName(),
     ar.objOrCls.toString()
   ).str();
 }
@@ -1052,11 +1084,13 @@ std::string show(const RegionDesc::Block& b) {
                   " length ", b.length(),
                   " initSpOff ", b.initialSpOffset().offset,
                   " inlineLevel ", b.inlineLevel(),
+                  " profTransID ", b.profTransID(),
                   '\n',
                   &ret
                  );
 
-  auto typePreds = makeMapWalker(b.typePreds());
+  auto predictions = makeMapWalker(b.typePredictions());
+  auto preconditions = makeMapWalker(b.typePreConditions());
   auto byRefs    = makeMapWalker(b.paramByRefs());
   auto refPreds  = makeMapWalker(b.reffinessPreds());
   auto knownFuncs= makeMapWalker(b.knownFuncs());
@@ -1065,8 +1099,12 @@ std::string show(const RegionDesc::Block& b) {
   const Func* topFunc = nullptr;
 
   for (int i = 0; i < b.length(); ++i) {
-    while (typePreds.hasNext(skIter)) {
-      folly::toAppend("  predict: ", show(typePreds.next()), "\n", &ret);
+    while (predictions.hasNext(skIter)) {
+      folly::toAppend("  predict: ", show(predictions.next()), "\n", &ret);
+    }
+    while (preconditions.hasNext(skIter)) {
+      folly::toAppend("  precondition: ", show(preconditions.next()), "\n",
+          &ret);
     }
     while (refPreds.hasNext(skIter)) {
       folly::toAppend("  predict reffiness: ", show(refPreds.next()), "\n",
@@ -1084,7 +1122,7 @@ std::string show(const RegionDesc::Block& b) {
         inlined = " (call is inlined)";
       }
       knownFunc = folly::format(" (top func: {}{})",
-                                topFunc->fullName()->data(), inlined).str();
+                                topFunc->fullName(), inlined).str();
     } else {
       assertx((i < b.length() - 1 || !b.inlinedCallee()) &&
              "inlined FCall without a known funcd");

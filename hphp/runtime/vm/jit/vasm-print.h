@@ -29,11 +29,13 @@ namespace HPHP { namespace jit {
 
 struct Vinstr;
 struct Vunit;
+struct Vconst;
 
 ///////////////////////////////////////////////////////////////////////////////
 
 std::string show(Vreg r);
 std::string show(Vptr p);
+std::string show(Vconst c);
 std::string show(const Vunit& unit);
 std::string show(const Vunit& unit, const Vinstr& inst);
 
@@ -45,6 +47,7 @@ void printCfg(std::ostream& out, const Vunit& unit,
 // Tracing level constants.
 constexpr int kInitialVasmLevel = 1;
 constexpr int kVasmImmsLevel = 2;
+constexpr int kVasmSimplifyLevel = 2;
 constexpr int kVasmFusionLevel = 2;
 constexpr int kVasmCodeGenLevel = 2;
 constexpr int kVasmRegAllocLevel = 3;
@@ -52,6 +55,7 @@ constexpr int kVasmCopyPropLevel = 4;
 constexpr int kVasmARMFoldLevel = 4;
 constexpr int kVasmJumpsLevel = 4;
 constexpr int kVasmExitsLevel = 4;
+constexpr int kVasmHoistFbccsLevel = 4;
 constexpr int kVasmDCELevel = 4;
 constexpr int kVasmLowerLevel = 4;
 constexpr int kVasmUnreachableLevel = 6;

@@ -79,6 +79,8 @@ class PrologueCallersRec : private boost::noncopyable {
   void                      addMainCaller(TCA caller);
   void                      addGuardCaller(TCA caller);
   void                      clearAllCallers();
+  void                      removeMainCaller(TCA caller);
+  void                      removeGuardCaller(TCA caller);
 
  private:
   PrologueCallersVec m_mainCallers;
@@ -222,6 +224,7 @@ public:
   bool                    optimized(FuncId funcId) const;
   void                    setOptimized(SrcKey sk);
   void                    setOptimized(FuncId funcId);
+  void                    clearOptimized(SrcKey sk);
   bool                    profiling(FuncId funcId) const;
   void                    setProfiling(FuncId funcId);
 

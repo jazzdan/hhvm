@@ -26,7 +26,7 @@
 #include "hphp/runtime/base/tv-conversions.h"
 #include "hphp/runtime/base/type-array.h"
 #include "hphp/runtime/base/type-string.h"
-#include "hphp/runtime/ext/ext_collections.h"
+#include "hphp/runtime/ext/collections/ext_collections-idl.h"
 #include "hphp/runtime/vm/runtime.h"
 #include "hphp/system/systemlib.h"
 
@@ -778,7 +778,6 @@ inline StringData* SetElemString(TypedValue* base, key_type<keyType> key,
     auto const oldp = base->m_data.pstr;
     auto const newp = oldp->modifyChar(x, y[0]);
     if (UNLIKELY(newp != oldp)) {
-      newp->incRefCount();
       decRefStr(oldp);
       base->m_data.pstr = newp;
       base->m_type = KindOfString;
@@ -792,15 +791,12 @@ inline StringData* SetElemString(TypedValue* base, key_type<keyType> key,
     }
     s[x] = y[0];
     sd->setSize(slen);
-    sd->incRefCount();
     decRefStr(base->m_data.pstr);
     base->m_data.pstr = sd;
     base->m_type = KindOfString;
   }
 
-  StringData* sd = StringData::Make(y, strlen(y), CopyString);
-  sd->incRefCount();
-  return sd;
+  return StringData::Make(y, strlen(y), CopyString);
 }
 
 /**
@@ -843,7 +839,6 @@ arrayRefShuffle(ArrayData* oldData, ArrayData* newData, TypedValue* base) {
     return ShuffleReturn<setRef>::do_return(oldData);
   }
 
-  newData->incRefCount();
   if (setRef) {
     if (base->m_type == KindOfArray && base->m_data.parr == oldData) {
       base->m_data.parr = newData;
@@ -1036,7 +1031,6 @@ inline void SetNewElemArray(TypedValue* base, Cell* value) {
     || (value->m_type == KindOfArray && value->m_data.parr == a);
   ArrayData* a2 = a->append(cellAsCVarRef(*value), copy);
   if (a2 != a) {
-    a2->incRefCount();
     auto old = base->m_data.parr;
     base->m_data.parr = a2;
     old->decRefAndRelease();
@@ -1554,7 +1548,6 @@ inline void UnsetElemArray(TypedValue* base, key_type<keyType> key) {
   ArrayData* a2 = UnsetElemArrayPre(a, key, copy);
 
   if (a2 != a) {
-    a2->incRefCount();
     auto old = base->m_data.parr;
     base->m_data.parr = a2;
     old->decRefAndRelease();
@@ -1776,7 +1769,6 @@ inline DataType propPreStdclass(TypedValue& tvScratch,
   tvRefcountedDecRef(base);
   base->m_type = KindOfObject;
   base->m_data.pobj = obj;
-  obj->incRefCount();
   result = base;
   // In PHP5, $undef->foo should warn, but $undef->foo['bar'] shouldn't.
   // This is crazy, so warn for both if EnableHipHopSyntax is on
@@ -1941,7 +1933,6 @@ inline void SetPropNull(Cell* val) {
 inline void SetPropStdclass(TypedValue* base, TypedValue key,
                             Cell* val) {
   auto const obj = newInstance(SystemLib::s_stdclassClass);
-  obj->incRefCount();
   StringData* keySD = prepareKey(key);
   SCOPE_EXIT { decRefStr(keySD); };
   obj->setProp(nullptr, keySD, (TypedValue*)val);
@@ -2015,7 +2006,6 @@ inline TypedValue* SetOpPropStdclass(TypedValue& tvRef, SetOpOp op,
                                      TypedValue* base, TypedValue key,
                                      Cell* rhs) {
   auto const obj = newInstance(SystemLib::s_stdclassClass);
-  obj->incRefCount();
   tvRefcountedDecRef(base);
   base->m_type = KindOfObject;
   base->m_data.pobj = obj;
@@ -2098,7 +2088,6 @@ template <bool setResult>
 inline void IncDecPropStdclass(IncDecOp op, TypedValue* base,
                                TypedValue key, TypedValue& dest) {
   auto const obj = newInstance(SystemLib::s_stdclassClass);
-  obj->incRefCount();
   tvRefcountedDecRef(base);
   base->m_type = KindOfObject;
   base->m_data.pobj = obj;

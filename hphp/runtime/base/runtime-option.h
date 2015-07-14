@@ -51,9 +51,11 @@ constexpr int kDefaultInitialStaticStringTableSize = 500000;
  */
 class RuntimeOption {
 public:
-  static void Load(IniSettingMap &ini, Hdf& config,
+  static void Load(
+    IniSettingMap &ini, Hdf& config,
     const std::vector<std::string>& iniClis = std::vector<std::string>(),
-    const std::vector<std::string>& hdfClis = std::vector<std::string>());
+    const std::vector<std::string>& hdfClis = std::vector<std::string>(),
+    std::vector<std::string>* messages = nullptr);
 
   static bool ServerExecutionMode() {
     return strcmp(ExecutionMode, "srv") == 0;
@@ -105,7 +107,6 @@ public:
 
   static std::map<std::string, AccessLogFileData> RPCLogs;
 
-  static std::string Tier;
   static std::string Host;
   static std::string DefaultServerNameSuffix;
   static std::string ServerType;
@@ -301,8 +302,6 @@ public:
   static bool EnableAPCStats;
   static bool EnableWebStats;
   static bool EnableMemoryStats;
-  static bool EnableMemcacheStats;
-  static bool EnableMemcacheKeyStats;
   static bool EnableSQLStats;
   static bool EnableSQLTableStats;
   static bool EnableNetworkIOStatus;
@@ -327,7 +326,7 @@ public:
   static bool WarnOnCollectionToArray;
   static bool UseDirectCopy;
 
-  static bool DisableSmartAllocator;
+  static bool DisableSmallAllocator;
 
   static std::map<std::string, std::string> ServerVariables;
 
@@ -352,6 +351,7 @@ public:
   static bool EnableArgsInBacktraces;
   static bool EnableZendCompat;
   static bool EnableZendSorting;
+  static bool EnableZendIniCompat;
   static bool TimeoutsUseWallTime;
   static bool CheckFlushOnUserClose;
   static bool EvalAuthoritativeMode;
@@ -397,18 +397,21 @@ public:
   F(bool, SimulateARM,                 simulateARMDefault())            \
   F(uint32_t, JitLLVM,                 jitLLVMDefault())                \
   F(uint32_t, JitLLVMKeepSize,         0)                               \
+  F(uint32_t, JitLLVMOptLevel,         2)                               \
+  F(uint32_t, JitLLVMSizeLevel,        0)                               \
+  F(bool,     JitLLVMBBVectorize,      false)                           \
   F(bool,     JitLLVMBasicOpt,         true)                            \
   F(string,   JitLLVMCompare,          "")                              \
   F(bool,     JitLLVMCondTail,         true)                            \
   F(bool,     JitLLVMCounters,         false)                           \
   F(bool,     JitLLVMDiscard,          false)                           \
   F(bool,     JitLLVMFastISel,         false)                           \
+  F(bool,     JitLLVMLoadCombine,      false)                           \
   F(bool,     JitLLVMMinSize,          true)                            \
-  F(uint32_t, JitLLVMOptLevel,         2)                               \
   F(bool,     JitLLVMOptSize,          true)                            \
   F(bool,     JitLLVMPrintAfterAll,    false)                           \
   F(bool,     JitLLVMRetOpt,           true)                            \
-  F(uint32_t, JitLLVMSizeLevel,        0)                               \
+  F(bool,     JitLLVMSLPVectorize,     jitLLVMSLPVectorizeDefault())    \
   F(uint32_t, JitLLVMSplitHotCold,     1)                               \
   F(bool,     JitLLVMVolatileIncDec,   true)                            \
   F(string,   JitLLVMAttrs,            "")                              \
@@ -420,6 +423,7 @@ public:
   F(uint64_t, JitAProfSize,            64 << 20)                        \
   F(uint64_t, JitAColdSize,            24 << 20)                        \
   F(uint64_t, JitAFrozenSize,          40 << 20)                        \
+  F(uint32_t, JitAutoTCShift,          1)                               \
   F(uint64_t, JitGlobalDataSize,       kJitGlobalDataDef)               \
   F(uint64_t, JitRelocationSize,       kJitRelocationSizeDefault)       \
   F(bool, JitTimer,                    kJitTimerDefault)                \
@@ -481,26 +485,26 @@ public:
   F(bool, JitDisabledByHphpd,          false)                           \
   F(bool, JitTransCounters,            false)                           \
   F(bool, JitPseudomain,               jitPseudomainDefault())          \
+  F(bool, HHIRLICM,                    false)                           \
   F(bool, HHIRSimplification,          true)                            \
   F(bool, HHIRGenOpts,                 true)                            \
   F(bool, HHIRRefcountOpts,            true)                            \
-  F(bool, HHIRRefcountOptsAlwaysSink,  false)                           \
-  F(uint32_t, HHIRNumFreeRegs,         64)                              \
   F(bool, HHIREnableGenTimeInlining,   true)                            \
   F(uint32_t, HHIRInliningMaxCost,     13)                              \
   F(uint32_t, HHIRInliningMaxDepth,    4)                               \
   F(uint32_t, HHIRInliningMaxReturnDecRefs, 3)                          \
   F(bool, HHIRInlineFrameOpts,         true)                            \
   F(bool, HHIRInlineSingletons,        true)                            \
-  /* 1 (the default) gives most asserts. 2 adds less commonly           \
-   * useful/more expensive asserts. */                                  \
-  F(uint32_t, HHIRGenerateAsserts,     debug)                           \
+  F(bool, HHIRGenerateAsserts,         debug)                           \
   F(bool, HHIRDirectExit,              true)                            \
   F(bool, HHIRDeadCodeElim,            true)                            \
   F(bool, HHIRGlobalValueNumbering,    true)                            \
+  F(bool, HHIRTypeCheckHoisting,       false) /* Task: 7568599 */       \
   F(bool, HHIRPredictionOpts,          true)                            \
   F(bool, HHIRMemoryOpts,              true)                            \
-  F(bool, HHIRStressCodegenBlocks,     false)                           \
+  F(bool, HHIRStorePRE,                true)                            \
+  F(bool, HHIROutlineGenericIncDecRef, true)                            \
+  F(bool, JitHoistFallbackccs,         true)                            \
   /* Register allocation flags */                                       \
   F(bool, HHIREnablePreColoring,       true)                            \
   F(bool, HHIREnableCoalescing,        true)                            \
@@ -512,24 +516,28 @@ public:
   F(string,   JitPGORegionSelector,    pgoRegionSelectorDefault())      \
   F(uint64_t, JitPGOThreshold,         pgoThresholdDefault())           \
   F(bool,     JitPGOHotOnly,           false)                           \
+  F(bool,     JitPGOCFGHotFuncOnly,    false)                           \
   F(bool,     JitPGOUsePostConditions, true)                            \
   F(uint32_t, JitUnlikelyDecRefPercent,10)                              \
   F(uint32_t, JitPGOReleaseVVMinPercent, 10)                            \
   F(bool,     JitPGOArrayGetStress,    false)                           \
+  F(uint32_t, JitPGOMinBlockCountPercent, 0)                            \
+  F(double,   JitPGOMinArcProbability, 0.0)                             \
+  F(uint32_t, JitPGOMaxFuncSizeDupBody, 80)                             \
   F(bool,     JitLoops,                loopsDefault())                  \
   F(uint32_t, HotFuncCount,            4100)                            \
-  F(bool, HHIRValidateRefCount,        debug)                           \
-  F(bool, HHIRRelaxGuards,             true)                            \
-  F(bool, HHIRConstrictGuards,         false)                           \
+  F(bool, HHIRConstrictGuards,         hhirConstrictGuardsDefault())    \
+  F(bool, HHIRRelaxGuards,             hhirRelaxGuardsDefault())        \
   /* DumpBytecode =1 dumps user php, =2 dumps systemlib & user php */   \
   F(int32_t, DumpBytecode,             0)                               \
   F(bool, DumpHhas,                    false)                           \
   F(bool, DumpTC,                      false)                           \
   F(bool, DumpTCAnchors,               false)                           \
+  F(uint32_t, DumpIR,                  0)                               \
   F(bool, DumpAst,                     false)                           \
   F(bool, MapTCHuge,                   hugePagesSoundNice())            \
-  F(bool, MapHotTextHuge,              hugePagesSoundNice())            \
   F(bool, MapTgtCacheHuge,             false)                           \
+  F(uint32_t, MaxHotTextHugePages,     hugePagesSoundNice() ? 1 : 0)    \
   F(int32_t, MaxLowMemHugePages,       hugePagesSoundNice() ? 8 : 0)    \
   F(uint32_t, TCNumHugeHotMB,          16)                              \
   F(uint32_t, TCNumHugeColdMB,         4)                               \
@@ -546,6 +554,9 @@ public:
   F(bool, EnableNuma, ServerExecutionMode())                            \
   F(bool, EnableNumaLocal, ServerExecutionMode())                       \
   F(bool, DisableStructArray, true)                                     \
+  F(bool, EnableCallBuiltin, true)                                      \
+  F(bool, EnableReusableTC,   reuseTCDefault())                         \
+  F(uint32_t, ReusableTCPadding, 128)                                   \
   /* */
 
 private:
@@ -602,8 +613,6 @@ public:
   static std::string DebuggerDefaultSandboxPath;
   static std::string DebuggerStartupDocument;
   static int DebuggerSignalTimeout;
-
-  static bool XDebugChrome;
 
   // Mail options
   static std::string SendmailPath;

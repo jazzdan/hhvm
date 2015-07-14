@@ -22,12 +22,15 @@
 #include "hphp/runtime/base/builtin-functions.h"
 #include "hphp/runtime/base/plain-file.h"
 #include "hphp/runtime/base/string-buffer.h"
-#include "hphp/runtime/base/smart-ptr.h"
+#include "hphp/runtime/base/req-ptr.h"
 #include "hphp/runtime/base/libevent-http-client.h"
 #include "hphp/runtime/base/curl-tls-workarounds.h"
 #include "hphp/runtime/base/runtime-option.h"
+#include "hphp/runtime/ext/extension-registry.h"
 #include "hphp/runtime/server/server-stats.h"
 #include "hphp/runtime/vm/jit/translator-inline.h"
+#include "hphp/util/lock.h"
+#include <boost/algorithm/string.hpp>
 #include <boost/variant.hpp>
 #include <folly/Optional.h>
 #include <openssl/ssl.h>
@@ -89,6 +92,116 @@ void throwException(ExceptionType&& e) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+/**
+ * This is a helper class used to wrap Curl handles that are pooled.
+ * Operations on this class are _NOT_ thread safe!
+ */
+class PooledCurlHandle {
+public:
+  explicit PooledCurlHandle(int connRecycleAfter)
+  : m_handle(nullptr), m_numUsages(0), m_connRecycleAfter(connRecycleAfter) { }
+
+  CURL* useHandle() {
+    if (m_handle == nullptr) {
+      m_handle = curl_easy_init();
+    }
+
+    if (m_connRecycleAfter > 0 &&
+        m_numUsages % m_connRecycleAfter == 0) {
+      curl_easy_cleanup(m_handle);
+      m_handle = curl_easy_init();
+      m_numUsages = 0;
+    }
+
+    m_numUsages++;
+    return m_handle;
+  }
+
+  void resetHandle() {
+    if (m_handle != nullptr) {
+      curl_easy_reset(m_handle);
+    }
+  }
+
+  ~PooledCurlHandle() {
+    if (m_handle != nullptr) {
+      curl_easy_cleanup(m_handle);
+    }
+  }
+
+private:
+  CURL* m_handle;
+  int m_numUsages;
+  int m_connRecycleAfter;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+/**
+ * This is a helper class used to implement a process-wide pool of libcurl
+ * handles. This provides very large performance benefits, as libcurl handles
+ * hold connections open and cache SSL session ids over their lifetimes.
+ * All operations on this class are thread safe.
+ */
+class CurlHandlePool {
+public:
+  static std::map<std::string, CurlHandlePool*> namedPools;
+
+  explicit CurlHandlePool(int poolSize, int waitTimeout, int numConnReuses)
+  : m_waitTimeout(waitTimeout) {
+    for (int i = 0; i < poolSize; i++) {
+      m_handleStack.push(new PooledCurlHandle(numConnReuses));
+    }
+    pthread_cond_init(&m_cond, nullptr);
+  }
+
+  PooledCurlHandle* fetch() {
+    Lock lock(m_mutex);
+
+    // wait until the user-specified timeout for an available handle
+    struct timespec ts;
+    gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += m_waitTimeout / 1000;
+    ts.tv_nsec += 1000000 * (m_waitTimeout % 1000);
+    while (m_handleStack.empty()) {
+      if (ETIMEDOUT == pthread_cond_timedwait(&m_cond, &m_mutex.getRaw(), &ts))
+      {
+        raise_error("Timeout reached waiting for an "
+                    "available pooled curl connection!");
+      }
+    }
+
+    PooledCurlHandle* ret = m_handleStack.top();
+    assert(ret);
+    m_handleStack.pop();
+    return ret;
+  }
+
+  void store(PooledCurlHandle* handle) {
+    Lock lock(m_mutex);
+    handle->resetHandle();
+    m_handleStack.push(handle);
+    pthread_cond_signal(&m_cond);
+  }
+
+  ~CurlHandlePool() {
+    Lock lock(m_mutex);
+    while (!m_handleStack.empty()) {
+      PooledCurlHandle *handle = m_handleStack.top();
+      m_handleStack.pop();
+      delete handle;
+    }
+  }
+
+private:
+  std::stack<PooledCurlHandle*> m_handleStack;
+  Mutex m_mutex;
+  pthread_cond_t m_cond;
+  int m_waitTimeout;
+};
+
+std::map<std::string, CurlHandlePool*> CurlHandlePool::namedPools;
+
+///////////////////////////////////////////////////////////////////////////////
 // helper data structure
 
 class CurlResource : public SweepableResourceData {
@@ -101,7 +214,7 @@ private:
 
     int                method;
     Variant            callback;
-    SmartPtr<File>     fp;
+    req::ptr<File>     fp;
     StringBuffer       buf;
     String             content;
     int                type;
@@ -113,7 +226,7 @@ private:
 
     int                method;
     Variant            callback;
-    SmartPtr<File>     fp;
+    req::ptr<File>     fp;
   };
 
   class ToFree {
@@ -138,11 +251,16 @@ private:
 public:
   CLASSNAME_IS("curl")
   // overriding ResourceData
-  virtual const String& o_getClassNameHook() const { return classnameof(); }
+  const String& o_getClassNameHook() const override { return classnameof(); }
 
-  explicit CurlResource(const String& url)
-  : m_emptyPost(true) {
-    m_cp = curl_easy_init();
+  explicit CurlResource(const String& url, CurlHandlePool *pool = nullptr)
+  : m_emptyPost(true), m_connPool(pool), m_pooledHandle(nullptr) {
+    if (m_connPool) {
+      m_pooledHandle = m_connPool->fetch();
+      m_cp = m_pooledHandle->useHandle();
+    } else {
+      m_cp = curl_easy_init();
+    }
     m_url = url;
 
     memset(m_error_str, 0, sizeof(m_error_str));
@@ -169,7 +287,11 @@ public:
     }
   }
 
-  explicit CurlResource(SmartPtr<CurlResource> src) {
+  explicit CurlResource(req::ptr<CurlResource> src)
+  : m_connPool(nullptr), m_pooledHandle(nullptr) {
+    // NOTE: we never pool copied curl handles, because all spots in
+    // the pool are pre-populated
+
     assert(src && src != this);
     assert(!src->m_exception);
 
@@ -202,14 +324,21 @@ public:
     close();
   }
 
-  virtual bool isInvalid() const {
+  bool isInvalid() const override {
     return !m_cp;
   }
 
   void closeForSweep() {
     assert(!m_exception);
     if (m_cp) {
-      curl_easy_cleanup(m_cp);
+      if (m_connPool) {
+        // reuse this curl handle if we're pooling
+        assert(m_pooledHandle);
+        m_connPool->store(m_pooledHandle);
+        m_pooledHandle = nullptr;
+      } else {
+        curl_easy_cleanup(m_cp);
+      }
       m_cp = nullptr;
     }
     m_to_free.reset();
@@ -374,6 +503,8 @@ public:
 #if LIBCURL_VERSION_NUM >= 0x071301
     case CURLOPT_POSTREDIR:
 #endif
+    case CURLOPT_PROTOCOLS:
+    case CURLOPT_REDIR_PROTOCOLS:
     case CURLOPT_FTPLISTONLY:
     case CURLOPT_FTPAPPEND:
     case CURLOPT_NETRC:
@@ -651,6 +782,7 @@ public:
     case CURLOPT_QUOTE:
     case CURLOPT_HTTP200ALIASES:
     case CURLOPT_POSTQUOTE:
+    case CURLOPT_RESOLVE:
       if (value.is(KindOfArray) || value.is(KindOfObject)) {
         Array arr = value.toArray();
         curl_slist *slist = nullptr;
@@ -671,8 +803,8 @@ public:
       } else {
         raise_warning("You must pass either an object or an array with "
                       "the CURLOPT_HTTPHEADER, CURLOPT_QUOTE, "
-                      "CURLOPT_HTTP200ALIASES and CURLOPT_POSTQUOTE "
-                      "arguments");
+                      "CURLOPT_HTTP200ALIASES, CURLOPT_POSTQUOTE "
+                      "and CURLOPT_RESOLVE arguments");
         return false;
       }
       break;
@@ -917,6 +1049,8 @@ private:
   Variant      m_progress_callback;
 
   bool m_emptyPost;
+  CurlHandlePool* m_connPool;
+  PooledCurlHandle* m_pooledHandle;
 
   static CURLcode ssl_ctx_callback(CURL *curl, void *sslctx, void *parm);
 };
@@ -1008,15 +1142,32 @@ CURLcode CurlResource::ssl_ctx_callback(CURL *curl, void *sslctx, void *parm) {
 
 Variant HHVM_FUNCTION(curl_init, const Variant& url /* = null_string */) {
   if (url.isNull()) {
-    return Variant(makeSmartPtr<CurlResource>(null_string));
+    return Variant(req::make<CurlResource>(null_string));
   } else {
-    return Variant(makeSmartPtr<CurlResource>(url.toString()));
+    return Variant(req::make<CurlResource>(url.toString()));
   }
+}
+
+Variant HHVM_FUNCTION(curl_init_pooled,
+    const String& poolName,
+    const Variant& url /* = null_string */)
+{
+  bool poolExists = (CurlHandlePool::namedPools.find(poolName.toCppString()) !=
+      CurlHandlePool::namedPools.end());
+  if (!poolExists) {
+    raise_warning("Attempting to use connection pooling without "
+                  "specifying an existent connection pool!");
+  }
+  CurlHandlePool *pool = poolExists ?
+    CurlHandlePool::namedPools.at(poolName.toCppString()) : nullptr;
+
+  return url.isNull() ? Variant(req::make<CurlResource>(null_string, pool)) :
+         Variant(req::make<CurlResource>(url.toString(), pool));
 }
 
 Variant HHVM_FUNCTION(curl_copy_handle, const Resource& ch) {
   CHECK_RESOURCE(curl);
-  return Variant(makeSmartPtr<CurlResource>(curl));
+  return Variant(req::make<CurlResource>(curl));
 }
 
 const StaticString
@@ -1263,6 +1414,10 @@ Variant HHVM_FUNCTION(curl_error, const Resource& ch) {
   return curl->getErrorString();
 }
 
+String HHVM_FUNCTION(curl_strerror, int code) {
+  return curl_easy_strerror((CURLcode)code);
+}
+
 Variant HHVM_FUNCTION(curl_close, const Resource& ch) {
   CHECK_RESOURCE(curl);
   curl->close();
@@ -1282,7 +1437,7 @@ public:
 
   CLASSNAME_IS("curl_multi")
   // overriding ResourceData
-  const String& o_getClassNameHook() const { return classnameof(); }
+  const String& o_getClassNameHook() const override { return classnameof(); }
 
   CurlMultiResource() {
     m_multi = curl_multi_init();
@@ -1300,7 +1455,7 @@ public:
     }
   }
 
-  virtual bool isInvalid() const {
+  bool isInvalid() const override {
     return !m_multi;
   }
 
@@ -1308,7 +1463,7 @@ public:
     m_easyh.append(ch);
   }
 
-  void remove(SmartPtr<CurlResource> curle) {
+  void remove(req::ptr<CurlResource> curle) {
     for (ArrayIter iter(m_easyh); iter; ++iter) {
       if (cast<CurlResource>(iter.second())->get(true) ==
           curle->get()) {
@@ -1385,14 +1540,14 @@ void CurlMultiResource::sweep() {
     return;                                                              \
   }
 
-#define CHECK_MULTI_RESOURCE_THROW(curlm)                                \
-  auto curlm = dyn_cast_or_null<CurlMultiResource>(mh);                  \
-  if (!curlm || curlm->isInvalid()) {                                    \
-    throw Object(SystemLib::AllocExceptionObject(CURLM_ARG_WARNING));    \
+#define CHECK_MULTI_RESOURCE_THROW(curlm)                               \
+  auto curlm = dyn_cast_or_null<CurlMultiResource>(mh);                 \
+  if (!curlm || curlm->isInvalid()) {                                   \
+    SystemLib::throwExceptionObject(CURLM_ARG_WARNING);                 \
   }
 
 Resource HHVM_FUNCTION(curl_multi_init) {
-  return Resource(makeSmartPtr<CurlMultiResource>());
+  return Resource(req::make<CurlMultiResource>());
 }
 
 Variant HHVM_FUNCTION(curl_multi_add_handle, const Resource& mh, const Resource& ch) {
@@ -1500,7 +1655,7 @@ class CurlTimeoutHandler : public AsioTimeoutHandler {
 
 class CurlMultiAwait : public AsioExternalThreadEvent {
  public:
-  CurlMultiAwait(SmartPtr<CurlMultiResource> multi, double timeout) {
+  CurlMultiAwait(req::ptr<CurlMultiResource> multi, double timeout) {
     if ((addLowHandles(multi) + addHighHandles(multi)) == 0) {
       // Nothing to do
       markAsFinished();
@@ -1558,7 +1713,7 @@ class CurlMultiAwait : public AsioExternalThreadEvent {
   // Ask curl_multi for its handles directly
   // This is preferable as we get to know which
   // are blocking on reads, and which on writes.
-  int addLowHandles(SmartPtr<CurlMultiResource> multi) {
+  int addLowHandles(req::ptr<CurlMultiResource> multi) {
     fd_set read_fds, write_fds;
     int max_fd = -1, count = 0;
     FD_ZERO(&read_fds); FD_ZERO(&write_fds);
@@ -1582,7 +1737,7 @@ class CurlMultiAwait : public AsioExternalThreadEvent {
   // Check for file descriptors >= FD_SETSIZE
   // which can't be returned in an fdset
   // This is a little hacky, but necessary given cURL's APIs
-  int addHighHandles(SmartPtr<CurlMultiResource> multi) {
+  int addHighHandles(req::ptr<CurlMultiResource> multi) {
     int count = 0;
     auto easy_handles = multi->getEasyHandles();
     for (ArrayIter iter(easy_handles); iter; ++iter) {
@@ -1638,7 +1793,7 @@ Array curl_convert_fd_to_stream(fd_set *fd, int max_fd) {
   Array ret = Array::Create();
   for (int i=0; i<=max_fd; i++) {
     if (FD_ISSET(i, fd)) {
-      ret.append(Variant(makeSmartPtr<BuiltinFile>(i)));
+      ret.append(Variant(req::make<BuiltinFile>(i)));
     }
   }
   return ret;
@@ -1888,6 +2043,8 @@ const int64_t k_CURLOPT_POST = CURLOPT_POST;
 const int64_t k_CURLOPT_POSTFIELDS = CURLOPT_POSTFIELDS;
 const int64_t k_CURLOPT_POSTREDIR = CURLOPT_POSTREDIR;
 const int64_t k_CURLOPT_POSTQUOTE = CURLOPT_POSTQUOTE;
+const int64_t k_CURLOPT_PROTOCOLS = CURLOPT_PROTOCOLS;
+const int64_t k_CURLOPT_REDIR_PROTOCOLS = CURLOPT_REDIR_PROTOCOLS;
 const int64_t k_CURLOPT_PRIVATE = CURLOPT_PRIVATE;
 const int64_t k_CURLOPT_PROGRESSDATA = CURLOPT_PROGRESSDATA;
 const int64_t k_CURLOPT_PROGRESSFUNCTION = CURLOPT_PROGRESSFUNCTION;
@@ -1903,6 +2060,7 @@ const int64_t k_CURLOPT_RANGE = CURLOPT_RANGE;
 const int64_t k_CURLOPT_READDATA = CURLOPT_READDATA;
 const int64_t k_CURLOPT_READFUNCTION = CURLOPT_READFUNCTION;
 const int64_t k_CURLOPT_REFERER = CURLOPT_REFERER;
+const int64_t k_CURLOPT_RESOLVE = CURLOPT_RESOLVE;
 const int64_t k_CURLOPT_RESUME_FROM = CURLOPT_RESUME_FROM;
 const int64_t k_CURLOPT_RETURNTRANSFER = CURLOPT_RETURNTRANSFER;
 #ifdef FACEBOOK
@@ -1963,6 +2121,20 @@ const int64_t k_CURL_VERSION_IPV6 = CURL_VERSION_IPV6;
 const int64_t k_CURL_VERSION_KERBEROS4 = CURL_VERSION_KERBEROS4;
 const int64_t k_CURL_VERSION_LIBZ = CURL_VERSION_LIBZ;
 const int64_t k_CURL_VERSION_SSL = CURL_VERSION_SSL;
+
+const int64_t k_CURLPROTO_HTTP = CURLPROTO_HTTP;
+const int64_t k_CURLPROTO_HTTPS = CURLPROTO_HTTPS;
+const int64_t k_CURLPROTO_FTP = CURLPROTO_FTP;
+const int64_t k_CURLPROTO_FTPS = CURLPROTO_FTPS;
+const int64_t k_CURLPROTO_SCP = CURLPROTO_SCP;
+const int64_t k_CURLPROTO_SFTP = CURLPROTO_SFTP;
+const int64_t k_CURLPROTO_TELNET = CURLPROTO_TELNET;
+const int64_t k_CURLPROTO_LDAP = CURLPROTO_LDAP;
+const int64_t k_CURLPROTO_LDAPS = CURLPROTO_LDAPS;
+const int64_t k_CURLPROTO_DICT = CURLPROTO_DICT;
+const int64_t k_CURLPROTO_FILE = CURLPROTO_FILE;
+const int64_t k_CURLPROTO_TFTP = CURLPROTO_TFTP;
+const int64_t k_CURLPROTO_ALL = CURLPROTO_ALL;
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -2154,6 +2326,8 @@ const StaticString s_CURLOPT_PORT("CURLOPT_PORT");
 const StaticString s_CURLOPT_POST("CURLOPT_POST");
 const StaticString s_CURLOPT_POSTFIELDS("CURLOPT_POSTFIELDS");
 const StaticString s_CURLOPT_POSTREDIR("CURLOPT_POSTREDIR");
+const StaticString s_CURLOPT_PROTOCOLS("CURLOPT_PROTOCOLS");
+const StaticString s_CURLOPT_REDIR_PROTOCOLS("CURLOPT_REDIR_PROTOCOLS");
 const StaticString s_CURLOPT_POSTQUOTE("CURLOPT_POSTQUOTE");
 const StaticString s_CURLOPT_PRIVATE("CURLOPT_PRIVATE");
 const StaticString s_CURLOPT_PROGRESSFUNCTION("CURLOPT_PROGRESSFUNCTION");
@@ -2169,6 +2343,7 @@ const StaticString s_CURLOPT_RANGE("CURLOPT_RANGE");
 const StaticString s_CURLOPT_READDATA("CURLOPT_READDATA");
 const StaticString s_CURLOPT_READFUNCTION("CURLOPT_READFUNCTION");
 const StaticString s_CURLOPT_REFERER("CURLOPT_REFERER");
+const StaticString s_CURLOPT_RESOLVE("CURLOPT_RESOLVE");
 const StaticString s_CURLOPT_RESUME_FROM("CURLOPT_RESUME_FROM");
 const StaticString s_CURLOPT_RETURNTRANSFER("CURLOPT_RETURNTRANSFER");
 #ifdef FACEBOOK
@@ -2224,6 +2399,23 @@ const StaticString s_CURL_VERSION_IPV6("CURL_VERSION_IPV6");
 const StaticString s_CURL_VERSION_KERBEROS4("CURL_VERSION_KERBEROS4");
 const StaticString s_CURL_VERSION_LIBZ("CURL_VERSION_LIBZ");
 const StaticString s_CURL_VERSION_SSL("CURL_VERSION_SSL");
+
+const StaticString s_CURLPROTO_HTTP("CURLPROTO_HTTP");
+const StaticString s_CURLPROTO_HTTPS("CURLPROTO_HTTPS");
+const StaticString s_CURLPROTO_FTP("CURLPROTO_FTP");
+const StaticString s_CURLPROTO_FTPS("CURLPROTO_FTPS");
+const StaticString s_CURLPROTO_SCP("CURLPROTO_SCP");
+const StaticString s_CURLPROTO_SFTP("CURLPROTO_SFTP");
+const StaticString s_CURLPROTO_TELNET("CURLPROTO_TELNET");
+const StaticString s_CURLPROTO_LDAP("CURLPROTO_LDAP");
+const StaticString s_CURLPROTO_LDAPS("CURLPROTO_LDAPS");
+const StaticString s_CURLPROTO_DICT("CURLPROTO_DICT");
+const StaticString s_CURLPROTO_FILE("CURLPROTO_FILE");
+const StaticString s_CURLPROTO_TFTP("CURLPROTO_TFTP");
+const StaticString s_CURLPROTO_ALL("CURLPROTO_ALL");
+
+static int s_poolSize, s_reuseLimit, s_getTimeout;
+static std::string s_namedPools;
 
 class CurlExtension final : public Extension {
  public:
@@ -2756,6 +2948,12 @@ class CurlExtension final : public Extension {
       s_CURLOPT_POSTREDIR.get(), k_CURLOPT_POSTREDIR
     );
     Native::registerConstant<KindOfInt64>(
+      s_CURLOPT_PROTOCOLS.get(), k_CURLOPT_PROTOCOLS
+    );
+    Native::registerConstant<KindOfInt64>(
+      s_CURLOPT_REDIR_PROTOCOLS.get(), k_CURLOPT_REDIR_PROTOCOLS
+    );
+    Native::registerConstant<KindOfInt64>(
       s_CURLOPT_POSTQUOTE.get(), k_CURLOPT_POSTQUOTE
     );
     Native::registerConstant<KindOfInt64>(
@@ -2799,6 +2997,9 @@ class CurlExtension final : public Extension {
     );
     Native::registerConstant<KindOfInt64>(
       s_CURLOPT_REFERER.get(), k_CURLOPT_REFERER
+    );
+    Native::registerConstant<KindOfInt64>(
+      s_CURLOPT_RESOLVE.get(), k_CURLOPT_RESOLVE
     );
     Native::registerConstant<KindOfInt64>(
       s_CURLOPT_RESUME_FROM.get(), k_CURLOPT_RESUME_FROM
@@ -2962,7 +3163,48 @@ class CurlExtension final : public Extension {
       s_CURL_VERSION_SSL.get(), k_CURL_VERSION_SSL
     );
 
+    Native::registerConstant<KindOfInt64>(
+      s_CURLPROTO_HTTP.get(), k_CURLPROTO_HTTP
+    );
+    Native::registerConstant<KindOfInt64>(
+      s_CURLPROTO_HTTPS.get(), k_CURLPROTO_HTTPS
+    );
+    Native::registerConstant<KindOfInt64>(
+      s_CURLPROTO_FTP.get(), k_CURLPROTO_FTP
+    );
+    Native::registerConstant<KindOfInt64>(
+      s_CURLPROTO_FTPS.get(), k_CURLPROTO_FTPS
+    );
+    Native::registerConstant<KindOfInt64>(
+      s_CURLPROTO_SCP.get(), k_CURLPROTO_SCP
+    );
+    Native::registerConstant<KindOfInt64>(
+      s_CURLPROTO_SFTP.get(), k_CURLPROTO_SFTP
+    );
+    Native::registerConstant<KindOfInt64>(
+      s_CURLPROTO_TELNET.get(), k_CURLPROTO_TELNET
+    );
+    Native::registerConstant<KindOfInt64>(
+      s_CURLPROTO_LDAP.get(), k_CURLPROTO_LDAP
+    );
+    Native::registerConstant<KindOfInt64>(
+      s_CURLPROTO_LDAPS.get(), k_CURLPROTO_LDAPS
+    );
+    Native::registerConstant<KindOfInt64>(
+      s_CURLPROTO_DICT.get(), k_CURLPROTO_DICT
+    );
+    Native::registerConstant<KindOfInt64>(
+      s_CURLPROTO_FILE.get(), k_CURLPROTO_FILE
+    );
+    Native::registerConstant<KindOfInt64>(
+      s_CURLPROTO_TFTP.get(), k_CURLPROTO_TFTP
+    );
+    Native::registerConstant<KindOfInt64>(
+      s_CURLPROTO_ALL.get(), k_CURLPROTO_ALL
+    );
+
     HHVM_FE(curl_init);
+    HHVM_FE(curl_init_pooled);
     HHVM_FE(curl_copy_handle);
     HHVM_FE(curl_version);
     HHVM_FE(curl_setopt);
@@ -2984,9 +3226,51 @@ class CurlExtension final : public Extension {
     HHVM_FE(fb_curl_multi_fdset);
     HHVM_FE(curl_multi_info_read);
     HHVM_FE(curl_multi_close);
+    HHVM_FE(curl_strerror);
+
+    Extension* ext = ExtensionRegistry::get("curl");
+    assert(ext);
+
+    IniSetting::Bind(ext, IniSetting::PHP_INI_SYSTEM, "curl.namedPools",
+      "", &s_namedPools);
+    if (s_namedPools.length() > 0) {
+
+      // split on commas, search and bind ini settings for each pool
+      std::vector<string> pools;
+      boost::split(pools, s_namedPools, boost::is_any_of(","));
+
+      for (std::string poolname: pools) {
+        if (poolname.length() == 0) { continue; }
+
+        // get the user-entered settings for this pool, if there are any
+        std::string poolSizeIni = "curl.namedPools." + poolname + ".size";
+        std::string reuseLimitIni =
+          "curl.namedPools." + poolname + ".reuseLimit";
+        std::string getTimeoutIni =
+          "curl.namedPools." + poolname + ".connGetTimeout";
+
+        IniSetting::Bind(ext, IniSetting::PHP_INI_SYSTEM, poolSizeIni,
+            "5", &s_poolSize);
+        IniSetting::Bind(ext, IniSetting::PHP_INI_SYSTEM, reuseLimitIni,
+            "100", &s_reuseLimit);
+        IniSetting::Bind(ext, IniSetting::PHP_INI_SYSTEM, getTimeoutIni,
+            "5000", &s_getTimeout);
+
+        CurlHandlePool *hp =
+          new CurlHandlePool(s_poolSize, s_getTimeout, s_reuseLimit);
+        CurlHandlePool::namedPools[poolname] = hp;
+      }
+    }
 
     loadSystemlib();
   }
+
+  void moduleShutdown() override {
+    for (auto const kvItr: CurlHandlePool::namedPools) {
+      delete kvItr.second;
+    }
+  }
+
 } s_curl_extension;
 
 }

@@ -19,7 +19,7 @@
 #define incl_HPHP_EXT_ASIO_CONTEXT_ENTER_H_
 
 #include "hphp/runtime/ext/asio/asio-context.h"
-#include "hphp/runtime/ext/asio/waitable-wait-handle.h"
+#include "hphp/runtime/ext/asio/ext_waitable-wait-handle.h"
 
 namespace HPHP { namespace asio {
 ///////////////////////////////////////////////////////////////////////////////

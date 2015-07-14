@@ -37,6 +37,7 @@
 #include "hphp/util/job-queue.h"
 #include "hphp/runtime/base/file-util.h"
 #include "hphp/runtime/base/execution-context.h"
+#include "hphp/runtime/base/program-functions.h"
 
 using namespace HPHP;
 using std::set;
@@ -200,7 +201,7 @@ class ParserWorker :
 public:
   bool m_ret;
   ParserWorker() : m_ret(true) {}
-  virtual void doJob(JobType job) {
+  void doJob(JobType job) override {
     bool ret;
     try {
       Package *package = m_context;
@@ -217,6 +218,10 @@ public:
       Logger::Error("Fatal: Unable to stat/parse %s", job.first);
       m_ret = false;
     }
+  }
+
+  void onThreadExit() override {
+    hphp_memory_cleanup();
   }
 };
 
@@ -348,13 +353,6 @@ void Package::saveStatsToFile(const char *filename, int totalSeconds) const {
     if (m_ar->getFunctionCount()) {
       ms.add("AvgLinePerFunc", getLineCount()/m_ar->getFunctionCount());
     }
-
-    std::map<std::string, int> counts;
-    SymbolTable::CountTypes(counts);
-    m_ar->countReturnTypes(counts);
-
-    ms.add("SymbolTypes");
-    o << counts;
 
     ms.add("VariableTableFunctions");
     JSON::CodeError::ListStream ls(o);

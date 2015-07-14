@@ -63,6 +63,9 @@ private:
 
 //////////////////////////////////////////////////////////////////////
 
+#ifdef OUT
+# undef OUT
+#endif
 struct RequestInjectionData {
   /* The state of the step out command. */
   enum class StepOutState : int8_t {
@@ -224,7 +227,6 @@ struct RequestInjectionData {
    * surprise flags for the current thread, use rds::surpriseFlags() instead.
    */
   void clearFlag(SurpriseFlag);
-  bool getFlag(SurpriseFlag) const;
   void setFlag(SurpriseFlag);
 
 private:
@@ -266,7 +268,7 @@ private:
   bool m_safeFileAccess;
 
   /* Pointer to surprise flags stored in RDS. */
-  std::atomic<ssize_t>* m_sflagsPtr{nullptr};
+  std::atomic<size_t>* m_sflagsAndStkPtr{nullptr};
 
   /*
    * When the PC is currently over a line that has been registered for a line
@@ -291,6 +293,15 @@ private:
   std::vector<std::string> m_allowedDirectories;
   int64_t m_errorReportingLevel;
   int64_t m_socketDefaultTimeout;
+
+  /*
+   * Keep track of the open_basedir_separator that may be used so we can
+   * have backwards compatibility with our current ;.
+   * This is a simple fix with the caveat that we don't mix the characters
+   * in an ini file or ini_set().
+   * Moving forward we should just use s_PATH_SEPARATOR and support only that
+   */
+  std::string m_open_basedir_separator;
 
  public:
   /* CmdInterrupts this thread is handling. */

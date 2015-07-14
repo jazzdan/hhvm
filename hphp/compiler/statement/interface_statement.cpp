@@ -41,10 +41,11 @@ InterfaceStatement::InterfaceStatement
  const std::string &docComment, StatementListPtr stmt,
  ExpressionListPtr attrList)
   : Statement(STATEMENT_CONSTRUCTOR_BASE_PARAMETER_VALUES),
-    m_originalName(name), m_base(base),
-    m_docComment(docComment), m_stmt(stmt), m_attrList(attrList) {
-  m_name = toLower(name);
-  if (m_base) m_base->toLower();
+    m_originalName(name),
+    m_base(base),
+    m_docComment(docComment),
+    m_stmt(stmt),
+    m_attrList(attrList) {
 }
 
 InterfaceStatement::InterfaceStatement
@@ -52,11 +53,9 @@ InterfaceStatement::InterfaceStatement
  const std::string &name, ExpressionListPtr base,
  const std::string &docComment, StatementListPtr stmt,
  ExpressionListPtr attrList)
-  : Statement(STATEMENT_CONSTRUCTOR_PARAMETER_VALUES(InterfaceStatement)),
-    m_originalName(name), m_base(base),
-    m_docComment(docComment), m_stmt(stmt), m_attrList(attrList) {
-  m_name = toLower(name);
-  if (m_base) m_base->toLower();
+  : InterfaceStatement(
+    STATEMENT_CONSTRUCTOR_PARAMETER_VALUES(InterfaceStatement),
+    name, base, docComment, stmt, attrList) {
 }
 
 StatementPtr InterfaceStatement::clone() {
@@ -79,10 +78,10 @@ int InterfaceStatement::getRecursiveCount() const {
 void InterfaceStatement::onParse(AnalysisResultConstPtr ar,
                                  FileScopePtr scope) {
   vector<string> bases;
-  if (m_base) m_base->getOriginalStrings(bases);
+  if (m_base) m_base->getStrings(bases);
 
   for (auto &b : bases) {
-    ar->parseOnDemandByClass(toLower(b));
+    ar->parseOnDemandByClass(b);
   }
 
   StatementPtr stmt = dynamic_pointer_cast<Statement>(shared_from_this());
@@ -96,9 +95,11 @@ void InterfaceStatement::onParse(AnalysisResultConstPtr ar,
     }
   }
 
-  ClassScopePtr classScope
-    (new ClassScope(ClassScope::KindOf::Interface, m_name, "", bases,
-                    m_docComment, stmt, attrs));
+  auto classScope =
+    std::make_shared<ClassScope>(
+      scope, ClassScope::KindOf::Interface, m_originalName, "", bases,
+      m_docComment, stmt, attrs);
+
   setBlockScope(classScope);
   scope->addClass(ar, classScope);
 
@@ -107,21 +108,21 @@ void InterfaceStatement::onParse(AnalysisResultConstPtr ar,
   if (m_stmt) {
     for (int i = 0; i < m_stmt->getCount(); i++) {
       IParseHandlerPtr ph = dynamic_pointer_cast<IParseHandler>((*m_stmt)[i]);
-      ph->onParseRecur(ar, classScope);
+      ph->onParseRecur(ar, scope, classScope);
     }
-    checkArgumentsToPromote(ExpressionListPtr(), T_INTERFACE);
+    checkArgumentsToPromote(scope, ExpressionListPtr(), T_INTERFACE);
   }
 }
 
 void InterfaceStatement::checkArgumentsToPromote(
-    ExpressionListPtr promotedParams, int type) {
+  FileScopeRawPtr scope, ExpressionListPtr promotedParams, int type) {
   if (!m_stmt) {
     return;
   }
   for (int i = 0; i < m_stmt->getCount(); i++) {
     MethodStatementPtr meth =
       dynamic_pointer_cast<MethodStatement>((*m_stmt)[i]);
-    if (meth && meth->getName() == "__construct") {
+    if (meth && meth->isNamed("__construct")) {
       ExpressionListPtr params = meth->getParams();
       if (params) {
         for (int i = 0; i < params->getCount(); i++) {
@@ -129,7 +130,8 @@ void InterfaceStatement::checkArgumentsToPromote(
             dynamic_pointer_cast<ParameterExpression>((*params)[i]);
           if (param->getModifier() != 0) {
             if (type == T_TRAIT || type == T_INTERFACE) {
-              param->parseTimeFatal(Compiler::InvalidAttribute,
+              param->parseTimeFatal(scope,
+                                    Compiler::InvalidAttribute,
                                     "Constructor parameter promotion "
                                     "not allowed on traits or interfaces");
             }
@@ -153,7 +155,7 @@ int InterfaceStatement::getLocalEffects() const {
 }
 
 std::string InterfaceStatement::getName() const {
-  return string("Interface ") + getScope()->getName();
+  return string("Interface ") + m_originalName;
 }
 
 bool InterfaceStatement::checkVolatileBases(AnalysisResultConstPtr ar) {
@@ -176,10 +178,6 @@ void InterfaceStatement::checkVolatile(AnalysisResultConstPtr ar) {
        // if any base is volatile, the class is volatile
        classScope->setVolatile();
      }
-  }
-  if (classScope->isVolatile()) {
-    classScope->getOuterScope()->getVariables()->
-       setAttribute(VariableTable::NeedGlobalPointer);
   }
 }
 
@@ -273,7 +271,7 @@ void InterfaceStatement::outputCodeModel(CodeGenerator &cg) {
   cg.printPropertyHeader("block");
   cg.printAsEnclosedBlock(m_stmt);
   cg.printPropertyHeader("sourceLocation");
-  cg.printLocation(this->getLocation());
+  cg.printLocation(this);
   if (!m_docComment.empty()) {
     cg.printPropertyHeader("comments");
     cg.printValue(m_docComment);

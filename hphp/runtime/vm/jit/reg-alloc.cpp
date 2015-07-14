@@ -190,6 +190,8 @@ void assignRegs(IRUnit& unit, Vunit& vunit, CodegenState& state,
         c = vunit.makeConst(0);
       } else if (type <= TBool) {
         c = vunit.makeConst(tmp->boolVal());
+      } else if (type <= TDbl) {
+        c = vunit.makeConst(tmp->dblVal());
       } else {
         c = vunit.makeConst(tmp->rawVal());
       }
@@ -250,6 +252,9 @@ void getEffects(const Abi& abi, const Vinstr& i,
       case Arch::ARM: defs.remove(PhysReg(arm::rVmFp)); break;
       case Arch::X64: defs -= reg::rbp | x64::rVmTl; break;
       }
+      break;
+    case Vinstr::callfaststub:
+      defs = abi.all() - abi.calleeSaved - x64::kGPCallerSaved;
       break;
     case Vinstr::cqo:
       uses = RegSet(reg::rax);

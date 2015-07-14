@@ -22,11 +22,12 @@
 #include "hphp/runtime/base/stats.h"
 #include "hphp/runtime/base/zend-functions.h"
 #include "hphp/runtime/ext/ext_closure.h"
-#include "hphp/runtime/ext/ext_collections.h"
+#include "hphp/runtime/ext/collections/ext_collections-idl.h"
 #include "hphp/runtime/ext/hh/ext_hh.h"
 #include "hphp/runtime/ext/std/ext_std_function.h"
 #include "hphp/runtime/vm/jit/mc-generator-internal.h"
 #include "hphp/runtime/vm/jit/mc-generator.h"
+#include "hphp/runtime/vm/jit/target-profile.h"
 #include "hphp/runtime/vm/jit/translator-inline.h"
 #include "hphp/runtime/vm/jit/unwind-x64.h"
 #include "hphp/runtime/vm/member-operations.h"
@@ -48,7 +49,9 @@ RefData* lookupStaticFromClosure(ObjectData* closure,
                                  StringData* name,
                                  bool& inited) {
   assertx(closure->instanceof(c_Closure::classof()));
-  String str(StringData::Make(s_staticPrefix.slice(), name->slice()));
+  auto str = String::attach(
+    StringData::Make(s_staticPrefix.slice(), name->slice())
+  );
   auto const cls = closure->getVMClass();
   auto const slot = cls->lookupDeclProp(str.get());
   assertx(slot != kInvalidSlot);
@@ -72,7 +75,6 @@ namespace jit {
 ArrayData* addNewElemHelper(ArrayData* a, TypedValue value) {
   ArrayData* r = a->append(tvAsCVarRef(&value), a->getCount() != 1);
   if (UNLIKELY(r != a)) {
-    r->incRefCount();
     decRefArr(a);
   }
   tvRefcountedDecRef(value);
@@ -239,15 +241,11 @@ ObjectData* convCellToObjHelper(TypedValue tv) {
 
 StringData* convDblToStrHelper(int64_t i) {
   double d = reinterpretIntAsDbl(i);
-  auto r = buildStringData(d);
-  r->incRefCount();
-  return r;
+  return buildStringData(d);
 }
 
 StringData* convIntToStrHelper(int64_t i) {
-  auto r = buildStringData(i);
-  r->incRefCount();
-  return r;
+  return buildStringData(i);
 }
 
 StringData* convObjToStrHelper(ObjectData* o) {
@@ -438,7 +436,7 @@ void VerifyParamTypeSlow(const Class* cls,
 }
 
 void VerifyParamTypeCallable(TypedValue value, int param) {
-  if (UNLIKELY(!HHVM_FN(is_callable)(tvAsCVarRef(&value)))) {
+  if (UNLIKELY(!is_callable(tvAsCVarRef(&value)))) {
     VerifyParamTypeFail(param);
   }
 }
@@ -463,7 +461,7 @@ void VerifyRetTypeSlow(const Class* cls,
 }
 
 void VerifyRetTypeCallable(TypedValue value) {
-  if (UNLIKELY(!HHVM_FN(is_callable)(tvAsCVarRef(&value)))) {
+  if (UNLIKELY(!is_callable(tvAsCVarRef(&value)))) {
     VerifyRetTypeFail(value);
   }
 }
@@ -520,6 +518,7 @@ bool ak_exist_int_obj(ObjectData* obj, int64_t key) {
   return arr.get()->exists(key);
 }
 
+namespace {
 ALWAYS_INLINE
 TypedValue getDefaultIfNullCell(const TypedValue* tv, TypedValue& def) {
   if (UNLIKELY(nullptr == tv)) {
@@ -532,6 +531,7 @@ TypedValue getDefaultIfNullCell(const TypedValue* tv, TypedValue& def) {
   auto const ret = tvToCell(tv);
   tvRefcountedIncRef(ret);
   return *ret;
+}
 }
 
 TypedValue arrayIdxS(ArrayData* a, StringData* key, TypedValue def) {
@@ -553,7 +553,7 @@ TypedValue arrayIdxIc(ArrayData* a, int64_t key, TypedValue def) {
   return arrayIdxI(a, key, def);
 }
 
-const StaticString s_idx("idx");
+const StaticString s_idx("hh\\idx");
 
 TypedValue genericIdx(TypedValue obj, TypedValue key, TypedValue def) {
   static auto func = Unit::loadFunc(s_idx.get());
@@ -566,6 +566,12 @@ TypedValue genericIdx(TypedValue obj, TypedValue key, TypedValue def) {
   TypedValue ret;
   g_context->invokeFuncFew(&ret, func, nullptr, nullptr, 3, &args[0]);
   return ret;
+}
+
+TypedValue mapIdx(ObjectData* mapOD, StringData* key, TypedValue def) {
+  assert(collections::isType(mapOD->getVMClass(), CollectionType::Map) ||
+         collections::isType(mapOD->getVMClass(), CollectionType::ImmMap));
+  return getDefaultIfNullCell(static_cast<BaseMap*>(mapOD)->get(key), def);
 }
 
 int32_t arrayVsize(ArrayData* ad) {
@@ -751,6 +757,10 @@ void lookupClsMethodHelper(Class* cls,
     *arPreliveOverwriteCells(ar) = make_tv<KindOfString>(meth);
     throw;
   }
+}
+
+void profileObjClassHelper(ClassProfile* profile, ObjectData* obj) {
+  profile->reportClass(obj->getVMClass());
 }
 
 Cell lookupCnsUHelper(const TypedValue* tv,
@@ -1037,9 +1047,11 @@ Cell lookupClassConstantTv(TypedValue* cache,
 
 ObjectData* colAddNewElemCHelper(ObjectData* coll, TypedValue value) {
   collections::initElem(coll, &value);
-  // consume the input value. the collection setter either threw or created a
-  // reference to value, so we can use a cheaper decref.
-  tvRefcountedDecRefNZ(value);
+  // If we specialized this on Vector we could use a DecRefNZ here (since we
+  // could assume that initElem has incref'd the value).  Right now, HH\Set
+  // goes through this code path also, though, and it might fail to add the new
+  // element.
+  tvRefcountedDecRef(value);
   return coll;
 }
 
@@ -1216,11 +1228,6 @@ void registerLiveObj(ObjectData* obj) {
   g_context->m_liveBCObjs.insert(obj);
 }
 
-void unwindResumeHelper() {
-  tl_regState = VMRegState::CLEAN;
-  _Unwind_Resume(unwindRdsInfo->exn);
-}
-
 void throwSwitchMode() {
   // This is only called right after dispatchBB, so the VM regs really are
   // clean.
@@ -1258,9 +1265,10 @@ void bindElemC(TypedValue* base, TypedValue key, RefData* val,
   }
 }
 
-void setWithRefElemC(TypedValue* base, TypedValue key, TypedValue val,
+void setWithRefElemC(TypedValue* base, TypedValue keyTV, TypedValue val,
                      MInstrState* mis) {
-  base = HPHP::ElemD<false, false>(mis->tvScratch, mis->tvRef, base, key);
+  auto const keyC = tvToCell(&keyTV);
+  base = HPHP::ElemD<false, false>(mis->tvScratch, mis->tvRef, base, *keyC);
   if (base != &mis->tvScratch) {
     tvDup(val, *base);
   } else {

@@ -24,6 +24,7 @@
 #include "hphp/runtime/base/data-walker.h"
 #include "hphp/runtime/base/apc-handle.h"
 #include "hphp/runtime/base/apc-handle-defs.h"
+#include "hphp/runtime/base/apc-collection.h"
 #include "hphp/runtime/base/externals.h"
 #include "hphp/runtime/base/array-init.h"
 #include "hphp/runtime/base/array-iterator.h"
@@ -138,9 +139,7 @@ APCHandle::Pair APCObject::MakeAPCObject(APCHandle* obj, const Variant& value) {
   ObjectData *o = value.getObjectData();
   DataWalker walker(DataWalker::LookupFeature::DetectSerializable);
   DataWalker::DataFeature features = walker.traverseData(o);
-  if (features.isCircular() ||
-      features.hasCollection() ||
-      features.hasSerializableReference()) {
+  if (features.isCircular || features.hasSerializable) {
     return {nullptr, 0};
   }
   auto tmp = APCHandle::Create(value, false, true, true);
@@ -153,12 +152,13 @@ Variant APCObject::MakeObject(const APCHandle* handle) {
     auto const serObj = APCString::fromHandle(handle)->getStringData();
     return apc_unserialize(serObj->data(), serObj->size());
   }
+  if (handle->isAPCCollection()) {
+    return APCCollection::fromHandle(handle)->createObject();
+  }
   return APCObject::fromHandle(handle)->createObject();
 }
 
 Object APCObject::createObject() const {
-  Object obj;
-
   const Class* klass;
   if (auto const c = m_cls.left()) {
     klass = c;
@@ -167,11 +167,11 @@ Object APCObject::createObject() const {
     if (!klass) {
       Logger::Error("APCObject::getObject(): Cannot find class %s",
                     m_cls.right()->data());
-      return obj;
+      return Object{};
     }
   }
-  obj = ObjectData::newInstance(const_cast<Class*>(klass));
-  obj.get()->clearNoDestruct();
+  Object obj{const_cast<Class*>(klass)};
+  obj->clearNoDestruct();
 
   auto prop = props();
   auto const propEnd = prop + m_propCount;

@@ -60,6 +60,7 @@ constexpr int kTestImmRegLen = 5;  // only for rax -- special encoding
 // mutations don't "tear" on remote cpus.
 constexpr size_t kX64CacheLineSize = 64;
 constexpr size_t kX64CacheLineMask = kX64CacheLineSize - 1;
+const TCA kInvalidCatchTrace   = (TCA)(-1);
 
 //////////////////////////////////////////////////////////////////////
 
@@ -157,7 +158,8 @@ public:
   CodeGenFixups& cgFixups() { return m_fixups; }
   FreeStubList& freeStubList() { return m_freeStubs; }
   LiteralMap& literals() { return m_literals; }
-  void recordSyncPoint(CodeAddress frontier, Offset pcOff, Offset spOff);
+  Annotations& annotations() { return m_annotations; }
+  void recordSyncPoint(CodeAddress frontier, Fixup fix);
 
   DataBlock& globalData() { return code.data(); }
   Debug::DebugInfo* getDebugInfo() { return &m_debugInfo; }
@@ -380,6 +382,7 @@ private:
   FreeStubList       m_freeStubs;
   CodeGenFixups      m_fixups;
   LiteralMap         m_literals;
+  Annotations        m_annotations;
 
   // asize + acoldsize + afrozensize + gdatasize
   size_t             m_totalSize;
@@ -389,7 +392,7 @@ private:
   bool               m_useLLVM;
 };
 
-TCA fcallHelper(ActRec*, bool isClonedClosure);
+TCA fcallHelper(ActRec*);
 TCA funcBodyHelper(ActRec*);
 int64_t decodeCufIterHelper(Iter* it, TypedValue func);
 
@@ -448,6 +451,11 @@ extern __thread int64_t s_perfCounters[];
  * Handle a VM stack overflow condition by throwing an appropriate exception.
  */
 void handleStackOverflow(ActRec* calleeAR);
+
+/*
+ * Determine whether something is a stack overflow, and if so, handle it.
+ */
+void handlePossibleStackOverflow(ActRec* calleeAR);
 
 }}
 

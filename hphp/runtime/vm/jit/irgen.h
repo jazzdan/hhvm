@@ -111,6 +111,13 @@ void checkRefs(IRGS&, int64_t entryArDelta, const std::vector<bool>& mask,
  */
 void prepareEntry(IRGS&);
 
+/*
+ * Creates a no-op IR instruction that branches to an exit. These placeholder
+ * instructions are later removed after any passes that want to use them for
+ * their exits.
+ */
+void makeExitPlaceholder(IRGS&);
+
 //////////////////////////////////////////////////////////////////////
 
 /*
@@ -183,12 +190,19 @@ void endRegion(IRGS&);
 void endRegion(IRGS&, SrcKey);
 void endBlock(IRGS&, Offset next, bool nextIsMerge);
 
+/*
+ * When we're done creating the IRUnit, this function must be called to ensure
+ * all the IR invariants hold.
+ */
+void sealUnit(IRGS&);
+
 //////////////////////////////////////////////////////////////////////
 
 /*
- * Called when we're starting to inline something.
+ * Called when we're starting to inline something.  Returns true iff
+ * it succeeds.
  */
-void beginInlining(IRGS&,
+bool beginInlining(IRGS&,
                    unsigned numParams,
                    const Func* target,
                    Offset returnBcOffset);
@@ -240,6 +254,13 @@ Type predictedTypeFromStack(const IRGS&, BCSPOffset slot);
 Type provenTypeFromLocation(const IRGS&, const Location&);
 Type provenTypeFromLocal(const IRGS&, uint32_t locId);
 Type provenTypeFromStack(const IRGS&, BCSPOffset slot);
+
+/*
+ * Assuming env is ready to translate a member instruction, analyze the type of
+ * the base value and return an appropriately-specialized TypeConstraint if a
+ * supported operation is detected.
+ */
+TypeConstraint mInstrBaseConstraint(const IRGS& env, Type predicted);
 
 //////////////////////////////////////////////////////////////////////
 

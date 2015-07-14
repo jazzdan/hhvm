@@ -109,7 +109,7 @@ RegionFormer::RegionFormer(const RegionContext& ctx,
   , m_blockFinished(false)
   // TODO(#5703534): this is using a different TransContext than actual
   // translation will use.
-  , m_irgs(TransContext{kInvalidTransID, m_sk, ctx.spOffset})
+  , m_irgs(TransContext{kInvalidTransID, m_sk, ctx.spOffset}, TransFlags{0})
   , m_arStates(1)
   , m_numJmps(0)
   , m_inl(inl)
@@ -159,10 +159,10 @@ RegionDescPtr RegionFormer::go() {
     auto t = lt.type;
     if (t <= TCls) {
       irgen::assertTypeLocation(m_irgs, lt.location, t);
-      m_curBlock->addPredicted(m_sk, RegionDesc::TypePred{lt.location, t});
+      m_curBlock->addPreCondition(m_sk, {lt.location, t});
     } else if (emitPredictions) {
       irgen::predictTypeLocation(m_irgs, lt.location, t);
-      m_curBlock->addPredicted(m_sk, RegionDesc::TypePred{lt.location, t});
+      m_curBlock->addPredicted(m_sk, {lt.location, t});
     } else {
       irgen::checkTypeLocation(m_irgs, lt.location, t, m_ctx.bcOffset,
                                true /* outerOnly */);
@@ -170,6 +170,7 @@ RegionDescPtr RegionFormer::go() {
   }
   irgen::gen(m_irgs, EndGuards);
 
+  bool needsExitPlaceholder = true;
   while (true) {
     assertx(m_numBCInstrs <= RuntimeOption::EvalJitMaxRegionInstrs);
     if (m_numBCInstrs == RuntimeOption::EvalJitMaxRegionInstrs) {
@@ -213,15 +214,21 @@ RegionDescPtr RegionFormer::go() {
     auto const inlineReturn = irgen::isInlining(m_irgs) &&
       (isRet(m_inst.op()) || m_inst.op() == OpNativeImpl);
     try {
-      translateInstr(m_irgs, m_inst, true/*checkOuterTypeOnly*/);
+      translateInstr(m_irgs, m_inst,
+          true/*checkOuterTypeOnly*/,
+          needsExitPlaceholder);
     } catch (const FailedIRGen& exn) {
       FTRACE(1, "ir generation for {} failed with {}\n",
              m_inst.toString(), exn.what());
-      always_assert(!m_interp.count(m_sk));
+      always_assert_flog(
+        !m_interp.count(m_sk),
+        "Double PUNT trying to translate {}\n", m_inst
+      );
       m_interp.insert(m_sk);
       m_region.reset();
       break;
     }
+    needsExitPlaceholder = false;
 
     irgen::finishHHBC(m_irgs);
 
@@ -329,18 +336,7 @@ bool RegionFormer::prepareInstruction() {
 
   auto const inputInfos = getInputs(m_inst);
 
-  // Read types for all the inputs and apply MetaData.
-  auto newDynLoc = [&](const InputInfo& ii) {
-    auto dl = m_inst.newDynLoc(
-      ii.loc,
-      irgen::predictedTypeFromLocation(m_irgs, ii.loc)
-    );
-    FTRACE(2, "predictedTypeFromLocation: {} -> {}\n",
-           ii.loc.pretty(), dl->rtt);
-    return dl;
-  };
-
-  for (auto const& ii : inputInfos) m_inst.inputs.push_back(newDynLoc(ii));
+  for (auto const& ii : inputInfos) m_inst.inputs.push_back(ii.loc);
 
   // This reads valueClass from the inputs so it used to need to
   // happen after readMetaData.  But now readMetaData is gone ...
@@ -501,6 +497,10 @@ bool RegionFormer::tryInline(uint32_t& instrSize) {
   ctx.resumed = false;
   for (int i = 0; i < numArgs; ++i) {
     auto type = irgen::publicTopType(m_irgs, BCSPOffset{i});
+    if (!type.subtypeOfAny(TCell, TBoxedInitCell)) {
+      return refuse(folly::sformat("argument {}'s type was too strange ({})",
+                                   i, type.toString()));
+    }
     uint32_t paramIdx = numArgs - 1 - i;
     ctx.liveTypes.push_back({RegionDesc::Location::Local{paramIdx}, type});
   }
@@ -587,37 +587,35 @@ void RegionFormer::truncateLiterals() {
 }
 
 /*
- * Check if the current type for the location in ii is specific enough for what
- * the current opcode wants. If not, return false.
+ * Check if the current predicted type for the location in ii is specific
+ * enough for what the current opcode wants. If not, return false.
  */
 bool RegionFormer::consumeInput(int i, const InputInfo& ii) {
-  auto& rtt = m_inst.inputs[i]->rtt;
   if (ii.dontGuard) return true;
+  auto const type = irgen::predictedTypeFromLocation(m_irgs, ii.loc);
 
-  if (m_profiling && rtt <= TBoxedCell &&
+  if (m_profiling && type <= TBoxedCell &&
       (m_region->blocks().size() > 1 || !m_region->entry()->empty())) {
     // We don't want side exits when profiling, so only allow instructions that
     // consume refs at the beginning of the region.
     return false;
   }
 
-  if (!ii.dontBreak && !rtt.isKnownDataType()) {
+  if (!ii.dontBreak && !type.isKnownDataType()) {
     // Trying to consume a value without a precise enough type.
     FTRACE(1, "selectTracelet: {} tried to consume {}\n",
-           m_inst.toString(), m_inst.inputs[i]->pretty());
+           m_inst.toString(), m_inst.inputs[i].pretty());
     return false;
   }
 
-  if (!(rtt <= TBoxedCell) ||
-      m_inst.ignoreInnerType ||
-      ii.dontGuardInner) {
+  if (!(type <= TBoxedCell) || m_inst.ignoreInnerType || ii.dontGuardInner) {
     return true;
   }
 
-  if (!rtt.inner().isKnownDataType()) {
+  if (!type.inner().isKnownDataType()) {
     // Trying to consume a boxed value without a guess for the inner type.
     FTRACE(1, "selectTracelet: {} tried to consume ref {}\n",
-           m_inst.toString(), m_inst.inputs[i]->pretty());
+           m_inst.toString(), m_inst.inputs[i].pretty());
     return false;
   }
 
@@ -625,29 +623,39 @@ bool RegionFormer::consumeInput(int i, const InputInfo& ii) {
 }
 
 
-typedef std::function<void(const RegionDesc::Location&, Type)> VisitGuardFn;
+using VisitGuardFn =
+  std::function<void(const RegionDesc::Location&, Type, bool)>;
+
 /*
  * For every instruction in trace representing a tracelet guard, call func with
- * its location and type.
+ * its location and type, and whether or not it's an inner hint.
  */
 void visitGuards(IRUnit& unit, const VisitGuardFn& func) {
   using L = RegionDesc::Location;
+  const bool stopAtEndGuards = !RuntimeOption::EvalHHIRConstrictGuards;
   auto blocks = rpoSortCfg(unit);
   for (auto* block : blocks) {
     for (auto const& inst : *block) {
       switch (inst.op()) {
         case EndGuards:
+          if (stopAtEndGuards) return;
+          break;
+        case ExitPlaceholder:
+          if (stopAtEndGuards) break;
           return;
         case HintLocInner:
         case CheckLoc:
-          func(L::Local{inst.extra<LocalId>()->locId}, inst.typeParam());
+          func(L::Local{inst.extra<LocalId>()->locId},
+               inst.typeParam(),
+               inst.is(HintLocInner));
           break;
         case HintStkInner:
         case CheckStk:
         {
           auto bcSpOffset = inst.extra<RelOffsetData>()->bcSpOffset;
           auto offsetFromFp = inst.marker().spOff() - bcSpOffset;
-          func(L::Stack{offsetFromFp}, inst.typeParam());
+          func(L::Stack{offsetFromFp}, inst.typeParam(),
+               inst.is(HintStkInner));
           break;
         }
         default: break;
@@ -686,34 +694,47 @@ void RegionFormer::recordDependencies() {
   }
 
   auto guardMap = std::map<RegionDesc::Location,Type>{};
-  visitGuards(unit, [&](const RegionDesc::Location& loc, Type type) {
+  ITRACE(2, "Visiting guards\n");
+  auto hintMap = std::map<RegionDesc::Location,Type>{};
+  visitGuards(unit, [&](const RegionDesc::Location& loc, Type type, bool hint) {
+    Trace::Indent indent;
+    ITRACE(3, "{}: {}\n", show(loc), type);
     if (type <= TCls) return;
-    auto inret = guardMap.insert(std::make_pair(loc, type));
+    auto& whichMap = hint ? hintMap : guardMap;
+    auto inret = whichMap.insert(std::make_pair(loc, type));
     if (inret.second) return;
     auto& oldTy = inret.first->second;
-    if (oldTy == TGen) {
-      // This is the case that we see an inner type prediction for a GuardLoc
-      // that got relaxed to Gen.
-      return;
-    }
     oldTy &= type;
   });
 
   for (auto& kv : guardMap) {
+    auto const hint_it = hintMap.find(kv.first);
+    // If we have a hinted type that's better than the guarded type, we want to
+    // keep it around.  This can really only when a guard is relaxed away to
+    // Gen because we knew something was a BoxedCell statically, but we may
+    // need to keep information about what inner type we were predicting.
+    if (hint_it != end(hintMap) && hint_it->second < kv.second) {
+      auto const pred = RegionDesc::TypedLocation {
+        hint_it->first,
+        hint_it->second
+      };
+      FTRACE(1, "selectTracelet adding prediction {}\n", show(pred));
+      firstBlock.addPredicted(blockStart, pred);
+    }
     if (kv.second == TGen) {
-      // Guard was relaxed to Gen---don't record it.
+      // Guard was relaxed to Gen---don't record it.  But if there's a hint, we
+      // may have needed that (recorded already above).
       continue;
     }
-    auto const pred = RegionDesc::TypePred { kv.first, kv.second };
-    FTRACE(1, "selectTracelet adding guard {}\n", show(pred));
-    firstBlock.addPredicted(blockStart, pred);
+    auto const preCond = RegionDesc::TypedLocation { kv.first, kv.second };
+    ITRACE(1, "selectTracelet adding guard {}\n", show(preCond));
+    firstBlock.addPreCondition(blockStart, preCond);
   }
 
   if (changed) {
     printUnit(3, unit, " after guard relaxation ", nullptr,
               m_irgs.irb->guards());
   }
-
 }
 
 ///////////////////////////////////////////////////////////////////////////////

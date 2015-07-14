@@ -19,7 +19,7 @@
 #include <vector>
 #include "hphp/zend/zend-html.h"
 #include "hphp/runtime/base/array-init.h"
-#include "hphp/runtime/base/bstring.h"
+#include "hphp/util/bstring.h"
 #include "hphp/runtime/base/zend-string.h"
 #include "hphp/runtime/base/zend-url.h"
 #include "hphp/runtime/base/runtime-error.h"
@@ -114,14 +114,15 @@ Variant StringUtil::Explode(const String& input, const String& delimiter,
   return ret;
 }
 
-String StringUtil::Implode(const Variant& items, const String& delim) {
-  if (!isContainer(items)) {
+String StringUtil::Implode(const Variant& items, const String& delim,
+                           const bool checkIsContainer /* = true */) {
+  if (checkIsContainer && !isContainer(items)) {
     throw_param_is_not_container();
   }
   int size = getContainerSize(items);
   if (size == 0) return empty_string();
 
-  String* sitems = (String*)smart_malloc(size * sizeof(String));
+  String* sitems = (String*)req::malloc(size * sizeof(String));
   int len = 0;
   int lenDelim = delim.size();
   int i = 0;
@@ -137,20 +138,21 @@ String StringUtil::Implode(const Variant& items, const String& delim) {
   char *buffer = s.mutableData();
   const char *sdelim = delim.data();
   char *p = buffer;
-  for (int i = 0; i < size; i++) {
+  String &init_str = sitems[0];
+  int init_len = init_str.size();
+  memcpy(p, init_str.data(), init_len);
+  p += init_len;
+  sitems[0].~String();
+  for (int i = 1; i < size; i++) {
     String &item = sitems[i];
-    if (i && lenDelim) {
-      memcpy(p, sdelim, lenDelim);
-      p += lenDelim;
-    }
+    memcpy(p, sdelim, lenDelim);
+    p += lenDelim;
     int lenItem = item.size();
-    if (lenItem) {
-      memcpy(p, item.data(), lenItem);
-      p += lenItem;
-    }
+    memcpy(p, item.data(), lenItem);
+    p += lenItem;
     sitems[i].~String();
   }
-  smart_free(sitems);
+  req::free(sitems);
   assert(p - buffer == len);
   s.setSize(len);
   return s;

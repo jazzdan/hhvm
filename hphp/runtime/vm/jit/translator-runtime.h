@@ -38,6 +38,7 @@ struct MInstrState;
 namespace jit {
 //////////////////////////////////////////////////////////////////////
 
+struct ClassProfile;
 struct TypeConstraint;
 
 //////////////////////////////////////////////////////////////////////
@@ -144,6 +145,7 @@ TypedValue arrayIdxS(ArrayData*, StringData*, TypedValue);
 TypedValue arrayIdxSi(ArrayData*, StringData*, TypedValue);
 
 TypedValue genericIdx(TypedValue, TypedValue, TypedValue);
+TypedValue mapIdx(ObjectData*, StringData*, TypedValue);
 
 TypedValue getMemoKeyHelper(TypedValue tv);
 
@@ -165,6 +167,8 @@ typedef FixedStringMap<TCA,true> SSwitchMap;
 TCA sswitchHelperFast(const StringData* val, const SSwitchMap* table, TCA* def);
 
 void tv_release_generic(TypedValue* tv);
+
+void profileObjClassHelper(ClassProfile*, ObjectData*);
 
 Cell lookupCnsHelper(const TypedValue* tv,
                      StringData* nm,
@@ -215,11 +219,6 @@ rds::Handle lookupClsRDSHandle(const StringData* name);
  * request.
  */
 void registerLiveObj(ObjectData* obj);
-
-/*
- * Set tl_regState to CLEAN and call _Unwind_Resume.
- */
-void unwindResumeHelper();
 
 /*
  * Throw a VMSwitchMode exception.

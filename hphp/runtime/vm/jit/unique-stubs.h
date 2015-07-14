@@ -49,6 +49,8 @@ struct UniqueStubs {
    */
   TCA retHelper;
   TCA genRetHelper;  // version for generators
+  TCA asyncGenRetHelper;  // version for async generators
+
 
   /*
    * Returning from a function when the ActRec was called from jitted code but
@@ -58,6 +60,7 @@ struct UniqueStubs {
    */
   TCA debuggerRetHelper;
   TCA debuggerGenRetHelper;
+  TCA debuggerAsyncGenRetHelper;
 
   /*
    * Returning from a function where the ActRec was pushed by an
@@ -102,7 +105,7 @@ struct UniqueStubs {
    * Catch blocks jump to endCatchHelper when they've finished executing. If
    * the unwinder has set state indicating a return address to jump to, this
    * stub will load vmfp and vmsp and jump there. Otherwise, it calls
-   * unwindResumeHelper.
+   * _Unwind_Resume.
    */
   TCA endCatchHelper;
   TCA endCatchHelperPast;
@@ -115,6 +118,14 @@ struct UniqueStubs {
    */
   TCA freeManyLocalsHelper;
   TCA freeLocalsHelpers[kNumFreeLocalsHelpers];
+
+  /*
+   * A cold, expensive stub to DecRef a value with an unknown (but known to be
+   * refcounted) DataType. It saves all GP registers around the destructor
+   * call. The value should be in the first two argument registers (data,
+   * type).
+   */
+  TCA genDecRefHelper;
 
   /*
    * When we enter a func prologue based on a prediction of which
@@ -155,6 +166,12 @@ struct UniqueStubs {
    */
   TCA functionEnterHelper;
   TCA functionEnterHelperReturn;
+
+  /*
+   * Unique stub that is called when a JIT'd prologue has detected /either/ a
+   * surprise condition or a stack overflow.
+   */
+  TCA functionSurprisedOrStackOverflow;
 
   /*
    * BindCall stubs for immutable/non-immutable calls

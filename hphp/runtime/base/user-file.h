@@ -28,15 +28,15 @@ public:
   DECLARE_RESOURCE_ALLOCATION(UserFile);
 
   explicit UserFile(Class *cls,
-                    const SmartPtr<StreamContext>& context = nullptr);
+                    const req::ptr<StreamContext>& context = nullptr);
   virtual ~UserFile();
 
   // overriding ResourceData
-  const String& o_getClassNameHook() const { return classnameof(); }
+  const String& o_getClassNameHook() const override { return classnameof(); }
 
-  virtual int fd() const;
+  int fd() const override;
 
-  virtual bool open(const String& filename, const String& mode) {
+  bool open(const String& filename, const String& mode) override {
     return openImpl(filename, mode, 0);
   }
   bool openImpl(const String& filename, const String& mode, int options);
@@ -58,8 +58,8 @@ public:
   bool stat(struct stat* buf) override;
 
   Object await(uint16_t events, double timeout) override {
-    throw Object(SystemLib::AllocExceptionObject(
-      "Userstreams do not support awaiting"));
+    SystemLib::throwExceptionObject(
+      "Userstreams do not support awaiting");
   }
 
   Variant getWrapperMetaData() override { return Variant(m_obj); }

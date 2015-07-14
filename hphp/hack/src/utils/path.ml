@@ -8,34 +8,16 @@
  *
  *)
 
+include Sys
 
-type t = {
-  is_normalized: bool;
-  path: string;
-}
+type t = string
 
-let dummy_path: t = { is_normalized = true; path = ""; }
+let dummy_path : t = ""
 
-(**
- * Like Python's os.path.expanduser, though probably doesn't cover some cases.
- * Roughly follow's bash's tilde expansion:
- * http://www.gnu.org/software/bash/manual/html_node/Tilde-Expansion.html
- *
- * ~/foo -> /home/bob/foo if $HOME = "/home/bob"
- * ~joe/foo -> /home/joe/foo if joe's home is /home/joe
- *)
-let expanduser (path : string) : string =
-  Str.substitute_first
-    (Str.regexp "^~\\([^/]*\\)")
-    begin fun s ->
-      match Str.matched_group 1 s with
-        | "" ->
-          begin try Unix.getenv "HOME"
-          with Not_found -> (Unix.getpwuid (Unix.getuid())).Unix.pw_dir end
-        | unixname ->
-          try (Unix.getpwnam unixname).Unix.pw_dir
-          with Not_found -> Str.matched_string s end
-    path
+let cat = Sys_utils.cat
+let compare = Pervasives.compare
+let dirname = Filename.dirname
+let expanduser = Sys_utils.expanduser
 
 (**
  * Resolves a path (using realpath)
@@ -48,65 +30,35 @@ let expanduser (path : string) : string =
  * - paths are always absolute. So the empty string "" becomes
  *   the current directory (in absolute)
  *)
-let make (path : string) : t =
+let make path =
   match Sys_utils.realpath (expanduser path) with
-  | Some path ->
-    {
-      is_normalized=true;
-      path=path;
-    }
-  | None ->
-    {
-      is_normalized=false;
-      path=path;
-    }
+  | Some path -> path
+  | None -> path (* assert false? *)
 
-let to_string (path : t) : string =
-  path.path
+let to_string path = path
 
-let equal (path1 : t) (path2 : t) : bool =
-  path1.is_normalized = path2.is_normalized &&
-  path1.path = path2.path
+let concat path more =
+  make (Printf.sprintf "%s/%s" path more)
 
-let file_exists (path : t) : bool =
-  let file = to_string path in
-  Sys.file_exists file
-
-let is_directory (path : t) : bool =
-  let file = to_string path in
-  Sys.is_directory file
-
-let is_normalized (path : t) : bool =
-  path.is_normalized
-
-let concat (path : t) (more : string) : t =
-  let path = to_string path in
-  let path = Printf.sprintf "%s/%s" path more in
-  make path
-
-let remove (path : t) : unit =
-  let file = to_string path in
-  Sys.remove file
-
-let parent (path : t) : t =
-  let s = to_string path in
+let parent path =
   if is_directory path
-  then make (s ^ "/../")
-  else make (Filename.dirname s)
+  then make (path ^ "/../")
+  else make (Filename.dirname path)
 
-let slash_escaped_string_of_path (path: t) : string =
-  let path_str = to_string path in
-  let buf = Buffer.create (String.length path_str) in
+let output = output_string
+
+let slash_escaped_string_of_path path =
+  let buf = Buffer.create (String.length path) in
   String.iter (fun ch ->
     match ch with
     | '/' -> Buffer.add_string buf "zS"
     | '\x00' -> Buffer.add_string buf "z0"
     | 'z' -> Buffer.add_string buf "zZ"
     | _ -> Buffer.add_char buf ch
-  ) path_str;
+  ) path;
   Buffer.contents buf
 
-let path_of_slash_escaped_string (str: string) : t =
+let path_of_slash_escaped_string str =
   let length = String.length str in
   let buf = Buffer.create length in
   let rec consume i =

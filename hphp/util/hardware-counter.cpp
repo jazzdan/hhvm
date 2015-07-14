@@ -277,15 +277,17 @@ void HardwareCounter::IncStoreCount(int64_t amount) {
 struct PerfTable perfTable[] = {
   /* PERF_TYPE_HARDWARE events */
 #define PC(n)    PERF_TYPE_HARDWARE, PERF_COUNT_HW_ ## n
-  { "cpu-cycles",          PC(CPU_CYCLES)          },
-  { "cycles",              PC(CPU_CYCLES)          },
-  { "instructions",        PC(INSTRUCTIONS)        },
-  { "cache-references",    PC(CACHE_REFERENCES)    },
-  { "cache-misses",        PC(CACHE_MISSES)        },
-  { "branch-instructions", PC(BRANCH_INSTRUCTIONS) },
-  { "branches",            PC(BRANCH_INSTRUCTIONS) },
-  { "branch-misses",       PC(BRANCH_MISSES)       },
-  { "bus-cycles",          PC(BUS_CYCLES)          },
+  { "cpu-cycles",              PC(CPU_CYCLES)              },
+  { "cycles",                  PC(CPU_CYCLES)              },
+  { "instructions",            PC(INSTRUCTIONS)            },
+  { "cache-references",        PC(CACHE_REFERENCES)        },
+  { "cache-misses",            PC(CACHE_MISSES)            },
+  { "branch-instructions",     PC(BRANCH_INSTRUCTIONS)     },
+  { "branches",                PC(BRANCH_INSTRUCTIONS)     },
+  { "branch-misses",           PC(BRANCH_MISSES)           },
+  { "bus-cycles",              PC(BUS_CYCLES)              },
+  { "stalled-cycles-frontend", PC(STALLED_CYCLES_FRONTEND) },
+  { "stalled-cycles-backend",  PC(STALLED_CYCLES_BACKEND)  },
 
   /* PERF_TYPE_HW_CACHE hw_cache_id */
 #define PCC(n)   PERF_TYPE_HW_CACHE, PERF_COUNT_HW_CACHE_ ## n
@@ -372,6 +374,15 @@ bool HardwareCounter::addPerfEvent(const char* event) {
   }
 
   checkLLCHack(event, type, config);
+
+  // Check if we have a raw spec.
+  if (!found && event[0] == 'r' && event[1] != 0) {
+    config = strtoull(event + 1, const_cast<char**>(&ev), 16);
+    if (*ev == 0) {
+      found = true;
+      type = PERF_TYPE_RAW;
+    }
+  }
 
   if (!found || *ev) {
     Logger::Warning("failed to find perf event: %s", event);

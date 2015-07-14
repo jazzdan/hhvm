@@ -31,6 +31,7 @@
 #include "hphp/runtime/vm/jit/srcdb.h"
 #include "hphp/runtime/vm/jit/trans-rec.h"
 #include "hphp/runtime/vm/jit/type.h"
+#include "hphp/runtime/vm/jit/recycle-tc.h"
 #include "hphp/runtime/vm/jit/unique-stubs.h"
 #include "hphp/runtime/vm/jit/write-lease.h"
 
@@ -125,6 +126,7 @@ struct TransContext {
   FPInvOffset initSpOffset;
   const Func* func;
   Offset initBcOffset;
+  bool prologue;
   bool resumed;
 };
 
@@ -179,7 +181,6 @@ struct Translator {
    * If no SrcRec exists, insert one into the SrcDB.
    */
   SrcRec* getSrcRec(SrcKey sk);
-
 
   /////////////////////////////////////////////////////////////////////////////
   // Configuration.
@@ -542,32 +543,6 @@ const InstrInfo& getInstrInfo(Op op);
  */
 bool dontGuardAnyInputs(Op op);
 
-
-///////////////////////////////////////////////////////////////////////////////
-// Property information.
-
-struct PropInfo {
-  PropInfo()
-    : offset(-1)
-    , repoAuthType{}
-  {}
-
-  explicit PropInfo(int offset, RepoAuthType repoAuthType)
-    : offset(offset)
-    , repoAuthType{repoAuthType}
-  {}
-
-  int offset;
-  RepoAuthType repoAuthType;
-};
-
-PropInfo getPropertyOffset(const IRGS& env,
-                           const NormalizedInstruction& ni,
-                           const Class* ctx,
-                           const Class*& baseClass,
-                           const MInstrInfo& mii,
-                           unsigned mInd, unsigned iInd);
-
 ///////////////////////////////////////////////////////////////////////////////
 // Other instruction information.
 
@@ -615,9 +590,18 @@ const Func* lookupImmutableMethod(const Class* cls, const StringData* name,
                                   const Class* ctx);
 
 /*
+ * If possible find the constructor for cls that would be run from the context
+ * ctx if a new instance of cls were created there. If the class fails to be
+ * unique, or in non-repo-authoritative mode this function will always return
+ * nullptr. Additionally if the constructor is inaccessible from the given
+ * context this function will return nullptr.
+ */
+const Func* lookupImmutableCtor(const Class* cls, const Class* ctx);
+
+/*
  * Return true if type is passed in/out of C++ as String&/Array&/Object&.
  */
-inline bool isSmartPtrRef(MaybeDataType t) {
+inline bool isReqPtrRef(MaybeDataType t) {
   return t == KindOfString || t == KindOfStaticString ||
          t == KindOfArray || t == KindOfObject ||
          t == KindOfResource;
@@ -642,7 +626,8 @@ int locPhysicalOffset(int32_t localIndex);
 void translateInstr(
   IRGS&,
   const NormalizedInstruction&,
-  bool checkOuterTypeOnly
+  bool checkOuterTypeOnly,
+  bool needsExitPlaceholder
 );
 
 extern bool tc_dump();

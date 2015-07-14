@@ -514,12 +514,13 @@ struct Index {
 
   /*
    * Lookup the best known type for a public static property, with a given
-   * class type and name type.
+   * class and name.
    *
    * This function will always return TInitGen before refine_public_statics has
    * been called, or if the AnalyzePublicStatics option is off.
    */
   Type lookup_public_static(Type cls, Type name) const;
+  Type lookup_public_static(borrowed_ptr<const php::Class>, SString name) const;
 
   /*
    * Returns whether a public static property is known to be immutable.  This
@@ -528,6 +529,14 @@ struct Index {
    */
   bool lookup_public_static_immutable(borrowed_ptr<const php::Class>,
                                       SString name) const;
+
+  /*
+   * Returns the computed vtable slot for the given class, if it's an interface
+   * that was given a vtable slot. No two interfaces implemented by the same
+   * class will share the same vtable slot. May return kInvalidSlot, if the
+   * given class isn't an interface or if it wasn't assigned a slot.
+   */
+  Slot lookup_iface_vtable_slot(borrowed_ptr<const php::Class>) const;
 
   /*
    * Refine the return type for a function, based on a round of

@@ -34,15 +34,12 @@ struct FrameStateMgr;
  */
 void optimizeRefcounts2(IRUnit&);
 void optimizePredictions(IRUnit&);
+void hoistTypeChecks(IRUnit&);
 void gvn(IRUnit&);
 void optimizeLoads(IRUnit&);
 void optimizeStores(IRUnit&);
+void optimizeLoopInvariantCode(IRUnit&);
 void cleanCfg(IRUnit&);
-
-/*
- * DCE runs in between various passes.
- */
-void eliminateDeadCode(IRUnit&);
 
 /*
  * For debugging, we can run this pass, which inserts various sanity checking

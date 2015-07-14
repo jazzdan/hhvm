@@ -26,7 +26,7 @@ namespace HPHP {
 StaticString s_call("__call");
 
 UserFSNode::UserFSNode(Class* cls,
-                       const SmartPtr<StreamContext>& context /*= nullptr */) {
+                       const req::ptr<StreamContext>& context /*= nullptr */) {
   VMRegAnchor _;
   const Func* ctor;
   m_cls = cls;
@@ -35,7 +35,7 @@ UserFSNode::UserFSNode(Class* cls,
     raise_error("Unable to call %s'n constructor", m_cls->name()->data());
   }
 
-  m_obj = ObjectData::newInstance(m_cls);
+  m_obj = Object{m_cls};
   m_obj.o_set("context", Variant(context));
   Variant ret;
   g_context->invokeFuncFew(ret.asTypedValue(), ctor, m_obj.get());

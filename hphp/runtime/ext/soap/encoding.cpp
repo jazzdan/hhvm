@@ -2680,19 +2680,19 @@ static Variant guess_zval_convert(encodeTypePtr type, xmlNodePtr data) {
   }
   ret = master_to_zval_int(enc, data);
   if (SOAP_GLOBAL(sdl) && type_name && enc->details.sdl_type) {
-    ObjectData* obj = ObjectData::newInstance(SoapVar::getClass());
-    SoapVar::setEncType(obj, enc->details.type);
-    SoapVar::setEncValue(obj, ret);
+    Object obj{SoapVar::getClass()};
+    SoapVar::setEncType(obj.get(), enc->details.type);
+    SoapVar::setEncValue(obj.get(), ret);
 
     string ns, cptype;
     parse_namespace(type_name, cptype, ns);
     xmlNsPtr nsptr = xmlSearchNs(data->doc, data, NS_STRING(ns));
 
-    SoapVar::setEncSType(obj, cptype);
+    SoapVar::setEncSType(obj.get(), cptype);
     if (nsptr) {
-      SoapVar::setEncNS(obj, String((char*)nsptr->href, CopyString));
+      SoapVar::setEncNS(obj.get(), String((char*)nsptr->href, CopyString));
     }
-    ret = Object(obj);
+    ret = std::move(obj);
   }
   return ret;
 }
@@ -2718,11 +2718,11 @@ static xmlNodePtr to_xml_datetime_ex(encodeTypePtr type, const Variant& data,
     ta = localtime_r(&timestamp, &tmbuf);
     /*ta = php_gmtime_r(&timestamp, &tmbuf);*/
 
-    buf = (char *)smart_malloc(buf_len);
+    buf = (char *)req::malloc(buf_len);
     while ((real_len = strftime(buf, buf_len, format, ta)) == buf_len ||
            real_len == 0) {
       buf_len *= 2;
-      buf = (char *)smart_realloc(buf, buf_len);
+      buf = (char *)req::realloc(buf, buf_len);
       if (!--max_reallocs) break;
     }
 
@@ -2737,12 +2737,12 @@ static xmlNodePtr to_xml_datetime_ex(encodeTypePtr type, const Variant& data,
       real_len += 6;
     }
     if (real_len >= buf_len) {
-      buf = (char *)smart_realloc(buf, real_len+1);
+      buf = (char *)req::realloc(buf, real_len+1);
     }
     strcat(buf, tzbuf);
 
     xmlNodeSetContent(xmlParam, BAD_CAST(buf));
-    smart_free(buf);
+    req::free(buf);
   } else if (data.isString()) {
     String sdata = data.toString();
     xmlNodeSetContentLen(xmlParam, BAD_CAST(sdata.data()), sdata.size());

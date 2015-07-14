@@ -4,6 +4,8 @@
 #include "hphp/runtime/vm/native-data.h"
 #include "hphp/runtime/ext/asio/asio-external-thread-event.h"
 
+#include <memory>
+
 #include "mcrouter/config.h" // @nolint
 #include "mcrouter/options.h" // @nolint
 #include "mcrouter/McrouterClient.h" // @nolint
@@ -33,14 +35,13 @@ static Object mcr_getException(const std::string& message,
     assert(c_MCRouterException);
   }
 
-  auto objdata = ObjectData::newInstance(c_MCRouterException);
-  Object obj(objdata);
+  Object obj{c_MCRouterException};
   TypedValue ret;
   g_context->invokeFunc(
     &ret,
     c_MCRouterException->getCtor(),
     make_packed_array(message, (int64_t)op, (int64_t)reply, key),
-    objdata);
+    obj.get());
   tvRefcountedDecRef(&ret);
   return obj;
 }
@@ -63,14 +64,13 @@ static Object mcr_getOptionException(
     errorArray.append(e);
   }
 
-  auto objdata = ObjectData::newInstance(c_MCRouterOptionException);
-  Object obj(objdata);
+  Object obj{c_MCRouterOptionException};
   TypedValue ret;
   g_context->invokeFunc(
     &ret,
     c_MCRouterOptionException->getCtor(),
     make_packed_array(errorArray),
-    objdata);
+    obj.get());
   return obj;
 }
 
@@ -94,7 +94,13 @@ class MCRouter {
 
     mcr::McrouterInstance* router;
     if (pid.empty()) {
+      /* TODO(t7574316): clean up */
+#ifdef HPHP_OSS
       router = mcr::McrouterInstance::createTransient(opts);
+#else
+      m_transientRouter = mcr::McrouterInstance::create(opts.clone());
+      router = m_transientRouter.get();
+#endif  /* HPHP_OSS */
     } else {
       router = mcr::McrouterInstance::init(pid.toCppString(), opts);
     }
@@ -116,6 +122,7 @@ class MCRouter {
   Object issue(mcr::mcrouter_msg_t& msg);
 
  private:
+  std::shared_ptr<mcr::McrouterInstance> m_transientRouter;
   mcr::McrouterClient::Pointer m_client;
 
   void parseOptions(mc::McrouterOptions& opts, const Array& options) {
@@ -166,7 +173,6 @@ class MCRouterResult : public AsioExternalThreadEvent {
       // Deferred string init, see below
       m_result.m_data.pstr = StringData::Make(
         m_stringResult.c_str(), m_stringResult.size(), CopyString);
-      m_result.m_data.pstr->setRefCount(1);
       m_stringResult.clear();
     }
     cellDup(m_result, c);

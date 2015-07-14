@@ -14,6 +14,7 @@
    +----------------------------------------------------------------------+
 */
 #include "hphp/runtime/vm/bytecode.h"
+#include "hphp/runtime/vm/bytecode-defs.h"
 
 #include <algorithm>
 #include <string>
@@ -23,7 +24,7 @@
 #include <iomanip>
 #include <cinttypes>
 
-#include <boost/format.hpp>
+#include <boost/filesystem.hpp>
 
 #include <libgen.h>
 #include <sys/mman.h>
@@ -78,15 +79,15 @@
 #include "hphp/runtime/vm/native.h"
 #include "hphp/runtime/vm/resumable.h"
 #include "hphp/runtime/ext/ext_closure.h"
-#include "hphp/runtime/ext/ext_generator.h"
+#include "hphp/runtime/ext/generator/ext_generator.h"
 #include "hphp/runtime/ext/apc/ext_apc.h"
 #include "hphp/runtime/ext/array/ext_array.h"
-#include "hphp/runtime/ext/asio/async-function-wait-handle.h"
-#include "hphp/runtime/ext/asio/async-generator.h"
-#include "hphp/runtime/ext/asio/async-generator-wait-handle.h"
-#include "hphp/runtime/ext/asio/static-wait-handle.h"
-#include "hphp/runtime/ext/asio/wait-handle.h"
-#include "hphp/runtime/ext/asio/waitable-wait-handle.h"
+#include "hphp/runtime/ext/asio/ext_async-function-wait-handle.h"
+#include "hphp/runtime/ext/asio/ext_async-generator.h"
+#include "hphp/runtime/ext/asio/ext_async-generator-wait-handle.h"
+#include "hphp/runtime/ext/asio/ext_static-wait-handle.h"
+#include "hphp/runtime/ext/asio/ext_wait-handle.h"
+#include "hphp/runtime/ext/asio/ext_waitable-wait-handle.h"
 #include "hphp/runtime/ext/hh/ext_hh.h"
 #include "hphp/runtime/ext/reflection/ext_reflection.h"
 #include "hphp/runtime/ext/std/ext_std_function.h"
@@ -104,7 +105,7 @@
 #include "hphp/runtime/base/container-functions.h"
 
 #include "hphp/system/systemlib.h"
-#include "hphp/runtime/ext/ext_collections.h"
+#include "hphp/runtime/ext/collections/ext_collections-idl.h"
 
 #include "hphp/runtime/vm/globals-array.h"
 
@@ -134,11 +135,12 @@ TRACE_SET_MOD(bcinterp);
 
 // Identifies the set of return helpers that we may set m_savedRip to in an
 // ActRec.
-static bool isReturnHelper(void* address) {
+bool isReturnHelper(void* address) {
   auto tcAddr = reinterpret_cast<jit::TCA>(address);
   auto& u = mcg->tx().uniqueStubs;
   return tcAddr == u.retHelper ||
          tcAddr == u.genRetHelper ||
+         tcAddr == u.asyncGenRetHelper ||
          tcAddr == u.retInlHelper ||
          tcAddr == u.callToExit;
 }
@@ -147,7 +149,8 @@ bool isDebuggerReturnHelper(void* address) {
   auto tcAddr = reinterpret_cast<jit::TCA>(address);
   auto& u = mcg->tx().uniqueStubs;
   return tcAddr == u.debuggerRetHelper ||
-         tcAddr == u.debuggerGenRetHelper;
+         tcAddr == u.debuggerGenRetHelper ||
+         tcAddr == u.debuggerAsyncGenRetHelper;
 }
 
 ActRec* ActRec::sfp() const {
@@ -171,13 +174,6 @@ void ActRec::setJitReturn(void* addr) {
   FTRACE(1, "Replace m_savedRip in fp {}, {:#x} -> {}, func {}\n",
          this, m_savedRip, addr, m_func->fullName()->data());
   m_savedRip = reinterpret_cast<uintptr_t>(addr);
-}
-
-void ActRec::setReturnVMExit() {
-  assert(isReturnHelper(mcg->tx().uniqueStubs.callToExit));
-  m_sfp = nullptr;
-  m_savedRip = reinterpret_cast<uintptr_t>(mcg->tx().uniqueStubs.callToExit);
-  m_soff = 0;
 }
 
 bool
@@ -234,6 +230,7 @@ const StaticString s___call("__call");
 const StaticString s___callStatic("__callStatic");
 const StaticString s_file("file");
 const StaticString s_line("line");
+const StaticString s_getWaitHandle("getWaitHandle");
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -242,6 +239,7 @@ const StaticString s_line("line");
 
 inline const char* prettytype(int) { return "int"; }
 inline const char* prettytype(long) { return "long"; }
+inline const char* prettytype(long long) { return "long long"; }
 inline const char* prettytype(double) { return "double"; }
 inline const char* prettytype(unsigned) { return "unsigned"; }
 inline const char* prettytype(OODeclExistsOp) { return "OpDeclExistsOp"; }
@@ -253,6 +251,7 @@ inline const char* prettytype(ObjMethodOp) { return "ObjMethodOp"; }
 inline const char* prettytype(BareThisOp) { return "BareThisOp"; }
 inline const char* prettytype(InitPropOp) { return "InitPropOp"; }
 inline const char* prettytype(SilenceOp) { return "SilenceOp"; }
+inline const char* prettytype(SwitchKind) { return "SwitchKind"; }
 
 // load a T value from *pc without incrementing
 template<class T> T peek(PC pc) {
@@ -326,7 +325,7 @@ const StaticString s_GLOBALS("GLOBALS");
 
 void VarEnv::createGlobal() {
   assert(!g_context->m_globalVarEnv);
-  g_context->m_globalVarEnv = smart_new<VarEnv>();
+  g_context->m_globalVarEnv = req::make_raw<VarEnv>();
 }
 
 VarEnv::VarEnv()
@@ -337,9 +336,14 @@ VarEnv::VarEnv()
 {
   TRACE(3, "Creating VarEnv %p [global scope]\n", this);
   auto globals = new (MM().objMalloc(sizeof(GlobalsArray)))
-                 GlobalsArray(&m_nvTable);
+    GlobalsArray(&m_nvTable);
+  assert(globals->hasExactlyOneRef());
+
   auto globalArray = make_tv<KindOfArray>(globals->asArrayData());
   m_nvTable.set(s_GLOBALS.get(), &globalArray);
+
+  assert(globals->hasMultipleRefs());
+  globals->decRefCount();
 }
 
 VarEnv::VarEnv(ActRec* fp, ExtraArgs* eArgs)
@@ -374,7 +378,7 @@ VarEnv::~VarEnv() {
   if (isGlobalScope()) {
     /*
      * When detaching the global scope, we leak any live objects (and
-     * let the smart allocator clean them up).  This is because we're
+     * let MemoryManager clean them up).  This is because we're
      * not supposed to run destructors for objects that are live at
      * the end of a request.
      */
@@ -382,12 +386,16 @@ VarEnv::~VarEnv() {
   }
 }
 
+void VarEnv::deallocate(ActRec* fp) {
+  fp->m_varEnv->exitFP(fp);
+}
+
 VarEnv* VarEnv::createLocal(ActRec* fp) {
-  return smart_new<VarEnv>(fp, fp->getExtraArgs());
+  return req::make_raw<VarEnv>(fp, fp->getExtraArgs());
 }
 
 VarEnv* VarEnv::clone(ActRec* fp) const {
-  return smart_new<VarEnv>(this, fp);
+  return req::make_raw<VarEnv>(this, fp);
 }
 
 void VarEnv::suspend(const ActRec* oldFP, ActRec* newFP) {
@@ -433,7 +441,7 @@ void VarEnv::exitFP(ActRec* fp) {
 
     // don't free global VarEnv
     if (!isGlobalScope()) {
-      smart_delete(this);
+      req::destroy_raw(this);
     }
   } else {
     auto const prevFP = g_context->getPrevVMState(fp);
@@ -492,11 +500,11 @@ Array VarEnv::getDefinedVariables() const {
   }
   {
     // Make result independent of the hashtable implementation.
-    ArrayData* sorted = ret.get()->escalateForSort(SORTFUNC_KSORT);
-    assert(sorted == ret.get() || sorted->getCount() == 0);
+    ArrayData* sorted = ret->escalateForSort(SORTFUNC_KSORT);
+    assert(sorted == ret.get() || sorted->hasExactlyOneRef());
     SCOPE_EXIT {
       if (sorted != ret.get()) {
-        ret = sorted;
+        ret = Array::attach(sorted);
       }
     };
     sorted->ksort(0, true);
@@ -515,7 +523,7 @@ ExtraArgs::~ExtraArgs() {}
 
 void* ExtraArgs::allocMem(unsigned nargs) {
   assert(nargs > 0);
-  return smart_malloc(sizeof(TypedValue) * nargs + sizeof(ExtraArgs));
+  return req::malloc(sizeof(TypedValue) * nargs + sizeof(ExtraArgs));
 }
 
 ExtraArgs* ExtraArgs::allocateCopy(TypedValue* args, unsigned nargs) {
@@ -537,12 +545,11 @@ ExtraArgs* ExtraArgs::allocateUninit(unsigned nargs) {
 
 void ExtraArgs::deallocate(ExtraArgs* ea, unsigned nargs) {
   assert(nargs > 0);
-
   for (unsigned i = 0; i < nargs; ++i) {
     tvRefcountedDecRef(ea->m_extraArgs + i);
   }
   ea->~ExtraArgs();
-  smart_free(ea);
+  req::free(ea);
 }
 
 void ExtraArgs::deallocate(ActRec* ar) {
@@ -568,12 +575,9 @@ TypedValue* ExtraArgs::getExtraArg(unsigned argInd) const {
 
 // Store actual stack elements array in a thread-local in order to amortize the
 // cost of allocation.
-class StackElms {
- public:
-  StackElms() : m_elms(nullptr) {}
-  ~StackElms() {
-    flush();
-  }
+namespace {
+struct StackElms {
+  ~StackElms() { flush(); }
   TypedValue* elms() {
     if (m_elms == nullptr) {
       // RuntimeOption::EvalVMStackElms-sized and -aligned.
@@ -595,27 +599,31 @@ class StackElms {
       m_elms = nullptr;
     }
   }
- private:
-  TypedValue* m_elms;
+private:
+  TypedValue* m_elms{nullptr};
 };
 IMPLEMENT_THREAD_LOCAL(StackElms, t_se);
+}
 
 const int Stack::sSurprisePageSize = sysconf(_SC_PAGESIZE);
 // We reserve the bottom page of each stack for use as the surprise
 // page, so the minimum useful stack size is the next power of two.
-const uint Stack::sMinStackElms = 2 * sSurprisePageSize / sizeof(TypedValue);
+const uint32_t Stack::sMinStackElms =
+  2 * sSurprisePageSize / sizeof(TypedValue);
 
 void Stack::ValidateStackSize() {
   if (RuntimeOption::EvalVMStackElms < sMinStackElms) {
-    throw std::runtime_error(str(
-      boost::format("VM stack size of 0x%llx is below the minimum of 0x%x")
-        % RuntimeOption::EvalVMStackElms
-        % sMinStackElms));
+    throw std::runtime_error(folly::sformat(
+      "VM stack size of {:#x} is below the minimum of {:#x}",
+      RuntimeOption::EvalVMStackElms,
+      sMinStackElms
+    ));
   }
   if (!folly::isPowTwo(RuntimeOption::EvalVMStackElms)) {
-    throw std::runtime_error(str(
-      boost::format("VM stack size of 0x%llx is not a power of 2")
-        % RuntimeOption::EvalVMStackElms));
+    throw std::runtime_error(folly::sformat(
+      "VM stack size of {:#x} is not a power of 2",
+      RuntimeOption::EvalVMStackElms
+    ));
   }
 }
 
@@ -627,13 +635,21 @@ Stack::~Stack() {
   requestExit();
 }
 
-void
-Stack::requestInit() {
+void Stack::requestInit() {
   m_elms = t_se->elms();
   // Burn one element of the stack, to satisfy the constraint that
   // valid m_top values always have the same high-order (>
   // log(RuntimeOption::EvalVMStackElms)) bits.
   m_top = m_base = m_elms + RuntimeOption::EvalVMStackElms - 1;
+
+  rds::header()->stackLimitAndSurprise.store(
+    reinterpret_cast<uintptr_t>(
+      reinterpret_cast<char*>(m_elms) + sSurprisePageSize +
+        kStackCheckPadding * sizeof(Cell)
+    ),
+    std::memory_order_release
+  );
+  assert(!(rds::header()->stackLimitAndSurprise.load() & kSurpriseFlagMask));
 
   // Because of the surprise page at the bottom of the stack we lose an
   // additional 256 elements which must be taken into account when checking for
@@ -644,8 +660,7 @@ Stack::requestInit() {
   assert(wouldOverflow(maxelms));
 }
 
-void
-Stack::requestExit() {
+void Stack::requestExit() {
   m_elms = nullptr;
 }
 
@@ -662,7 +677,7 @@ void flush_evaluation_stack() {
      * It is possible to create a new thread, but then not use it
      * because another thread became available and stole the job.
      * If that thread becomes idle, it will have a g_context, and
-     * some smart allocated memory
+     * some request-allocated memory
      */
     hphp_memory_cleanup();
   }
@@ -1256,15 +1271,12 @@ ObjectData* ExecutionContext::createObject(StringData* clsName,
 ObjectData* ExecutionContext::createObject(const Class* class_,
                                            const Variant& params,
                                            bool init) {
-  Object o;
-  o = newInstance(const_cast<Class*>(class_));
+  auto o = Object::attach(newInstance(const_cast<Class*>(class_)));
   if (init) {
     initObject(class_, params, o.get());
   }
 
-  ObjectData* ret = o.detach();
-  ret->decRefCount();
-  return ret;
+  return o.detach();
 }
 
 ObjectData* ExecutionContext::createObjectOnly(StringData* clsName) {
@@ -1284,7 +1296,7 @@ ObjectData* ExecutionContext::initObject(const Class* class_,
   if (!(ctor->attrs() & AttrPublic)) {
     std::string msg = "Access to non-public constructor of class ";
     msg += class_->name()->data();
-    throw Object(Reflection::AllocReflectionExceptionObject(msg));
+    throw Reflection::AllocReflectionExceptionObject(msg);
   }
   // call constructor
   if (!isContainerOrNull(params)) {
@@ -1681,7 +1693,7 @@ static NEVER_INLINE void shuffleMagicArrayArgs(ActRec* ar, const Cell args,
       for (ArrayIter iter(args); iter; ++iter) {
         ai.appendWithRef(iter.secondRefPlus());
       }
-      stack.pushArray(ai.create());
+      stack.pushArrayNoRc(ai.create());
     }
   }
 
@@ -1818,8 +1830,8 @@ static bool prepareArrayArgs(ActRec* ar, const Cell args,
     assert(!iter); // iter should now be exhausted
     if (hasVarParam) {
       auto const ad = ai.create();
-      stack.pushArray(ad);
       assert(ad->hasExactlyOneRef());
+      stack.pushArrayNoRc(ad);
     }
     ar->initNumArgs(nargs);
     ar->setExtraArgs(extraArgs);
@@ -1851,8 +1863,8 @@ static bool prepareArrayArgs(ActRec* ar, const Cell args,
       }
       assert(!iter); // iter should now be exhausted
       auto const ad = ai.create();
-      stack.pushArray(ad);
       assert(ad->hasExactlyOneRef());
+      stack.pushArrayNoRc(ad);
     }
     ar->initNumArgs(f->numParams());
   }
@@ -1965,8 +1977,7 @@ void ExecutionContext::syncGdbState() {
 static void dispatch();
 static void enterVMAtCurPC();
 
-static void enterVMAtAsyncFunc(ActRec* enterFnAr, Resumable* resumable,
-                               ObjectData* exception) {
+static void prepareAsyncFuncEntry(ActRec* enterFnAr, Resumable* resumable) {
   assert(enterFnAr);
   assert(enterFnAr->func()->isAsync());
   assert(enterFnAr->resumed());
@@ -1976,20 +1987,6 @@ static void enterVMAtAsyncFunc(ActRec* enterFnAr, Resumable* resumable,
   vmpc() = vmfp()->func()->unit()->at(resumable->resumeOffset());
   assert(vmfp()->func()->contains(vmpc()));
   EventHook::FunctionResumeAwait(enterFnAr);
-
-  if (UNLIKELY(exception != nullptr)) {
-    assert(exception->instanceof(SystemLib::s_ExceptionClass));
-    Object e(exception);
-    throw e;
-  }
-
-  const bool useJit = RID().getJit();
-  if (LIKELY(useJit && resumable->resumeAddr())) {
-    Stats::inc(Stats::VMEnter);
-    mcg->enterTCAfterPrologue(resumable->resumeAddr());
-  } else {
-    enterVMAtCurPC();
-  }
 }
 
 static void enterVMAtFunc(ActRec* enterFnAr,
@@ -2054,21 +2051,16 @@ static void enterVMAtCurPC() {
 }
 
 /**
- * Enter VM and invoke a function or resume an async function. The 'ar'
- * argument points to an ActRec of the invoked/resumed function. When
- * an async function is resumed, a 'pc' pointing to the resume location
- * inside the async function must be provided. Optionally, the resumed
- * async function will throw an 'exception' upon entering VM if passed.
+ * Enter VM by calling action(), which invokes a function or resumes
+ * an async function. The 'ar' argument points to an ActRec of the
+ * invoked/resumed function.
  */
-static void enterVM(ActRec* ar, StackArgsState stk,
-                    Resumable* resumable,
-                    ObjectData* exception,
-                    VarEnv* varEnv) {
+template<class Action>
+static inline void enterVMCustomHandler(ActRec* ar, Action action) {
   assert(ar);
   assert(!ar->sfp());
   assert(isReturnHelper(reinterpret_cast<void*>(ar->m_savedRip)));
   assert(ar->m_soff == 0);
-  assert(!resumable || (stk == StackArgsState::Untrimmed));
 
   auto ec = &*g_context;
   DEBUG_ONLY int faultDepth = ec->m_faults.size();
@@ -2077,72 +2069,16 @@ static void enterVM(ActRec* ar, StackArgsState stk,
   vmFirstAR() = ar;
   vmJitCalledFrame() = nullptr;
 
-  /*
-   * When an exception is propagating, each nesting of the VM is
-   * responsible for unwinding its portion of the execution stack, and
-   * finding user handlers if it is a catchable exception.
-   *
-   * This try/catch is where all this logic is centered.  The actual
-   * unwinding happens under exception_handler in unwind.cpp, which
-   * returns a UnwindAction here to indicate what to do next.
-   *
-   * Either we'll enter the VM loop again at a user error/fault
-   * handler, or propagate the exception to a less-nested VM.
-   */
-  bool first = true;
-resume:
-  try {
-    if (first) {
-      first = false;
-      if (!resumable) {
-        enterVMAtFunc(ar, stk, varEnv);
-      } else {
-        assert(varEnv == nullptr);
-        enterVMAtAsyncFunc(ar, resumable, exception);
-      }
-    } else {
-      enterVMAtCurPC();
-    }
+  action();
 
-    // Everything succeeded with no exception---return to the previous
-    // VM nesting level.
-    return;
-
-  } catch (...) {
-    always_assert(tl_regState == VMRegState::CLEAN);
-    switch (exception_handler()) {
-      case UnwindAction::Propagate:
-        break;
-      case UnwindAction::ResumeVM:
-        if (vmpc()) { goto resume; }
-        return;
-    }
+  while (vmpc()) {
+    exception_handler(enterVMAtCurPC);
   }
+}
 
-  /*
-   * Here we have to propagate an exception out of this VM's nesting
-   * level.
-   */
-
-  assert(ec->m_faults.size() > 0);
-  Fault fault = ec->m_faults.back();
-  ec->m_faults.pop_back();
-
-  switch (fault.m_faultType) {
-  case Fault::Type::UserException:
-    {
-      Object obj = fault.m_userException;
-      fault.m_userException->decRefCount();
-      throw obj;
-    }
-  case Fault::Type::CppException:
-    // throwException() will take care of deleting heap-allocated
-    // exception object for us
-    fault.m_cppException->throwException();
-    not_reached();
-  }
-
-  not_reached();
+template<class Action>
+static inline void enterVM(ActRec* ar, Action action) {
+  enterVMCustomHandler(ar, [&] { exception_handler(action); });
 }
 
 void ExecutionContext::invokeFunc(TypedValue* retptr,
@@ -2263,8 +2199,13 @@ void ExecutionContext::invokeFunc(TypedValue* retptr,
       popVMState();
     };
 
-    enterVM(ar, varEnv ? StackArgsState::Untrimmed : StackArgsState::Trimmed,
-            nullptr, nullptr, varEnv);
+    enterVM(ar, [&] {
+      enterVMAtFunc(
+        ar,
+        varEnv ? StackArgsState::Untrimmed : StackArgsState::Trimmed,
+        varEnv
+      );
+    });
 
     // retptr might point somewhere that is affected by (push|pop)VMState, so
     // don't write to it until after we pop the nested VM state.
@@ -2358,7 +2299,9 @@ void ExecutionContext::invokeFuncFew(TypedValue* retptr,
       popVMState();
     };
 
-    enterVM(ar, StackArgsState::Untrimmed, nullptr, nullptr, nullptr);
+    enterVM(ar, [&] {
+      enterVMAtFunc(ar, StackArgsState::Untrimmed, nullptr);
+    });
 
     // retptr might point somewhere that is affected by (push|pop)VMState, so
     // don't write to it until after we pop the nested VM state.
@@ -2389,7 +2332,17 @@ void ExecutionContext::resumeAsyncFunc(Resumable* resumable,
   pushVMState(savedSP);
   SCOPE_EXIT { popVMState(); };
 
-  enterVM(fp, StackArgsState::Untrimmed, resumable, nullptr, nullptr);
+  enterVM(fp, [&] {
+    prepareAsyncFuncEntry(fp, resumable);
+
+    const bool useJit = RID().getJit();
+    if (LIKELY(useJit && resumable->resumeAddr())) {
+      Stats::inc(Stats::VMEnter);
+      mcg->enterTCAfterPrologue(resumable->resumeAddr());
+    } else {
+      enterVMAtCurPC();
+    }
+  });
 }
 
 void ExecutionContext::resumeAsyncFuncThrow(Resumable* resumable,
@@ -2410,7 +2363,11 @@ void ExecutionContext::resumeAsyncFuncThrow(Resumable* resumable,
   pushVMState(vmStack().top());
   SCOPE_EXIT { popVMState(); };
 
-  enterVM(fp, StackArgsState::Untrimmed, resumable, exception, nullptr);
+  enterVMCustomHandler(fp, [&] {
+    prepareAsyncFuncEntry(fp, resumable);
+
+    unwindPhp(exception);
+  });
 }
 
 void ExecutionContext::invokeUnit(TypedValue* retval, const Unit* unit) {
@@ -2498,6 +2455,7 @@ bool ExecutionContext::evalUnit(Unit* unit, PC& pc, int funcType) {
   assert(vmfp());
   ar->setReturn(vmfp(), pc, mcg->tx().uniqueStubs.retHelper);
   pushLocalsAndIterators(func);
+  assert(vmfp()->func()->attrs() & AttrMayUseVV);
   if (!vmfp()->hasVarEnv()) {
     vmfp()->setVarEnv(VarEnv::createLocal(vmfp()));
   }
@@ -2582,7 +2540,7 @@ void pushLocalsAndIterators(const Func* func, int nparams /*= 0*/) {
 }
 
 void ExecutionContext::enqueueAPCHandle(APCHandle* handle, size_t size) {
-  assert(handle->isUncounted() && size > 0);
+  assert(handle->isUncounted());
   assert(handle->type() == KindOfString ||
          handle->type() == KindOfArray);
   m_apcHandles.push_back(handle);
@@ -2875,7 +2833,14 @@ void unwindPreventReturnToTC(ActRec* ar) {
   if (isReturnHelper(savedRip)) return;
 
   auto& ustubs = mcg->tx().uniqueStubs;
-  ar->setJitReturn(ar->resumed() ? ustubs.genRetHelper : ustubs.retHelper);
+  if (ar->resumed()) {
+    // async functions use callToExit stub
+    assert(ar->func()->isGenerator());
+    ar->setJitReturn(ar->func()->isAsync()
+      ? ustubs.asyncGenRetHelper : ustubs.genRetHelper);
+  } else {
+    ar->setJitReturn(ustubs.retHelper);
+  }
 }
 
 void debuggerPreventReturnToTC(ActRec* ar) {
@@ -2892,8 +2857,14 @@ void debuggerPreventReturnToTC(ActRec* ar) {
   jit::pushDebuggerCatch(ar);
 
   auto& ustubs = mcg->tx().uniqueStubs;
-  ar->setJitReturn(ar->resumed() ? ustubs.debuggerGenRetHelper
-                                 : ustubs.debuggerRetHelper);
+  if (ar->resumed()) {
+    // async functions use callToExit stub
+    assert(ar->func()->isGenerator());
+    ar->setJitReturn(ar->func()->isAsync()
+      ? ustubs.debuggerAsyncGenRetHelper : ustubs.debuggerGenRetHelper);
+  } else {
+    ar->setJitReturn(ustubs.debuggerRetHelper);
+  }
 }
 
 // Walk the stack and find any return address to jitted code and bash it to the
@@ -3727,9 +3698,9 @@ OPTBLD_INLINE void iopAddNewElemV(IOP_ARGS) {
 OPTBLD_INLINE void iopNewCol(IOP_ARGS) {
   pc++;
   auto cType = static_cast<CollectionType>(decode_iva(pc));
-  auto nElms = decode_iva(pc);
-  auto obj = collections::alloc(cType, nElms);
-  vmStack().pushObject(obj);
+  // Incref the collection object during construction.
+  auto obj = collections::alloc(cType);
+  vmStack().pushObjectNoRc(obj);
 }
 
 OPTBLD_INLINE void iopColFromArray(IOP_ARGS) {
@@ -3737,10 +3708,11 @@ OPTBLD_INLINE void iopColFromArray(IOP_ARGS) {
   auto const cType = static_cast<CollectionType>(decode_iva(pc));
   auto const c1 = vmStack().topC();
   // This constructor reassociates the ArrayData with the collection, so no
-  // inc/decref is needed.
+  // inc/decref is needed for the array. The collection object itself is
+  // increfed.
   auto obj = collections::alloc(cType, c1->m_data.parr);
   vmStack().discard();
-  vmStack().pushObject(obj);
+  vmStack().pushObjectNoRc(obj);
 }
 
 OPTBLD_INLINE void iopColAddNewElemC(IOP_ARGS) {
@@ -4205,7 +4177,7 @@ OPTBLD_INLINE void iopFatal(IOP_ARGS) {
 
 OPTBLD_INLINE void jmpSurpriseCheck(Offset offset) {
   if (offset <= 0 && UNLIKELY(checkSurpriseFlags())) {
-    EventHook::CheckSurprise();
+    check_request_surprise();
   }
 }
 
@@ -4294,10 +4266,10 @@ OPTBLD_INLINE void iopSwitch(IOP_ARGS) {
   Offset* jmptab = (Offset*)pc;
   pc += veclen * sizeof(*jmptab);
   auto base = decode<int64_t>(pc);
-  auto bounded = decode_iva(pc);
+  auto const kind = decode_oa<SwitchKind>(pc);
 
   TypedValue* val = vmStack().topTV();
-  if (!bounded) {
+  if (kind == SwitchKind::Unbounded) {
     assert(val->m_type == KindOfInt64);
     // Continuation switch: no bounds checking needed
     int64_t label = val->m_data.num;
@@ -5819,8 +5791,7 @@ static void throw_call_non_object(const char* methodName,
     methodName, typeName);
 
   if (RuntimeOption::ThrowExceptionOnBadMethodCall) {
-    Object e(SystemLib::AllocBadMethodCallExceptionObject(String(msg)));
-    throw e;
+    SystemLib::throwBadMethodCallExceptionObject(String(msg));
   }
   throw FatalErrorException(msg.c_str());
 }
@@ -5985,7 +5956,6 @@ OPTBLD_INLINE void iopFPushCtor(IOP_ARGS) {
   TRACE(2, "FPushCtor: just new'ed an instance of class %s: %p\n",
         cls->name()->data(), this_);
   this_->incRefCount();
-  this_->incRefCount();
   tv->m_type = KindOfObject;
   tv->m_data.pobj = this_;
   // Push new activation record.
@@ -6016,7 +5986,6 @@ OPTBLD_INLINE void iopFPushCtorD(IOP_ARGS) {
   ObjectData* this_ = newInstance(cls);
   TRACE(2, "FPushCtorD: new'ed an instance of class %s: %p\n",
         cls->name()->data(), this_);
-  this_->incRefCount();
   vmStack().pushObject(this_);
   // Push new activation record.
   ActRec* ar = vmStack().allocA();
@@ -6347,10 +6316,17 @@ OPTBLD_INLINE void iopFCallBuiltin(IOP_ARGS) {
     raise_error("Call to undefined function %s()",
                 vmfp()->m_func->unit()->lookupLitstrId(id)->data());
   }
+
   TypedValue* args = vmStack().indTV(numArgs-1);
   TypedValue ret;
   if (Native::coerceFCallArgs(args, numArgs, numNonDefault, func)) {
-    Native::callFunc<true, false>(func, nullptr, args, ret);
+    if (func->hasVariadicCaptureParam()) {
+      assertx(numArgs > 0);
+      assertx(args[1-numArgs].m_type == KindOfArray);
+      Native::callFunc<true, true>(func, nullptr, args, numNonDefault, ret);
+    } else {
+      Native::callFunc<true, false>(func, nullptr, args, numNonDefault, ret);
+    }
   } else {
     if (func->attrs() & AttrParamCoerceModeNull) {
       ret.m_type = KindOfNull;
@@ -6528,7 +6504,7 @@ OPTBLD_INLINE void iopWIterInit(IOP_ARGS) {
   Iter* it = frame_iter(vmfp(), itId);
   TypedValue* tv1 = frame_local(vmfp(), val);
   if (initIterator(pc, origPc, it, offset, c1)) {
-    tvAsVariant(tv1).setWithRef(it->arr().secondRef());
+    tvAsVariant(tv1).setWithRef(it->arr().secondRefPlus());
   }
 }
 
@@ -6544,7 +6520,7 @@ OPTBLD_INLINE void iopWIterInitK(IOP_ARGS) {
   TypedValue* tv1 = frame_local(vmfp(), val);
   TypedValue* tv2 = frame_local(vmfp(), key);
   if (initIterator(pc, origPc, it, offset, c1)) {
-    tvAsVariant(tv1).setWithRef(it->arr().secondRef());
+    tvAsVariant(tv1).setWithRef(it->arr().secondRefPlus());
     tvAsVariant(tv2) = it->arr().first();
   }
 }
@@ -6643,7 +6619,7 @@ OPTBLD_INLINE void iopWIterNext(IOP_ARGS) {
   TypedValue* tv1 = frame_local(vmfp(), val);
   if (it->next()) {
     pc = origPc + offset;
-    tvAsVariant(tv1).setWithRef(it->arr().secondRef());
+    tvAsVariant(tv1).setWithRef(it->arr().secondRefPlus());
   }
 }
 
@@ -6660,7 +6636,7 @@ OPTBLD_INLINE void iopWIterNextK(IOP_ARGS) {
   TypedValue* tv2 = frame_local(vmfp(), key);
   if (it->next()) {
     pc = origPc + offset;
-    tvAsVariant(tv1).setWithRef(it->arr().secondRef());
+    tvAsVariant(tv1).setWithRef(it->arr().secondRefPlus());
     tvAsVariant(tv2) = it->arr().first();
   }
 }
@@ -6804,9 +6780,10 @@ OPTBLD_INLINE void iopEval(IOP_ARGS) {
   auto vm = &*g_context;
   string_printf(
     evalFilename,
-    "%s(%d" EVAL_FILENAME_SUFFIX,
+    "%s(%d)(%s" EVAL_FILENAME_SUFFIX,
     vm->getContainingFileName()->data(),
-    vm->getLine()
+    vm->getLine(),
+    string_md5(code.data(), code.size()).c_str()
   );
   Unit* unit = vm->compileEvalString(prefixedCode.get(), evalFilename.c_str());
 
@@ -6968,7 +6945,7 @@ OPTBLD_INLINE void iopCatch(IOP_ARGS) {
   Fault fault = vm->m_faults.back();
   vm->m_faults.pop_back();
   assert(fault.m_raiseFrame == vmfp());
-  assert(fault.m_faultType == Fault::Type::UserException);
+  assert(fault.m_userException);
   vmStack().pushObjectNoRc(fault.m_userException);
 }
 
@@ -7071,11 +7048,27 @@ OPTBLD_INLINE void iopCreateCl(IOP_ARGS) {
   pc++;
   auto numArgs = decode_iva(pc);
   auto clsName = decode_litstr(pc);
-  auto const cls = Unit::loadClass(clsName);
+  auto const cls = Unit::loadClass(clsName)->rescope(
+    const_cast<Class*>(vmfp()->m_func->cls())
+  );
   auto const cl = static_cast<c_Closure*>(newInstance(cls));
   cl->init(numArgs, vmfp(), vmStack().top());
   vmStack().ndiscard(numArgs);
-  vmStack().pushObject(cl);
+  vmStack().pushObjectNoRc(cl);
+}
+
+static inline BaseGenerator* this_base_generator(const ActRec* fp) {
+  auto const obj = fp->getThis();
+  assert(obj->getVMClass() == AsyncGenerator::getClass() ||
+         obj->getVMClass() == Generator::getClass());
+  return obj->getVMClass() == Generator::getClass()
+    ? static_cast<BaseGenerator*>(Generator::fromObject(obj))
+    : static_cast<BaseGenerator*>(AsyncGenerator::fromObject(obj));
+}
+
+static inline Generator* this_generator(const ActRec* fp) {
+  auto const obj = fp->getThis();
+  return Generator::fromObject(obj);
 }
 
 const StaticString s_this("this");
@@ -7093,13 +7086,15 @@ OPTBLD_INLINE TCA iopCreateCont(IOP_ARGS) {
 
   // Create the {Async,}Generator object. Create takes care of copying local
   // variables and iterators.
-  auto const gen = func->isAsync()
-    ? static_cast<BaseGenerator*>(
-        c_AsyncGenerator::Create(fp, numSlots, nullptr, resumeOffset))
-    : static_cast<BaseGenerator*>(
-        c_Generator::Create<false>(fp, numSlots, nullptr, resumeOffset));
+  auto const obj = func->isAsync()
+    ? AsyncGenerator::Create(fp, numSlots, nullptr, resumeOffset)
+    : Generator::Create<false>(fp, numSlots, nullptr, resumeOffset);
 
-  EventHook::FunctionSuspendE(fp, gen->actRec());
+  auto const genData = func->isAsync() ?
+    static_cast<BaseGenerator*>(AsyncGenerator::fromObject(obj)) :
+    static_cast<BaseGenerator*>(Generator::fromObject(obj));
+
+  EventHook::FunctionSuspendE(fp, genData->actRec());
 
   // Grab caller info from ActRec.
   ActRec* sfp = fp->sfp();
@@ -7108,7 +7103,7 @@ OPTBLD_INLINE TCA iopCreateCont(IOP_ARGS) {
   // Free ActRec and store the return value.
   vmStack().ndiscard(numSlots);
   vmStack().ret();
-  tvCopy(make_tv<KindOfObject>(gen), *vmStack().topTV());
+  tvCopy(make_tv<KindOfObject>(obj), *vmStack().topTV());
   assert(vmStack().topTV() == &fp->m_r);
 
   // Return control to the caller.
@@ -7116,19 +7111,6 @@ OPTBLD_INLINE TCA iopCreateCont(IOP_ARGS) {
   pc = LIKELY(sfp != nullptr) ? sfp->func()->getEntry() + soff : nullptr;
 
   return jitReturnPost(jitReturn);
-}
-
-static inline BaseGenerator* this_base_generator(const ActRec* fp) {
-  auto const obj = fp->getThis();
-  assert(obj->instanceof(c_AsyncGenerator::classof()) ||
-         obj->instanceof(c_Generator::classof()));
-  return static_cast<BaseGenerator*>(obj);
-}
-
-static inline c_Generator* this_generator(const ActRec* fp) {
-  auto const obj = this_base_generator(fp);
-  assert(obj->getVMClass() == c_Generator::classof());
-  return static_cast<c_Generator*>(obj);
 }
 
 OPTBLD_INLINE void contEnterImpl(PC& pc) {
@@ -7140,10 +7122,12 @@ OPTBLD_INLINE void contEnterImpl(PC& pc) {
 
   // Do linkage of the generator's AR.
   assert(vmfp()->hasThis());
-  BaseGenerator* gen = this_base_generator(vmfp());
+  auto const gen = this_base_generator(vmfp());
   assert(gen->getState() == BaseGenerator::State::Running);
   ActRec* genAR = gen->actRec();
-  genAR->setReturn(vmfp(), pc, mcg->tx().uniqueStubs.genRetHelper);
+  genAR->setReturn(vmfp(), pc, genAR->func()->isAsync() ?
+    mcg->tx().uniqueStubs.asyncGenRetHelper :
+    mcg->tx().uniqueStubs.genRetHelper);
 
   vmfp() = genAR;
 
@@ -7234,14 +7218,14 @@ OPTBLD_INLINE void iopContValid(IOP_ARGS) {
 
 OPTBLD_INLINE void iopContKey(IOP_ARGS) {
   pc++;
-  c_Generator* cont = this_generator(vmfp());
+  Generator* cont = this_generator(vmfp());
   cont->startedCheck();
   cellDup(cont->m_key, *vmStack().allocC());
 }
 
 OPTBLD_INLINE void iopContCurrent(IOP_ARGS) {
   pc++;
-  c_Generator* cont = this_generator(vmfp());
+  Generator* cont = this_generator(vmfp());
   cont->startedCheck();
   cellDup(cont->m_value, *vmStack().allocC());
 }
@@ -7264,8 +7248,9 @@ OPTBLD_INLINE void asyncSuspendE(PC& pc, int32_t iters) {
   // Create the AsyncFunctionWaitHandle object. Create takes care of
   // copying local variables and itertors.
   auto waitHandle = static_cast<c_AsyncFunctionWaitHandle*>(
-    c_AsyncFunctionWaitHandle::Create(vmfp(), vmfp()->func()->numSlotsInFrame(),
-                                      nullptr, resumeOffset, child));
+    c_AsyncFunctionWaitHandle::Create<true>(vmfp(),
+                                            vmfp()->func()->numSlotsInFrame(),
+                                            nullptr, resumeOffset, child));
 
   // Call the FunctionSuspend hook. FunctionSuspend will decref the newly
   // allocated waitHandle if it throws.
@@ -7336,12 +7321,30 @@ OPTBLD_INLINE void asyncSuspendR(PC& pc) {
 OPTBLD_INLINE TCA iopAwait(IOP_ARGS) {
   pc++;
   auto iters = decode_iva(pc);
-
-  auto const wh = c_WaitHandle::fromCell(vmStack().topC());
+  auto const awaitable = vmStack().topC();
+  auto wh = c_WaitHandle::fromCell(awaitable);
   if (UNLIKELY(wh == nullptr)) {
-    raise_error("Await on a non-WaitHandle");
-    not_reached();
-  } else if (wh->isSucceeded()) {
+    if (LIKELY(awaitable->m_type == KindOfObject)) {
+      auto const obj = awaitable->m_data.pobj;
+      auto const cls = obj->getVMClass();
+      auto const func = cls->lookupMethod(s_getWaitHandle.get());
+      if (func && !(func->attrs() & AttrStatic)) {
+        TypedValue ret;
+        g_context->invokeFuncFew(&ret, func, obj, nullptr, 0, nullptr);
+        cellSet(*tvToCell(&ret), *vmStack().topC());
+        tvRefcountedDecRef(ret);
+        wh = c_WaitHandle::fromCell(vmStack().topC());
+      }
+    }
+
+    if (UNLIKELY(wh == nullptr)) {
+      Object e(SystemLib::AllocBadMethodCallExceptionObject(
+        "Await on a non-WaitHandle"));
+      throw e;
+    }
+  }
+
+  if (wh->isSucceeded()) {
     cellSet(wh->getResult(), *vmStack().topC());
     return nullptr;
   } else if (UNLIKELY(wh->isFailed())) {
@@ -7359,6 +7362,25 @@ OPTBLD_INLINE TCA iopAwait(IOP_ARGS) {
   }
 
   return jitReturnPost(jitReturn);
+}
+
+OPTBLD_INLINE void iopWHResult(IOP_ARGS) {
+  pc++;
+  // we should never emit this bytecode for non-waithandle
+  auto const wh = c_WaitHandle::fromCellAssert(vmStack().topC());
+  // the failure condition is likely since we punt to this opcode
+  // in the JIT when the state is failed.
+  if (wh->isFailed()) {
+    throw Object{wh->getException()};
+  }
+  if (wh->isSucceeded()) {
+    cellSet(wh->getResult(), *vmStack().topC());
+    return;
+  }
+  SystemLib::throwInvalidOperationExceptionObject(
+    "Request for result on pending wait handle, "
+    "must await or join() before calling result()");
+  not_reached();
 }
 
 OPTBLD_INLINE void iopCheckProp(IOP_ARGS) {
@@ -7843,7 +7865,7 @@ void ExecutionContext::requestInit() {
   assert(SystemLib::s_nativeFuncUnit);
   assert(SystemLib::s_nativeClassUnit);
 
-  EnvConstants::requestInit(smart_new<EnvConstants>());
+  EnvConstants::requestInit(req::make_raw<EnvConstants>());
   VarEnv::createGlobal();
   vmStack().requestInit();
   ObjectData::resetMaxId();
@@ -7911,8 +7933,8 @@ void ExecutionContext::requestExit() {
   tl_miter_table.clear();
 
   if (m_globalVarEnv) {
-    smart_delete(m_globalVarEnv);
-    m_globalVarEnv = 0;
+    req::destroy_raw(m_globalVarEnv);
+    m_globalVarEnv = nullptr;
   }
 
   if (!m_lastError.isNull()) {

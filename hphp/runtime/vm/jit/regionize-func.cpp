@@ -62,8 +62,8 @@ void markCoveredArc(const TransCFG::Arc& arc,
                     TransCFG::ArcPtrSet& coveredArcs) {
   auto dstRetransSet = findRetransSet(dstRegion, arc.dst());
   for (auto outArc : cfg.outArcs(arc.src())) {
-    if (hasTransId(outArc->dst())) {
-      auto dstTid = getTransId(outArc->dst());
+    if (hasTransID(outArc->dst())) {
+      auto dstTid = getTransID(outArc->dst());
       if (dstRetransSet.count(dstTid)) {
         coveredArcs.insert(outArc);
       }
@@ -84,7 +84,7 @@ void markCovered(const TransCFG& cfg, const RegionDescPtr region,
   assertx(selectedVec.size() > 0);
   TransID newHead = selectedVec[0];
   assertx(!region->empty());
-  assertx(newHead == getTransId(region->entry()->id()));
+  assertx(newHead == getTransID(region->entry()->id()));
 
   // Mark all region's nodes as covered.
   coveredNodes.insert(selectedVec.begin(), selectedVec.end());
@@ -99,9 +99,9 @@ void markCovered(const TransCFG& cfg, const RegionDescPtr region,
 
   // Mark all CFG arcs within the region as covered.
   region->forEachArc([&](RegionDesc::BlockId src, RegionDesc::BlockId dst) {
-    if (!hasTransId(src) || !hasTransId(dst)) return;
-    TransID srcTid = getTransId(src);
-    TransID dstTid = getTransId(dst);
+    if (!hasTransID(dst)) return;
+    TransID srcTid = region->block(src)->profTransID();
+    TransID dstTid = region->block(dst)->profTransID();
     assertx(cfg.hasArc(srcTid, dstTid));
     bool foundArc = false;
     for (auto arc : cfg.outArcs(srcTid)) {
@@ -248,8 +248,7 @@ bool allArcsCovered(const TransCFG::ArcPtrVec& arcs,
  * "covered".  A node is covered if any region contains it.  An arc T1->T2
  * is covered if either:
  *
- *   a) T1 and T2 are in the same region R and T2 immediately follows
- *      T1 in R.
+ *   a) T1 and T2 are in the same region R and R contains arc T1->T2.
  *   b) T2 is the head (first translation) of a region.
  *
  * Basic algorithm:
@@ -265,6 +264,9 @@ void regionizeFunc(const Func* func,
                    RegionVec& regions) {
   const Timer rf_timer(Timer::regionizeFunc);
   assertx(RuntimeOption::EvalJitPGO);
+
+  PGORegionMode regionMode = pgoRegionMode(*func);
+
   auto const funcId = func->getFuncId();
   auto const profData = mcg->tx().profData();
   TransCFG cfg(funcId, profData, mcg->tx().getSrcDB(),
@@ -283,7 +285,8 @@ void regionizeFunc(const Func* func,
 
   std::sort(nodes.begin(), nodes.end(),
             [&](TransID tid1, TransID tid2) -> bool {
-              if (RuntimeOption::EvalJitPGORegionSelector == "wholecfg") {
+              if (regionMode == PGORegionMode::WholeCFG ||
+                  regionMode == PGORegionMode::HotCFG) {
                 auto bcOff1 = profData->transStartBcOff(tid1);
                 auto bcOff2 = profData->transStartBcOff(tid2);
                 if (bcOff1 != bcOff2) return bcOff1 < bcOff2;
@@ -311,14 +314,20 @@ void regionizeFunc(const Func* func,
       TransIDSet selectedSet;
       TransIDVec selectedVec;
       RegionDescPtr region;
-      if (RuntimeOption::EvalJitPGORegionSelector == "hottrace") {
-        region = selectHotTrace(newHead, profData, cfg,
-                                selectedSet, &selectedVec);
-      } else if (RuntimeOption::EvalJitPGORegionSelector == "wholecfg") {
-        region = selectWholeCFG(newHead, profData, cfg, selectedSet,
+      switch (regionMode) {
+        case PGORegionMode::Hottrace:
+          region = selectHotTrace(newHead, profData, cfg,
+                                  selectedSet, &selectedVec);
+          break;
+
+        case PGORegionMode::WholeCFG:
+        case PGORegionMode::HotCFG:
+          region = selectHotCFG(newHead, profData, cfg, selectedSet,
                                 &selectedVec);
-      } else {
-        always_assert(0 && "Invalid value for EvalJitPGORegionSelector");
+          break;
+
+        case PGORegionMode::Hotblock:
+          always_assert(0 && "Invalid value for EvalJitPGORegionSelector");
       }
       FTRACE(6, "regionizeFunc: selected region to cover node {}\n{}\n",
              newHead, show(*region));

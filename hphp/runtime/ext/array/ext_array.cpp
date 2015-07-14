@@ -29,12 +29,14 @@
 #include "hphp/runtime/base/request-local.h"
 #include "hphp/runtime/base/sort-flags.h"
 #include "hphp/runtime/base/zend-collator.h"
-#include "hphp/runtime/ext/ext_generator.h"
-#include "hphp/runtime/ext/ext_collections.h"
+#include "hphp/runtime/ext/generator/ext_generator.h"
+#include "hphp/runtime/ext/collections/ext_collections-idl.h"
 #include "hphp/runtime/ext/std/ext_std_function.h"
 #include "hphp/runtime/vm/jit/translator.h"
 #include "hphp/runtime/vm/jit/translator-inline.h"
 #include "hphp/util/logger.h"
+
+#include <vector>
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -76,12 +78,6 @@ DEFINE_CONSTANT(UCOL_HIRAGANA_QUATERNARY_MODE);
 DEFINE_CONSTANT(UCOL_NUMERIC_COLLATION);
 
 #undef DEFINE_CONSTANT
-
-int countArguments() {
-  ActRec *ar = g_context->getStackFrame();
-  assert(ar);
-  return ar->numArgs();
-}
 
 Variant HHVM_FUNCTION(array_change_key_case,
                       const Variant& input,
@@ -423,7 +419,7 @@ static void php_array_merge_recursive(PointerSet &seen, bool check,
       // There is no need to do toKey() conversion, for a key that is already
       // in the array.
       Variant &v = arr1.lvalAt(key, AccessFlags::Key);
-      Array subarr1(v.toArray()->copy());
+      auto subarr1 = v.toArray().copy();
       php_array_merge_recursive(seen, v.isReferenced(), subarr1,
                                 value.toArray());
       v.unset(); // avoid contamination of the value that was strongly bound
@@ -438,7 +434,99 @@ static void php_array_merge_recursive(PointerSet &seen, bool check,
   }
 }
 
+Variant HHVM_FUNCTION(array_map, const Variant& callback,
+                                 const Variant& arr1,
+                                 const Array& _argv /* = null_array */) {
+  CallCtx ctx;
+  ctx.func = nullptr;
+  if (!callback.isNull()) {
+    CallerFrame cf;
+    vm_decode_function(callback, cf(), false, ctx);
+  }
+  const auto& cell_arr1 = *arr1.asCell();
+  if (UNLIKELY(!isContainer(cell_arr1))) {
+    raise_warning("array_map(): Argument #2 should be an array or collection");
+    return init_null();
+  }
+  if (LIKELY(_argv.empty())) {
+    // Handle the common case where the caller passed two
+    // params (a callback and a container)
+    if (!ctx.func) {
+      if (cell_arr1.m_type == KindOfArray) {
+        return arr1;
+      } else {
+        return arr1.toArray();
+      }
+    }
+    ArrayInit ret(getContainerSize(cell_arr1), ArrayInit::Map{});
+    bool keyConverted = (cell_arr1.m_type == KindOfArray);
+    if (!keyConverted) {
+      auto col_type = cell_arr1.m_data.pobj->collectionType();
+      keyConverted = !collectionAllowsIntStringKeys(col_type);
+    }
+    for (ArrayIter iter(arr1); iter; ++iter) {
+      Variant result;
+      g_context->invokeFuncFew((TypedValue*)&result, ctx, 1,
+                               iter.secondRefPlus().asCell());
+      // if keyConverted is false, it's possible that ret will have fewer
+      // elements than cell_arr1; keys int(1) and string('1') may both be
+      // present
+      ret.add(iter.first(), result, keyConverted);
+    }
+    return ret.toVariant();
+  }
+
+  // Handle the uncommon case where the caller passed a callback
+  // and two or more containers
+  ArrayIter* iters =
+    (ArrayIter*)req::malloc(sizeof(ArrayIter) * (_argv.size() + 1));
+  size_t numIters = 0;
+  SCOPE_EXIT {
+    while (numIters--) iters[numIters].~ArrayIter();
+    req::free(iters);
+  };
+  size_t maxLen = getContainerSize(cell_arr1);
+  (void) new (&iters[numIters]) ArrayIter(cell_arr1);
+  ++numIters;
+  for (ArrayIter it(_argv); it; ++it, ++numIters) {
+    const auto& c = *it.secondRefPlus().asCell();
+    if (UNLIKELY(!isContainer(c))) {
+      raise_warning("array_map(): Argument #%d should be an array or "
+                    "collection", (int)(numIters + 2));
+      (void) new (&iters[numIters]) ArrayIter(it.secondRefPlus().toArray());
+    } else {
+      (void) new (&iters[numIters]) ArrayIter(c);
+      size_t len = getContainerSize(c);
+      if (len > maxLen) maxLen = len;
+    }
+  }
+  PackedArrayInit ret_ai(maxLen);
+  for (size_t k = 0; k < maxLen; k++) {
+    PackedArrayInit params_ai(numIters);
+    for (size_t i = 0; i < numIters; ++i) {
+      if (iters[i]) {
+        params_ai.append(iters[i].secondRefPlus());
+        ++iters[i];
+      } else {
+        params_ai.append(init_null_variant);
+      }
+    }
+    Array params = params_ai.toArray();
+    if (ctx.func) {
+      Variant result;
+      g_context->invokeFunc((TypedValue*)&result,
+                              ctx.func, params, ctx.this_,
+                              ctx.cls, nullptr, ctx.invName);
+      ret_ai.append(result);
+    } else {
+      ret_ai.append(params);
+    }
+  }
+  return ret_ai.toVariant();
+}
+
 Variant HHVM_FUNCTION(array_merge,
+                      int64_t numArgs,
                       const Variant& array1,
                       const Variant& array2 /* = null_variant */,
                       const Array& args /* = null array */) {
@@ -446,7 +534,7 @@ Variant HHVM_FUNCTION(array_merge,
   Array ret = Array::Create();
   php_array_merge(ret, arr_array1);
 
-  if (UNLIKELY(countArguments() < 2)) return ret;
+  if (UNLIKELY(numArgs < 2)) return ret;
 
   getCheckedArray(array2);
   php_array_merge(ret, arr_array2);
@@ -454,7 +542,7 @@ Variant HHVM_FUNCTION(array_merge,
   for (ArrayIter iter(args); iter; ++iter) {
     Variant v = iter.second();
     if (!v.isArray()) {
-      throw_expected_array_exception();
+      throw_expected_array_exception("array_merge");
       return init_null();
     }
     const Array& arr_v = v.asCArrRef();
@@ -464,6 +552,7 @@ Variant HHVM_FUNCTION(array_merge,
 }
 
 Variant HHVM_FUNCTION(array_merge_recursive,
+                      int64_t numArgs,
                       const Variant& array1,
                       const Variant& array2 /* = null_variant */,
                       const Array& args /* = null array */) {
@@ -473,7 +562,7 @@ Variant HHVM_FUNCTION(array_merge_recursive,
   php_array_merge_recursive(seen, false, ret, arr_array1);
   assert(seen.empty());
 
-  if (UNLIKELY(countArguments() < 2)) return ret;
+  if (UNLIKELY(numArgs < 2)) return ret;
 
   getCheckedArray(array2);
   php_array_merge_recursive(seen, false, ret, arr_array2);
@@ -482,7 +571,7 @@ Variant HHVM_FUNCTION(array_merge_recursive,
   for (ArrayIter iter(args); iter; ++iter) {
     Variant v = iter.second();
     if (!v.isArray()) {
-      throw_expected_array_exception();
+      throw_expected_array_exception("array_merge_recursive");
       return init_null();
     }
     const Array& arr_v = v.asCArrRef();
@@ -739,7 +828,7 @@ Variant HHVM_FUNCTION(array_push,
       }
     }
   }
-  throw_expected_array_or_collection_exception();
+  throw_expected_array_or_collection_exception("array_push");
   return init_null();
 }
 
@@ -748,27 +837,6 @@ Variant HHVM_FUNCTION(array_rand,
                       int num_req /* = 1 */) {
   getCheckedArray(input);
   return ArrayUtil::RandomKeys(arr_input, num_req);
-}
-
-static Variant reduce_func(const Variant& result, const Variant& operand, const void *data) {
-  CallCtx* ctx = (CallCtx*)data;
-  Variant ret;
-  TypedValue args[2] = { *result.asCell(), *operand.asCell() };
-  g_context->invokeFuncFew(ret.asTypedValue(), *ctx, 2, args);
-  return ret;
-}
-Variant HHVM_FUNCTION(array_reduce,
-                      const Variant& input,
-                      const Variant& callback,
-                      const Variant& initial /* = null_variant */) {
-  getCheckedArray(input);
-  CallCtx ctx;
-  CallerFrame cf;
-  vm_decode_function(callback, cf(), false, ctx);
-  if (ctx.func == NULL) {
-    return init_null();
-  }
-  return ArrayUtil::Reduce(arr_input, reduce_func, &ctx, initial);
 }
 
 Variant HHVM_FUNCTION(array_reverse,
@@ -817,7 +885,7 @@ Variant HHVM_FUNCTION(array_shift,
 
 Variant HHVM_FUNCTION(array_slice,
                       const Variant& input,
-                      int offset,
+                      int64_t offset,
                       const Variant& length /* = null_variant */,
                       bool preserve_keys /* = false */) {
   const auto& cell_input = *input.asCell();
@@ -829,17 +897,18 @@ Variant HHVM_FUNCTION(array_slice,
   }
   int64_t len = length.isNull() ? 0x7FFFFFFF : length.toInt64();
 
-  int num_in = getContainerSize(cell_input);
+  const int64_t num_in = getContainerSize(cell_input);
   if (offset > num_in) {
     offset = num_in;
   } else if (offset < 0 && (offset = (num_in + offset)) < 0) {
     offset = 0;
   }
 
+  auto const maxLen = num_in - offset;
   if (len < 0) {
-    len = num_in - offset + len;
-  } else if (((unsigned)offset + (unsigned)len) > (unsigned)num_in) {
-    len = num_in - offset;
+    len = maxLen + len;
+  } else if (len > maxLen) {
+    len = maxLen;
   }
 
   if (len <= 0) {
@@ -1090,7 +1159,7 @@ bool HHVM_FUNCTION(array_walk_recursive,
                    const Variant& funcname,
                    const Variant& userdata /* = null_variant */) {
   if (!input.isArray()) {
-    throw_expected_array_exception();
+    throw_expected_array_exception("array_walk_recursive");
     return false;
   }
   CallCtx ctx;
@@ -1109,7 +1178,7 @@ bool HHVM_FUNCTION(array_walk,
                    const Variant& funcname,
                    const Variant& userdata /* = null_variant */) {
   if (!input.isArray()) {
-    throw_expected_array_exception();
+    throw_expected_array_exception("array_walk");
     return false;
   }
   CallCtx ctx;
@@ -1176,7 +1245,7 @@ static int php_count_recursive(const Array& array) {
 bool HHVM_FUNCTION(shuffle,
                    VRefParam array) {
   if (!array.isArray()) {
-    throw_expected_array_exception();
+    throw_expected_array_exception("shuffle");
     return false;
   }
   array = ArrayUtil::Shuffle(array);
@@ -1249,7 +1318,7 @@ static Variant iter_op_impl(VRefParam refParam, OpPtr op, NonArrayRet nonArray,
   if (doCow && ad->hasMultipleRefs() && !(ad->*pred)() &&
       !ad->noCopyOnWrite()) {
     ad = ad->copy();
-    cellSet(make_tv<KindOfArray>(ad), cell);
+    cellMove(make_tv<KindOfArray>(ad), cell);
   }
   return (ad->*op)();
 }
@@ -1477,7 +1546,7 @@ static int cmp_func(const Variant& v1, const Variant& v2, const void *data) {
 ///////////////////////////////////////////////////////////////////////////////
 // diff functions
 
-static inline void addToSetHelper(const SmartPtr<c_Set>& st,
+static inline void addToSetHelper(const req::ptr<c_Set>& st,
                                   const Cell c,
                                   TypedValue* strTv,
                                   bool convertIntLikeStrs) {
@@ -1501,7 +1570,7 @@ static inline void addToSetHelper(const SmartPtr<c_Set>& st,
   }
 }
 
-static inline bool checkSetHelper(const SmartPtr<c_Set>& st,
+static inline bool checkSetHelper(const req::ptr<c_Set>& st,
                                   const Cell c,
                                   TypedValue* strTv,
                                   bool convertIntLikeStrs) {
@@ -1523,7 +1592,7 @@ static inline bool checkSetHelper(const SmartPtr<c_Set>& st,
   return st->contains(s);
 }
 
-static void containerValuesToSetHelper(const SmartPtr<c_Set>& st,
+static void containerValuesToSetHelper(const req::ptr<c_Set>& st,
                                        const Variant& container) {
   Variant strHolder(empty_string_variant());
   TypedValue* strTv = strHolder.asTypedValue();
@@ -1533,7 +1602,7 @@ static void containerValuesToSetHelper(const SmartPtr<c_Set>& st,
   }
 }
 
-static void containerKeysToSetHelper(const SmartPtr<c_Set>& st,
+static void containerKeysToSetHelper(const req::ptr<c_Set>& st,
                                      const Variant& container) {
   Variant strHolder(empty_string_variant());
   TypedValue* strTv = strHolder.asTypedValue();
@@ -1592,7 +1661,7 @@ Variant HHVM_FUNCTION(array_diff,
   // Put all of the values from all the containers (except container1 into a
   // Set. All types aside from integer and string will be cast to string, and
   // we also convert int-like strings to integers.
-  auto st = makeSmartPtr<c_Set>();
+  auto st = req::make<c_Set>();
   st->reserve(largestSize);
   containerValuesToSetHelper(st, container2);
   if (UNLIKELY(moreThanTwo)) {
@@ -1642,7 +1711,7 @@ Variant HHVM_FUNCTION(array_diff_key,
   // Put all of the keys from all the containers (except container1) into a
   // Set. All types aside from integer and string will be cast to string, and
   // we also convert int-like strings to integers.
-  auto st = makeSmartPtr<c_Set>();
+  auto st = req::make<c_Set>();
   st->reserve(largestSize);
   containerKeysToSetHelper(st, container2);
   if (UNLIKELY(moreThanTwo)) {
@@ -1765,7 +1834,7 @@ static inline TypedValue* makeContainerListHelper(const Variant& a,
   assert(smallestPos < count);
   // Allocate a TypedValue array and copy 'a' and the contents of 'argv'
   TypedValue* containers =
-    (TypedValue*)smart_malloc(count * sizeof(TypedValue));
+    (TypedValue*)req::malloc(count * sizeof(TypedValue));
   tvCopy(*a.asCell(), containers[0]);
   int pos = 1;
   for (ArrayIter argvIter(argv); argvIter; ++argvIter, ++pos) {
@@ -1784,7 +1853,7 @@ static inline TypedValue* makeContainerListHelper(const Variant& a,
   return containers;
 }
 
-static inline void addToIntersectMapHelper(const SmartPtr<c_Map>& mp,
+static inline void addToIntersectMapHelper(const req::ptr<c_Map>& mp,
                                            const Cell c,
                                            TypedValue* intOneTv,
                                            TypedValue* strTv,
@@ -1809,7 +1878,7 @@ static inline void addToIntersectMapHelper(const SmartPtr<c_Map>& mp,
   }
 }
 
-static inline void updateIntersectMapHelper(const SmartPtr<c_Map>& mp,
+static inline void updateIntersectMapHelper(const req::ptr<c_Map>& mp,
                                             const Cell c,
                                             int pos,
                                             TypedValue* strTv,
@@ -1846,11 +1915,11 @@ static inline void updateIntersectMapHelper(const SmartPtr<c_Map>& mp,
   }
 }
 
-static void containerValuesIntersectHelper(const SmartPtr<c_Set>& st,
+static void containerValuesIntersectHelper(const req::ptr<c_Set>& st,
                                            TypedValue* containers,
                                            int count) {
   assert(count >= 2);
-  auto mp = makeSmartPtr<c_Map>();
+  auto mp = req::make<c_Map>();
   Variant strHolder(empty_string_variant());
   TypedValue* strTv = strHolder.asTypedValue();
   TypedValue intOneTv = make_tv<KindOfInt64>(1);
@@ -1885,11 +1954,11 @@ static void containerValuesIntersectHelper(const SmartPtr<c_Set>& st,
   }
 }
 
-static void containerKeysIntersectHelper(const SmartPtr<c_Set>& st,
+static void containerKeysIntersectHelper(const req::ptr<c_Set>& st,
                                          TypedValue* containers,
                                          int count) {
   assert(count >= 2);
-  auto mp = makeSmartPtr<c_Map>();
+  auto mp = req::make<c_Map>();
   Variant strHolder(empty_string_variant());
   TypedValue* strTv = strHolder.asTypedValue();
   TypedValue intOneTv = make_tv<KindOfInt64>(1);
@@ -1967,7 +2036,7 @@ Variant HHVM_FUNCTION(array_intersect,
   ARRAY_INTERSECT_PRELUDE()
   // Build up a Set containing the values that are present in all the
   // containers (except container1)
-  auto st = makeSmartPtr<c_Set>();
+  auto st = req::make<c_Set>();
   if (LIKELY(!moreThanTwo)) {
     // There is only one container (not counting container1) so we can
     // just call containerValuesToSetHelper() to build the Set.
@@ -1978,7 +2047,7 @@ Variant HHVM_FUNCTION(array_intersect,
     int count = args.size() + 1;
     TypedValue* containers =
       makeContainerListHelper(container2, args, count, smallestPos);
-    SCOPE_EXIT { smart_free(containers); };
+    SCOPE_EXIT { req::free(containers); };
     // Build a Set of the values that were present in all of the containers
     containerValuesIntersectHelper(st, containers, count);
   }
@@ -2022,7 +2091,7 @@ Variant HHVM_FUNCTION(array_intersect_key,
   }
   // Build up a Set containing the keys that are present in all the containers
   // (except container1)
-  auto st = makeSmartPtr<c_Set>();
+  auto st = req::make<c_Set>();
   if (LIKELY(!moreThanTwo)) {
     // There is only one container (not counting container1) so we can just
     // call containerKeysToSetHelper() to build the Set.
@@ -2033,7 +2102,7 @@ Variant HHVM_FUNCTION(array_intersect_key,
     int count = args.size() + 1;
     TypedValue* containers =
       makeContainerListHelper(container2, args, count, smallestPos);
-    SCOPE_EXIT { smart_free(containers); };
+    SCOPE_EXIT { req::free(containers); };
     // Build a Set of the keys that were present in all of the containers
     containerKeysIntersectHelper(st, containers, count);
   }
@@ -2243,11 +2312,11 @@ class ArraySortTmp {
  public:
   explicit ArraySortTmp(Array& arr, SortFunction sf) : m_arr(arr) {
     m_ad = arr.get()->escalateForSort(sf);
-    assert(m_ad == arr.get() || m_ad->getCount() == 0);
+    assert(m_ad == arr.get() || m_ad->hasExactlyOneRef());
   }
   ~ArraySortTmp() {
     if (m_ad != m_arr.get()) {
-      m_arr = m_ad;
+      m_arr = Array::attach(m_ad);
     }
   }
   ArrayData* operator->() { return m_ad; }
@@ -2287,7 +2356,7 @@ php_sort(VRefParam container, int sort_flags,
     //  - Maps and Sets require associative sort
     //  - Immutable collections are not to be modified
   }
-  throw_expected_array_or_collection_exception();
+  throw_expected_array_or_collection_exception(ascending ? "sort" : "rsort");
   return false;
 }
 
@@ -2320,7 +2389,7 @@ php_asort(VRefParam container, int sort_flags,
       }
     }
   }
-  throw_expected_array_or_collection_exception();
+  throw_expected_array_or_collection_exception(ascending ? "asort" : "arsort");
   return false;
 }
 
@@ -2353,7 +2422,7 @@ php_ksort(VRefParam container, int sort_flags, bool ascending,
       }
     }
   }
-  throw_expected_array_or_collection_exception();
+  throw_expected_array_or_collection_exception(ascending ? "ksort" : "krsort");
   return false;
 }
 
@@ -2438,7 +2507,7 @@ bool HHVM_FUNCTION(usort,
     //  - Maps and Sets require associative sort
     //  - Immutable collections are not to be modified
   }
-  throw_expected_array_or_collection_exception();
+  throw_expected_array_or_collection_exception("usort");
   return false;
 }
 
@@ -2468,7 +2537,7 @@ bool HHVM_FUNCTION(uasort,
     //  - Vectors require a non-associative sort
     //  - Immutable collections are not to be modified
   }
-  throw_expected_array_or_collection_exception();
+  throw_expected_array_or_collection_exception("uasort");
   return false;
 }
 
@@ -2493,7 +2562,7 @@ bool HHVM_FUNCTION(uksort,
     //  - Vectors require a non-associative sort
     //  - Immutable collections are not to be modified
   }
-  throw_expected_array_or_collection_exception();
+  throw_expected_array_or_collection_exception("uksort");
   return false;
 }
 
@@ -2588,7 +2657,7 @@ static Array::PFUNC_CMP get_cmp_func(int sort_flags, bool ascending) {
 TypedValue* HHVM_FN(array_multisort)(ActRec* ar) {
   TypedValue* tv = getArg(ar, 0);
   if (tv == nullptr || !tvAsVariant(tv).isArray()) {
-    throw_expected_array_exception();
+    throw_expected_array_exception("array_multisort");
     return arReturn(ar, false);
   }
 
@@ -2682,6 +2751,7 @@ public:
     HHVM_FE(array_key_exists);
     HHVM_FE(key_exists);
     HHVM_FE(array_keys);
+    HHVM_FALIAS(__SystemLib\\array_map, array_map);
     HHVM_FE(array_merge_recursive);
     HHVM_FE(array_merge);
     HHVM_FE(array_replace_recursive);
@@ -2691,7 +2761,6 @@ public:
     HHVM_FE(array_product);
     HHVM_FE(array_push);
     HHVM_FE(array_rand);
-    HHVM_FE(array_reduce);
     HHVM_FE(array_reverse);
     HHVM_FE(array_search);
     HHVM_FE(array_shift);

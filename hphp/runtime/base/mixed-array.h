@@ -66,18 +66,21 @@ public:
       StringData* skey;
     };
     // We store values here, but also some information local to this array:
-    // data.m_aux.u_hash contains either 0 (for an int key) or a string
-    // hashcode; the high bit is the int/string key descriminator.
-    // data.m_type == kInvalidDataType if this is an empty slot in the
-    // array (e.g. after a key is deleted).
+    // data.m_aux.u_hash contains either a negative number (for an int key) or a
+    // string hashcode (31-bit and thus non-negative); the high bit is the
+    // int/string key descriminator. data.m_type == kInvalidDataType if this is
+    // an empty slot in the array (e.g. after a key is deleted).
     TypedValueAux data;
 
     bool hasStrKey() const {
-      return data.hash() != 0;
+      // Currently string hash is 31-bit, thus it saves us some instructions to
+      // encode int keys as a negative hash, so that we don't have to care about
+      // the MSB when working with strhash_t.
+      return data.hash() >= 0;
     }
 
     bool hasIntKey() const {
-      return data.hash() == 0;
+      return data.hash() < 0;
     }
 
     int32_t hash() const {
@@ -85,24 +88,30 @@ public:
     }
 
     int32_t probe() const {
-      return hasIntKey() ? ikey : hash();
+      return hash();
     }
 
     void setStaticKey(StringData* k, strhash_t h) {
       assert(k->isStatic());
       skey = k;
-      data.hash() = h | STRHASH_MSB;
+      data.hash() = h;
     }
 
     void setStrKey(StringData* k, strhash_t h) {
       skey = k;
-      data.hash() = h | STRHASH_MSB;
+      data.hash() = h;
       k->incRefCount();
     }
 
     void setIntKey(int64_t k) {
       ikey = k;
-      data.hash() = 0;
+      data.hash() = k | STRHASH_MSB;
+      assert(hasIntKey());
+      static_assert(STRHASH_MSB < 0, "using strhash_t = int32_t");
+    }
+
+    bool isTombstone() const {
+      return MixedArray::isTombstone(data.m_type);
     }
 
     static constexpr size_t dataOff() {
@@ -113,6 +122,13 @@ public:
   static constexpr size_t dataOff() {
     return sizeof(MixedArray);
   }
+
+  /*
+   * Initialize an empty small mixed array with given field. This should be
+   * inlined.
+   */
+  static void InitSmall(MixedArray* a, RefCount count, uint32_t size,
+                        int64_t nextIntKey);
 
   /*
    * Allocate a new, empty, request-local array in packed mode, with
@@ -181,7 +197,7 @@ public:
   ALWAYS_INLINE
   ssize_t getIterBegin() const {
     assert(!empty());
-    if (LIKELY(!isTombstone(data()[0].data.m_type))) {
+    if (LIKELY(!data()[0].isTombstone())) {
       return 0;
     }
     return nextElm(data(), 0);
@@ -219,6 +235,7 @@ private:
   using ArrayData::release;
 public:
   static Variant CreateVarForUncountedArray(const Variant& source);
+  static void ConvertTvToUncounted(TypedValue* source);
   static void ReleaseUncountedTypedValue(TypedValue& tv);
 
   static size_t Vsize(const ArrayData*);
@@ -254,7 +271,7 @@ public:
   static ArrayData* RemoveStr(ArrayData*, const StringData* k, bool copy);
   static ArrayData* Copy(const ArrayData*);
   static ArrayData* CopyWithStrongIterators(const ArrayData*);
-  static ArrayData* NonSmartCopy(const ArrayData*);
+  static ArrayData* CopyStatic(const ArrayData*);
   static ArrayData* Append(ArrayData*, const Variant& v, bool copy);
   static ArrayData* AppendRef(ArrayData*, Variant& v, bool copy);
   static ArrayData* AppendWithRef(ArrayData*, const Variant& v, bool copy);
@@ -304,7 +321,8 @@ public:
   static constexpr int32_t Tombstone  = -2;
 
   // Use a minimum of an 4-element hash table.  Valid range: [2..32]
-  static constexpr uint32_t SmallScale = 1;
+  static constexpr uint32_t LgSmallScale = 0;
+  static constexpr uint32_t SmallScale = 1 << LgSmallScale;
   static constexpr uint32_t SmallHashSize = SmallScale * 4;
   static constexpr uint32_t SmallMask = SmallHashSize - 1; // 3
   static constexpr uint32_t SmallSize = SmallScale * 3;
@@ -361,12 +379,9 @@ private:
   static void getElmKey(const Elm& e, TypedValue* out);
 
 private:
-  enum class AllocMode : bool { Smart, NonSmart };
+  enum class AllocMode : bool { Request, Static };
 
-  template<class CopyKeyValue>
-  static MixedArray* CopyMixed(const MixedArray& other,
-                               AllocMode,
-                               CopyKeyValue);
+  static MixedArray* CopyMixed(const MixedArray& other, AllocMode);
   static MixedArray* CopyReserve(const MixedArray* src, size_t expectedSize);
 
   MixedArray() = delete;
@@ -375,9 +390,15 @@ private:
   ~MixedArray() = delete;
 
 private:
-  static void initHash(int32_t* table, size_t tableSize);
-  static int32_t* copyHash(int32_t* to, const int32_t* from, size_t tableSize);
-  static Elm* copyElms(Elm* to, const Elm* from, size_t count);
+  static void initHash(int32_t* table, uint32_t scale);
+  static void copyHash(int32_t* to, const int32_t* from, uint32_t scale);
+  // Copy elements as well as `m_nextKI' from one MixedArray to another.
+  // Warning: it could copy up to 24 bytes beyond the array and thus overwrite
+  // the hashtable, but it never reads/writes beyond the end of the hash
+  // table.  If you use this function, make sure you copy/write the correct
+  // data on the hash table afterwards.
+  static void copyElmsNextUnsafe(MixedArray* to, const MixedArray* from,
+                                 uint32_t nElems);
 
   template <typename AccessorT>
   SortFlavor preSort(const AccessorT& acc, bool checkTypes);
@@ -392,11 +413,12 @@ private:
   ssize_t nextElm(Elm* elms, ssize_t ei) const {
     assert(ei >= -1);
     while (size_t(++ei) < m_used) {
-      if (!isTombstone(elms[ei].data.m_type)) {
+      if (!elms[ei].isTombstone()) {
         return ei;
       }
     }
-    return m_used;
+    assert(ei == m_used);
+    return ei;
   }
 
   ssize_t prevElm(Elm* elms, ssize_t ei) const;
@@ -408,14 +430,14 @@ private:
   template <class Hit>
   ssize_t findImpl(size_t h0, Hit) const;
   ssize_t find(int64_t ki) const;
-  ssize_t find(const StringData* s, strhash_t prehash) const;
+  ssize_t find(const StringData* s, strhash_t h) const;
 
   // The array should already be sized for the new insertion before
   // calling these methods.
   template <class Hit>
   int32_t* findForInsertImpl(size_t h0, Hit) const;
   int32_t* findForInsert(int64_t ki) const;
-  int32_t* findForInsert(const StringData* k, strhash_t prehash) const;
+  int32_t* findForInsert(const StringData* k, strhash_t h) const;
 
   struct InsertPos {
     InsertPos(bool found, TypedValue& tv) : found(found), tv(tv) {}
@@ -428,7 +450,7 @@ private:
   template <class Hit, class Remove>
   ssize_t findForRemoveImpl(size_t h0, Hit, Remove) const;
   ssize_t findForRemove(int64_t ki, bool updateNext);
-  ssize_t findForRemove(const StringData* k, strhash_t prehash);
+  ssize_t findForRemove(const StringData* k, strhash_t h);
 
   ssize_t iter_advance_helper(ssize_t prev) const;
 
@@ -496,16 +518,15 @@ private:
    * when Grow()ing the array, that also checks for potentially
    * unbalanced entries because of hash collision.
    */
-  static void InsertCheckUnbalanced(MixedArray* ad, int32_t* table,
-                                    uint32_t mask,
-                                    Elm* iter, Elm* stop);
+  static MixedArray* InsertCheckUnbalanced(MixedArray* ad, int32_t* table,
+                                           uint32_t mask,
+                                           Elm* iter, Elm* stop);
   /*
    * grow() increases the hash table size and the number of slots for
    * elements by a factor of 2. grow() rebuilds the hash table, but it
    * does not compact the elements.
    */
   static MixedArray* Grow(MixedArray* old, uint32_t newScale);
-  static MixedArray* GrowPacked(MixedArray* old);
 
   /**
    * compact() does not change the hash table size or the number of slots
@@ -530,7 +551,6 @@ private:
    */
   MixedArray* resize();
   MixedArray* resizeIfNeeded();
-  MixedArray* resizePackedIfNeeded();
 
   Elm* data() const {
     return const_cast<Elm*>(reinterpret_cast<Elm const*>(this + 1));
@@ -539,7 +559,7 @@ private:
   int32_t* hashTab() const {
     return const_cast<int32_t*>(
       reinterpret_cast<int32_t const*>(
-        data() + capacity()
+        data() + static_cast<size_t>(m_scale) * 3
       )
     );
   }

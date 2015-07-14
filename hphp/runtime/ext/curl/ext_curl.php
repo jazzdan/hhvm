@@ -46,6 +46,16 @@ function curl_errno(resource $ch): mixed;
 function curl_error(resource $ch): mixed;
 
 /**
+ * Returns a string description of a cURL error code
+ *
+ * @param int $errno - a curl error code, e.g. returned by curl_errno()
+ *
+ * @return string - Returns a string description of a cURL error code
+ */
+<<__Native>>
+function curl_strerror(int $errno): string;
+
+/**
  * Perform a cURL session
  *
  * @param resource $ch -
@@ -117,6 +127,25 @@ function curl_getinfo(resource $ch,
  */
 <<__Native>>
 function curl_init(?string $url = null): mixed;
+
+
+/**
+ * Initialize a cURL session using a pooled curl handle. When this resource
+ * is garbage collected, the curl handle will be saved for reuse later.
+ * Pooled curl handles persist between requests.
+ *
+ * @param string $poolName - The name of the connection pool to use.
+ *  Named connection pools are initialized via the 'curl.namedPools' ini
+ *  setting, which is a comma separated list of named pools to create.
+ * @param string $url - If provided, the CURLOPT_URL option will be set
+ *   to its value. You can manually set this using the curl_setopt()
+ *   function.    The file protocol is disabled by cURL if open_basedir is
+ *   set.
+ *
+ * @return resource - Returns a cURL handle on success, FALSE on errors.
+ */
+<<__Native, __HipHopSpecific>>
+function curl_init_pooled(string $poolName, ?string $url = null): mixed;
 
 /**
  * Add a normal cURL handle to a cURL multi handle

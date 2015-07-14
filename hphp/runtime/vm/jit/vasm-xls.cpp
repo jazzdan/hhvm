@@ -55,11 +55,26 @@ namespace {
 
 size_t s_counter;
 
+// Vreg discriminator.
+enum class Constraint { Any, CopySrc, Gpr, Simd, Sf };
+
+Constraint constraint(const Vreg&) { return Constraint::Any; }
+Constraint constraint(const Vreg64&) { return Constraint::Gpr; }
+Constraint constraint(const Vreg32&) { return Constraint::Gpr; }
+Constraint constraint(const Vreg16&) { return Constraint::Gpr; }
+Constraint constraint(const Vreg8&) { return Constraint::Gpr; }
+Constraint constraint(const VregDbl&) { return Constraint::Simd; }
+Constraint constraint(const Vreg128&) { return Constraint::Simd; }
+Constraint constraint(const VregSF&) { return Constraint::Sf; }
+
+bool is_wide(const Vreg128&) { return true; }
+template<class T> bool is_wide(const T&) { return false; }
+
 // A Use refers to the position where an interval is used or defined
 struct Use {
-  VregKind kind;
+  Constraint kind;
   unsigned pos;
-  Vreg hint; // if valid, try to use same vreg as this
+  Vreg hint; // if valid, try to use same physical register as hint.
 };
 
 // A LiveRange is an closed-open range of positions where an interval is live.
@@ -72,9 +87,6 @@ struct LiveRange {
 public:
   unsigned start, end;
 };
-
-typedef jit::vector<LiveRange> RangeList;
-typedef jit::vector<Use> UseList;
 
 constexpr int kInvalidSpillSlot = -1;
 
@@ -119,8 +131,8 @@ struct Interval {
 public:
   Interval* const parent;
   Interval* next{nullptr};
-  RangeList ranges;
-  UseList uses;
+  jit::vector<LiveRange> ranges;
+  jit::vector<Use> uses;
   const Vreg vreg;
   unsigned def_pos;
   int slot{kInvalidSpillSlot};
@@ -130,16 +142,16 @@ public:
   Vconst val;
 };
 
-typedef boost::dynamic_bitset<> LiveSet;
-typedef std::pair<Vlabel,unsigned> EdgeKey;
+using LiveSet = boost::dynamic_bitset<>;
+using EdgeKey = std::pair<Vlabel,unsigned>;
+using CopyPlan = PhysReg::Map<Interval*>;
+using PosVec = PhysReg::Map<unsigned>;
+
 struct EdgeHasher {
   size_t operator()(EdgeKey k) const {
     return size_t(k.first) ^ k.second;
   }
 };
-
-typedef PhysReg::Map<Interval*> CopyPlan;
-typedef PhysReg::Map<unsigned> PosVec;
 
 // Extended Linear Scan register allocator over vasm virtual registers (Vregs).
 // This encapsulates the intermediate data structures used during the algorithm
@@ -173,10 +185,11 @@ struct Vxls {
   void buildIntervals();
   void walkIntervals();
   void resolveSplits();
-  void lowerCopyargs();
+  void lowerCopies();
   void resolveEdges();
   void renameOperands();
   void insertCopies();
+  void peephole();
   void allocateSpillSpace();
 
   // utilities
@@ -193,7 +206,8 @@ struct Vxls {
   void spillOthers(Interval* current, PhysReg r);
   void assignSpill(Interval* ivl);
   void insertCopiesAt(jit::vector<Vinstr>& code, unsigned& j,
-                      const CopyPlan&, MemoryRef slots, unsigned pos);
+                      const CopyPlan&, MemoryRef slots, unsigned pos,
+                      const Interval* sf_ivl);
   void insertSpillsAt(jit::vector<Vinstr>& code, unsigned& j,
                       const CopyPlan&, MemoryRef slots, unsigned pos);
   PhysReg findHint(Interval* current, const PosVec& free_until, RegSet allow);
@@ -378,19 +392,22 @@ unsigned nextIntersect(const Interval* current, const Interval* other) {
   return kMaxPos;
 }
 
-// Return the position of the next use >= pos.
-// If there are no more uses after pos, return kMaxPos.
+// Return the position of the next use >= pos that requires a register.
+// If there are no more uses after pos that require a register, return kMaxPos.
 unsigned Interval::firstUseAfter(unsigned pos) const {
-  auto u = uses.begin() + findUse(pos);
-  return u != uses.end() && pos <= u->pos ? u->pos :
-         kMaxPos;
+  for (auto& u : uses) {
+    if (u.kind == Constraint::CopySrc) continue;
+    if (u.pos >= pos) return u.pos;
+  }
+  return kMaxPos;
 }
 
-// Return the position of the latest use <= pos.
+// Return the position of the latest use <= pos that requires a register.
 // If the first use is after pos, return 0.
 unsigned Interval::lastUseBefore(unsigned pos) const {
   auto prev = 0;
   for (auto& u : uses) {
+    if (u.kind == Constraint::CopySrc) continue;
     if (u.pos > pos) return prev;
     prev = u.pos;
   }
@@ -398,9 +415,12 @@ unsigned Interval::lastUseBefore(unsigned pos) const {
 }
 
 // Return the position of the first use that requires a register,
-// or kMaxPos if no remaining uses need registers.
+// or kMaxPos if no remaining uses need registers. (Ignores CopySrc).
 unsigned Interval::firstUse() const {
-  return uses.empty() ? kMaxPos : uses.front().pos;
+  for (auto& u : uses) {
+    if (u.kind != Constraint::CopySrc) return u.pos;
+  }
+  return kMaxPos;
 }
 
 // Split this interval at pos and return the rest. Pos must be a location
@@ -493,6 +513,12 @@ Vxls::~Vxls() {
  *
  * If any sub-interval was spilled, a single store is generated after each
  * definition point.
+ *
+ * When analyzing instructions that use or define a virtual SF register
+ * (VregSF), eagerly rename it to the singleton PhysReg RegSF{0}, under the
+ * assumption that there can only be one live SF at each position. This
+ * reduces the number of intervals we need to process, facilitates inserting
+ * ldimm{0} (as xor), and is checked by checkSF().
  */
 
 void Vxls::allocate() {
@@ -505,22 +531,19 @@ void Vxls::allocate() {
   buildIntervals();
   walkIntervals();
   resolveSplits();
-  lowerCopyargs();
+  lowerCopies();
   resolveEdges();
   renameOperands();
   insertCopies();
-  // Remove nop-copies before allocating spill space, since it might create new
+  // insertCopies() can generate spills before fallbackccs in the
+  // entry block, which causes spill space to be allocated and
+  // deallocated immediately when the type-checks fail. So call
+  // hoistFallbackccs to move the fallbackccs above such stores to
+  // prevent this problem.
+  hoistFallbackccs(unit);
+  // clean up before allocating spill space, since it might create new
   // blocks and modify the cfg.
-  for (auto b : blocks) {
-    auto& code = unit.blocks[b].code;
-    auto end = std::remove_if(code.begin(), code.end(), [&](Vinstr& inst) {
-      return is_trivial_nop(inst) ||
-             inst.op == Vinstr::copyargs || // we lowered it
-             inst.op == Vinstr::phidef; // we lowered it
-    });
-    code.erase(end, code.end());
-  }
-
+  peephole();
   allocateSpillSpace();
   printUnit(kVasmRegAllocLevel, "after vasm-xls", unit);
 }
@@ -633,6 +656,10 @@ struct LiveDefVisitor {
   void def(Vtuple defs) { for (auto r : m_tuples[defs]) def(r); }
   void defHint(Vtuple def_tuple, Vtuple hint_tuple) { def(def_tuple); }
   void defHint(Vreg d, Vreg hint) { def(d); }
+  void def(VregSF r) {
+    r = RegSF{0}; // eagerly rename all SFs
+    m_live.reset(r);
+  }
 
  private:
   jit::vector<VregList>& m_tuples;
@@ -647,8 +674,9 @@ struct LiveUseVisitor {
   {}
   template<class F>          void imm(const F&) {}
   template<class R>          void def(R) {}
-  template<class D, class H> void defHint(D, H){}
+  template<class D, class H> void defHint(D, H) {}
   template<class R>          void across(R r) { use(r); }
+  void across(VregSF) = delete;
   void across(RegSet regs) { regs.forEach([&](Vreg r) { across(r); }); }
   void use(Vreg r)         { m_live.set(r); }
   void use(Vtuple uses)    { for (auto r : m_tuples[uses]) use(r); }
@@ -657,6 +685,10 @@ struct LiveUseVisitor {
   void use(Vptr m) {
     if (m.base.isValid()) use(m.base);
     if (m.index.isValid()) use(m.index);
+  }
+  void use(VregSF r) {
+    r = RegSF{0}; // eagerly rename all SFs
+    m_live.set(r);
   }
   template<class S, class H> void useHint(S src, H hint) { use(src); }
   void useHint(Vtuple src_tuple, Vtuple hint_tuple) { use(src_tuple); }
@@ -752,20 +784,24 @@ struct DefVisitor {
     auto& defs = m_tuples[def_tuple];
     auto& hints = m_tuples[hint_tuple];
     for (int i = 0; i < defs.size(); i++) {
-      def(defs[i], VregKind::Any, hints[i]);
+      def(defs[i], Constraint::Any, hints[i]);
     }
   }
   template<class D, class H> void defHint(D dst, H hint) {
-    def(dst, dst.kind, hint, dst.bits == 128);
+    def(dst, constraint(dst), hint, is_wide(dst));
   }
   template<class R> void def(R r) {
-    def(r, r.kind, Vreg{}, r.bits == 128);
+    def(r, constraint(r), Vreg{}, is_wide(r));
   }
-  void def(Vreg r) { def(r, VregKind::Any); }
-  void defHint(Vreg d, Vreg hint) { def(d, VregKind::Any, hint); }
+  void def(Vreg r) { def(r, Constraint::Any); }
+  void defHint(Vreg d, Vreg hint) { def(d, Constraint::Any, hint); }
   void def(RegSet rs) { rs.forEach([&](Vreg r) { def(r); }); }
+  void def(VregSF r) {
+    r = RegSF{0}; // eagerly rename all SFs
+    def(r, constraint(r));
+  }
 private:
-  void def(Vreg r, VregKind kind, Vreg hint = Vreg{}, bool wide = false) {
+  void def(Vreg r, Constraint kind, Vreg hint = Vreg{}, bool wide = false) {
     auto ivl = m_intervals[r];
     if (m_live.test(r)) {
       m_live.reset(r);
@@ -794,11 +830,12 @@ private:
 // this kinda sucks, but I can't use a lambda to handle Vreg and Vptr
 // at the same time.
 struct UseVisitor {
-  UseVisitor(LiveSet& live, Vxls& vxls, LiveRange range)
+  UseVisitor(LiveSet& live, Vxls& vxls, const Vinstr& inst, LiveRange range)
     : m_intervals(vxls.intervals)
     , m_tuples(vxls.unit.tuples)
     , m_live(live)
     , m_range(range)
+    , m_inst(inst)
   {}
   template<class F> void imm(const F&){} // skip immediates
   template<class R> void def(R){} // skip defs
@@ -828,16 +865,29 @@ struct UseVisitor {
     regs.forEach([&](Vreg r) { across(r); });
   }
 
-  template<class R> void use(R r) { use(r, r.kind, m_range.end); }
+  template<class R> void use(R r) { use(r, constraint(r), m_range.end); }
   template<class S, class H> void useHint(S src, H hint) {
-    use(src, src.kind, m_range.end, hint);
+    use(src, constraint(src), m_range.end, hint);
   }
-  void use(Vreg r, VregKind kind, unsigned end, Vreg hint = Vreg{}) {
+  void use(VregSF r) {
+    r = RegSF{0}; // eagerly rename all SFs
+    use(r, constraint(r), m_range.end);
+  }
+  void use(Vreg r, Constraint kind, unsigned end, Vreg hint = Vreg{}) {
     m_live.set(r);
     auto ivl = m_intervals[r];
     if (!ivl) ivl = m_intervals[r] = jit::make<Interval>(r);
     ivl->add({m_range.start, end});
     if (!ivl->fixed()) {
+      if (m_inst.op == Vinstr::copyargs ||
+          m_inst.op == Vinstr::copy2 ||
+          m_inst.op == Vinstr::copy ||
+          (m_inst.op == Vinstr::phijcc && kind != Constraint::Sf) ||
+          m_inst.op == Vinstr::phijmp) {
+        // all these instructions lower to parallel copyplans, which know
+        // how to load directly from constants or spilled locations
+        kind = Constraint::CopySrc;
+      }
       ivl->uses.push_back({kind, m_range.end, hint});
     }
   }
@@ -847,12 +897,13 @@ struct UseVisitor {
   // which ensures it will be assigned a different register than the
   // destination. This isn't necessary if *both* operands of a binary
   // instruction are the same virtual register, but is still correct.
-  template<class R> void across(R r) { use(r, r.kind, m_range.end + 1); }
+  template<class R> void across(R r) { use(r, constraint(r), m_range.end + 1); }
 private:
   jit::vector<Interval*>& m_intervals;
   jit::vector<VregList>& m_tuples;
   LiveSet& m_live;
   const LiveRange m_range;
+  const Vinstr& m_inst;
 };
 
 // Compute lifetime intervals and use positions of all intervals by walking
@@ -890,7 +941,7 @@ void Vxls::buildIntervals() {
       visitOperands(inst, dv);
       dv.def(implicit_defs);
 
-      UseVisitor uv(live, *this, {block_range.start, pos});
+      UseVisitor uv(live, *this, inst, {block_range.start, pos});
       visitOperands(inst, uv);
       uv.use(implicit_uses);
       uv.across(implicit_across);
@@ -901,7 +952,7 @@ void Vxls::buildIntervals() {
   }
 
   // finish processing live ranges for constants
-  for (auto& c : unit.constants) {
+  for (auto& c : unit.constToReg) {
     if (auto ivl = intervals[c.second]) {
       ivl->ranges.back().start = 0;
       ivl->constant = true;
@@ -1025,10 +1076,10 @@ unsigned Vxls::constrain(Interval* ivl, RegSet& allow) {
   auto const any = m_abi.unreserved() - m_abi.sf; // Any but not flags.
   allow = m_abi.unreserved();
   for (auto& u : ivl->uses) {
-    auto need = u.kind == VregKind::Simd ? m_abi.simdUnreserved :
-                u.kind == VregKind::Gpr ? m_abi.gpUnreserved :
-                u.kind == VregKind::Sf ? m_abi.sf :
-                /* VregKind::Any */ any;
+    auto need = u.kind == Constraint::Simd ? m_abi.simdUnreserved :
+                u.kind == Constraint::Gpr ? m_abi.gpUnreserved :
+                u.kind == Constraint::Sf ? m_abi.sf :
+                any; // Any or CopySrc
     if ((allow & need).empty()) {
       // cannot satisfy constraints; must split before u.pos
       return u.pos - 1;
@@ -1048,7 +1099,7 @@ unsigned Vxls::nearestSplitBefore(unsigned pos) {
 }
 
 // Return the first usable hint from all the uses in this interval.
-// Skip uses that don't have any hint, or have an unsable hint.
+// Skip uses that don't have any hint, or have an unusable hint.
 PhysReg Vxls::findHint(Interval* current, const PosVec& free_until,
                        RegSet allow) {
   if (!RuntimeOption::EvalHHIREnablePreColoring &&
@@ -1061,6 +1112,8 @@ PhysReg Vxls::findHint(Interval* current, const PosVec& free_until,
     }
     return InvalidReg;
   };
+
+  auto ret = InvalidReg;
   for (auto u : current->uses) {
     if (!u.hint.isValid()) continue;
     auto hint_ivl = intervals[u.hint];
@@ -1076,8 +1129,12 @@ PhysReg Vxls::findHint(Interval* current, const PosVec& free_until,
     if (free_until[hint] >= current->end()) {
       return hint;
     }
+    if (ret == InvalidReg ||
+        free_until[ret] < free_until[hint]) {
+      ret = hint;
+    }
   }
-  return InvalidReg;
+  return ret;
 }
 
 void Vxls::allocate(Interval* current) {
@@ -1097,9 +1154,34 @@ void Vxls::allocate(Interval* current) {
     free_until[r] = std::min(until, free_until[r]);
   }
 
+  if (current->ranges.size() > 1) {
+    auto blk_range = findBlockRange(current->start());
+    if (blk_range.end > current->ranges[0].end) {
+      // We're assigning a register to an interval with
+      // multiple ranges, but the vreg isn't live out
+      // of the first range. This means there's no
+      // connection between this range and any subsequent
+      // one, so we can safely break the interval
+      // after the first range without making things worse.
+      // On the other hand, it can make things better, by
+      // eg not assigning a constant to a register in an
+      // unlikely exit block, and then holding it in a callee save
+      // reg across lots of unrelated code until its used
+      // again in another unlikely exit block.
+      auto second = current->split(blk_range.end, false);
+      pending.push(second);
+    } else if (current->constant &&
+               current->uses.size() &&
+               current->uses[0].pos >= blk_range.end) {
+      // we probably don't want to load a constant into a register
+      // at the start of a block where its not used.
+      return spill(current);
+    }
+  }
+
   // Try to get a hinted register
   auto hint = findHint(current, free_until, allow);
-  if (hint != InvalidReg) {
+  if (hint != InvalidReg && free_until[hint] >= current->end()) {
     return assignReg(current, hint);
   }
   auto r = find(free_until);
@@ -1115,8 +1197,31 @@ void Vxls::allocate(Interval* current) {
     assertx(min_split <= max_split);
     auto split_pos = nearestSplitBefore(max_split);
     if (split_pos > current->start()) {
+      if (prev_use && prev_use < split_pos) {
+        /*
+         * If there are uses in previous blocks, but no
+         * uses between the start of the block containing split_pos,
+         * and split_pos itself, we should split earlier; otherwise
+         * we'll need to insert moves/loads on the edge(s) into this
+         * block, which clearly can't be used since we're spilling
+         * before the first use.
+         * Might as well spill on a block boundary, as early as
+         * possible.
+         */
+        auto prev_range_ix = current->findRange(prev_use);
+        auto prev_range = &current->ranges[prev_range_ix];
+        if (prev_range->start <= prev_use && prev_range->end < split_pos) {
+          prev_range++;
+        }
+        if (prev_range->start > prev_use && prev_range->start < split_pos) {
+          split_pos = prev_range->start;
+        }
+      }
       auto second = current->split(split_pos, true);
       pending.push(second);
+      if (hint != InvalidReg && free_until[hint] >= current->end()) {
+        r = hint;
+      }
       return assignReg(current, r);
     }
   }
@@ -1182,8 +1287,15 @@ void Vxls::allocBlocked(Interval* current) {
 
 // Assign r to this interval.
 void Vxls::assignReg(Interval* ivl, PhysReg r) {
-  ivl->reg = r;
-  active.push_back(ivl);
+  if (!ivl->fixed() && ivl->uses.empty()) {
+    ivl->reg = InvalidReg;
+    if (!ivl->constant) {
+      assignSpill(ivl);
+    }
+  } else {
+    ivl->reg = r;
+    active.push_back(ivl);
+  }
 }
 
 // split ivl at pos and spill the second part.  If pos is too close
@@ -1209,7 +1321,6 @@ void Vxls::spill(Interval* ivl) {
     }
     pending.push(ivl->split(split_pos));
   }
-  assertx(ivl->uses.empty());
   ivl->reg = InvalidReg;
   if (!ivl->constant) assignSpill(ivl);
 }
@@ -1243,7 +1354,7 @@ void Vxls::spillOthers(Interval* current, PhysReg r) {
 
 // Assign the next available spill slot to interval
 void Vxls::assignSpill(Interval* ivl) {
-  assertx(!ivl->fixed() && ivl->parent && ivl->uses.empty());
+  assertx(!ivl->fixed() && ivl->parent);
 
   auto leader = ivl->parent;
 
@@ -1304,23 +1415,23 @@ struct Renamer {
   }
   void use(RegSet r){}
 private:
-  void rename(Vreg8& r) { r = lookup(r, VregKind::Gpr); }
-  void rename(Vreg16& r) { r = lookup(r, VregKind::Gpr); }
-  void rename(Vreg32& r) { r = lookup(r, VregKind::Gpr); }
-  void rename(Vreg64& r) { r = lookup(r, VregKind::Gpr); }
-  void rename(VregDbl& r) { r = lookup(r, VregKind::Simd); }
-  void rename(Vreg128& r) { r = lookup(r, VregKind::Simd); }
-  void rename(VregSF& r) { r = lookup(r, VregKind::Sf); }
-  void rename(Vreg& r) { r = lookup(r, VregKind::Any); }
+  void rename(Vreg8& r) { r = lookup(r, Constraint::Gpr); }
+  void rename(Vreg16& r) { r = lookup(r, Constraint::Gpr); }
+  void rename(Vreg32& r) { r = lookup(r, Constraint::Gpr); }
+  void rename(Vreg64& r) { r = lookup(r, Constraint::Gpr); }
+  void rename(VregDbl& r) { r = lookup(r, Constraint::Simd); }
+  void rename(Vreg128& r) { r = lookup(r, Constraint::Simd); }
+  void rename(VregSF& r) { r = RegSF{0}; }
+  void rename(Vreg& r) { r = lookup(r, Constraint::Any); }
   void rename(Vtuple t) { /* phijmp/phijcc+phidef handled by resolveEdges */ }
-  PhysReg lookup(Vreg vreg, VregKind kind) {
+  PhysReg lookup(Vreg vreg, Constraint kind) {
     auto ivl = xls.intervals[vreg];
     if (!ivl || vreg.isPhys()) return vreg;
     PhysReg reg = ivl->childAt(pos)->reg;
-    assertx((kind == VregKind::Gpr && reg.isGP()) ||
-           (kind == VregKind::Simd && reg.isSIMD()) ||
-           (kind == VregKind::Sf && reg.isSF()) ||
-           (kind == VregKind::Any && reg != InvalidReg));
+    assertx((kind == Constraint::Gpr && reg.isGP()) ||
+           (kind == Constraint::Simd && reg.isSIMD()) ||
+           (kind == Constraint::Sf && reg.isSF()) ||
+           (kind == Constraint::Any && reg != InvalidReg));
     return reg;
   }
 private:
@@ -1383,8 +1494,17 @@ void Vxls::insertSpill(Interval* ivl) {
   spills[pos][ivl->reg] = ivl; // store ivl->reg => ivl->slot
 }
 
-// Lower copyargs into moveplans at the copyargs position.
-void Vxls::lowerCopyargs() {
+// Lower copyargs{} and copy{} into moveplans at the same position.
+void Vxls::lowerCopies() {
+  auto lower = [&](unsigned pos, Vreg s, Vreg d) {
+    auto i1 = intervals[s];
+    if (!i1->fixed()) i1 = i1->childAt(pos);
+    auto i2 = intervals[d];
+    if (i2->reg != i1->reg) {
+      assertx(!copies[pos][i2->reg]);
+      copies[pos][i2->reg] = i1;
+    }
+  };
   for (auto b : blocks) {
     auto pos = block_ranges[b].start;
     for (auto& inst : unit.blocks[b].code) {
@@ -1392,14 +1512,16 @@ void Vxls::lowerCopyargs() {
         auto& uses = unit.tuples[inst.copyargs_.s];
         auto& defs = unit.tuples[inst.copyargs_.d];
         for (unsigned i = 0, n = uses.size(); i < n; ++i) {
-          auto i1 = intervals[uses[i]];
-          if (i1 && !i1->fixed()) i1 = i1->childAt(pos);
-          auto i2 = intervals[defs[i]];
-          if (i2->reg != i1->reg) {
-            assertx(!copies[pos][i2->reg]);
-            copies[pos][i2->reg] = i1;
-          }
+          lower(pos, uses[i], defs[i]);
         }
+        inst = nop{};
+      } else if (inst.op == Vinstr::copy2) {
+        lower(pos, inst.copy2_.s0, inst.copy2_.d0);
+        lower(pos, inst.copy2_.s1, inst.copy2_.d1);
+        inst = nop{};
+      } else if (inst.op == Vinstr::copy) {
+        lower(pos, inst.copy_.s, inst.copy_.d);
+        inst = nop{};
       }
       pos += 2;
     }
@@ -1416,8 +1538,8 @@ static Vtuple findDefs(const Vunit& unit, Vlabel b) {
 }
 
 void Vxls::resolveEdges() {
-  auto addEdgeCopiesForPhiUseDefIntervalConflicts = [&](
-    Vlabel block, Vlabel target, uint32_t targetIndex, const VregList& uses) {
+  auto addPhiEdgeCopies =
+  [&](Vlabel block, Vlabel target, uint32_t targetIndex, const VregList& uses) {
     auto p1 = block_ranges[block].end - 2;
     auto& defs = unit.tuples[findDefs(unit, target)];
     for (unsigned i = 0, n = uses.size(); i < n; ++i) {
@@ -1436,25 +1558,18 @@ void Vxls::resolveEdges() {
     auto succlist = succs(block1);
     auto& inst1 = block1.code.back();
     if (inst1.op == Vinstr::phijmp) {
-      auto target = inst1.phijmp_.target;
-      auto& uses = unit.tuples[inst1.phijmp_.uses];
-      addEdgeCopiesForPhiUseDefIntervalConflicts(b1, target, 0, uses);
-
-      auto tmp_pos = inst1.pos;
+      auto& phijmp = inst1.phijmp_;
+      auto target = phijmp.target;
+      auto& uses = unit.tuples[phijmp.uses];
+      addPhiEdgeCopies(b1, target, 0, uses);
       inst1 = jmp{target};
-      inst1.pos = tmp_pos;
     } else if (inst1.op == Vinstr::phijcc) {
-      auto& uses = unit.tuples[inst1.phijcc_.uses];
-      uint32_t i = 0;
-      for (auto target : succs(inst1)) {
-        addEdgeCopiesForPhiUseDefIntervalConflicts(b1, target, i, uses);
-        i += 1;
-      }
-
-      auto& targets = inst1.phijcc_.targets;
-      auto tmp_pos = inst1.pos;
-      inst1 = jcc{inst1.phijcc_.cc, inst1.phijcc_.sf, {targets[0], targets[1]}};
-      inst1.pos = tmp_pos;
+      auto& phijcc = inst1.phijcc_;
+      auto& uses = unit.tuples[phijcc.uses];
+      auto& targets = phijcc.targets;
+      addPhiEdgeCopies(b1, targets[0], 0, uses);
+      addPhiEdgeCopies(b1, targets[1], 1, uses);
+      inst1 = jcc{phijcc.cc, phijcc.sf, {targets[0], targets[1]}};
     }
     for (unsigned i = 0, n = succlist.size(); i < n; i++) {
       auto b2 = succlist[i];
@@ -1481,6 +1596,11 @@ void Vxls::resolveEdges() {
 // last phase: mutate the code by inserting copies. this destroyes
 // the position numbering, so we can't use interval positions after this.
 void Vxls::insertCopies() {
+  // sf_ivl is the physical SF register, computed from the union of VregSF
+  // registers by computeLiveness() and buildIntervals().
+  // Its safe to lower ldimm{0,r} to xor{r,r,r} when SF is not live.
+  auto sf_ivl = intervals[VregSF(RegSF{0})];
+
   // insert copies inside blocks
   for (auto b : blocks) {
     auto pos = block_ranges[b].start;
@@ -1496,11 +1616,11 @@ void Vxls::insertCopies() {
       }
       auto c = copies.find(pos - 1);
       if (c != copies.end()) {
-        insertCopiesAt(code, j, c->second, slots, pos - 1);
+        insertCopiesAt(code, j, c->second, slots, pos - 1, sf_ivl);
       }
       c = copies.find(pos);
       if (c != copies.end()) {
-        insertCopiesAt(code, j, c->second, slots, pos);
+        insertCopiesAt(code, j, c->second, slots, pos, sf_ivl);
       }
     }
   }
@@ -1515,7 +1635,8 @@ void Vxls::insertCopies() {
       if (c != edge_copies.end()) {
         unsigned j = code.size() - 1;
         auto slots = m_sp[spill_offsets[succlist[0]]];
-        insertCopiesAt(code, j, c->second, slots, block_ranges[b].end - 1);
+        insertCopiesAt(code, j, c->second, slots,
+                       block_ranges[b].end - 1, sf_ivl);
       }
     } else {
       // copies will go at start of successor
@@ -1526,7 +1647,8 @@ void Vxls::insertCopies() {
           auto slots = m_sp[spill_offsets[s]];
           auto& code = unit.blocks[s].code;
           unsigned j = 0;
-          insertCopiesAt(code, j, c->second, slots, block_ranges[s].start);
+          insertCopiesAt(code, j, c->second, slots,
+                         block_ranges[s].start, sf_ivl);
         }
       }
     }
@@ -1535,6 +1657,37 @@ void Vxls::insertCopies() {
     dumpIntervals();
     print("after inserting copies");
   );
+}
+
+// Run a quick peephole pass to clean up after ourselves.
+// Remove nop-copies before allocating spill space, since it might create new
+// instructions that we lowered, and trivial copies.
+void Vxls::peephole() {
+  auto match_xchg = [](Vinstr& i, Vreg& r0, Vreg& r1) {
+    if (i.op != Vinstr::copy2) return false;
+    r0 = i.copy2_.s0;
+    r1 = i.copy2_.s1;
+    return r0 == i.copy2_.d1 && r1 == i.copy2_.d0;
+  };
+  for (auto b : blocks) {
+    auto& code = unit.blocks[b].code;
+    for (int i=0, n = code.size(); i+1 < n; i++) {
+      Vreg r0, r1, r2, r3;
+      if (match_xchg(code[i], r0, r1) &&
+          match_xchg(code[i+1], r2, r3) &&
+          ((r0 == r2 && r1 == r3) || (r0 == r3 && r1 == r2))) {
+        // matched xchg+xchg that cancel each other
+        code[i] = nop{};
+        code[i+1] = nop{};
+        i++;
+      }
+    }
+    auto end = std::remove_if(code.begin(), code.end(), [&](Vinstr& inst) {
+      return is_trivial_nop(inst) ||
+             inst.op == Vinstr::phidef; // we lowered it
+    });
+    code.erase(end, code.end());
+  }
 }
 
 /*
@@ -1657,7 +1810,9 @@ void processSpillExits(Vunit& unit, Vlabel label, SpillState state,
     state = instrInState(unit, inst, state, sp);
 
     if (state < NeedSpill ||
-        (inst.op != Vinstr::fallbackcc && inst.op != Vinstr::bindjcc)) {
+        (inst.op != Vinstr::fallbackcc &&
+         inst.op != Vinstr::bindjcc &&
+         inst.op != Vinstr::jcci)) {
       continue;
     }
 
@@ -1676,13 +1831,19 @@ void processSpillExits(Vunit& unit, Vlabel label, SpillState state,
       targetCode.emplace_back(fallback{fb_i.dest, fb_i.trflags, fb_i.args});
       cc = fb_i.cc;
       sf = fb_i.sf;
-    } else {
+    } else if (inst.op == Vinstr::bindjcc) {
       auto const& bj_i = inst.bindjcc_;
       targetCode.emplace_back(free);
       targetCode.emplace_back(bindjmp{bj_i.target, bj_i.spOff, bj_i.trflags,
                                       bj_i.args});
       cc = bj_i.cc;
       sf = bj_i.sf;
+    } else /* inst.op == Vinstr::jcci */ {
+      auto const& jcc_i = inst.jcci_;
+      targetCode.emplace_back(free);
+      targetCode.emplace_back(jmpi{jcc_i.taken});
+      cc = jcc_i.cc;
+      sf = jcc_i.sf;
     }
     targetCode.back().origin = inst.origin;
 
@@ -1863,11 +2024,7 @@ void Vxls::insertSpillsAt(jit::vector<Vinstr>& code, unsigned& j,
     assertx(slot >= 0 && src == ivl->reg);
     MemoryRef ptr{slots.r + slotOffset(slot)};
     if (!ivl->wide) {
-      always_assert_flog(
-        !src.isSF(),
-        "Tried to spill %flags in Vunit:\n\n{}",
-        show(unit)
-      );
+      always_assert_flog(!src.isSF(), "Tried to spill %flags");
       stores.emplace_back(store{src, ptr});
     } else {
       assertx(src.isSIMD());
@@ -1885,7 +2042,10 @@ void Vxls::insertSpillsAt(jit::vector<Vinstr>& code, unsigned& j,
 
 void Vxls::insertCopiesAt(jit::vector<Vinstr>& code, unsigned& j,
                           const CopyPlan& copies, MemoryRef slots,
-                          unsigned pos) {
+                          unsigned pos, const Interval* sf_ivl) {
+  auto sf_live = [&](unsigned pos) {
+    return sf_ivl && !sf_ivl->ranges.empty() && sf_ivl->covers(pos);
+  };
   MovePlan moves;
   jit::vector<Vinstr> loads;
   for (auto dst : copies) {
@@ -1894,23 +2054,39 @@ void Vxls::insertCopiesAt(jit::vector<Vinstr>& code, unsigned& j,
     if (ivl->reg != InvalidReg) {
       moves[dst] = ivl->reg;
     } else if (ivl->constant) {
-      if (!ivl->val.isUndef) {
-        switch (ivl->val.kind) {
-          case Vconst::Quad:
-            loads.emplace_back(ldimmq{ivl->val.val, dst, true});
-            break;
-          case Vconst::Long:
-            loads.emplace_back(ldimml{int32_t(ivl->val.val), dst, true});
-            break;
-          case Vconst::Byte:
-            loads.emplace_back(ldimmb{uint8_t(ivl->val.val), dst, true});
-            break;
-          case Vconst::ThreadLocal:
-            loads.emplace_back(
-              load{Vptr{baseless(ivl->val.disp), Vptr::FS}, dst}
-            );
-            break;
-        }
+      if (ivl->val.isUndef) continue;
+      auto const use_xor = ivl->val.val == 0 && dst.isGP() && !sf_live(pos);
+      switch (ivl->val.kind) {
+        case Vconst::Quad:
+        case Vconst::Double:
+          if (use_xor) {
+            Vreg32 d32 = dst; // assume 32-bit ops zero upper bits
+            loads.emplace_back(xorl{d32, d32, d32, RegSF{0}});
+          } else {
+            loads.emplace_back(ldimmq{ivl->val.val, dst});
+          }
+          break;
+        case Vconst::Long:
+          if (use_xor) {
+            Vreg32 d32 = dst;
+            loads.emplace_back(xorl{d32, d32, d32, RegSF{0}});
+          } else {
+            loads.emplace_back(ldimml{int32_t(ivl->val.val), dst});
+          }
+          break;
+        case Vconst::Byte:
+          if (use_xor) {
+            Vreg8 d8 = dst;
+            loads.emplace_back(xorb{d8, d8, d8, RegSF{0}});
+          } else {
+            loads.emplace_back(ldimmb{uint8_t(ivl->val.val), dst});
+          }
+          break;
+        case Vconst::ThreadLocal:
+          loads.emplace_back(
+            load{Vptr{baseless(ivl->val.disp), Vptr::FS}, dst}
+          );
+          break;
       }
     } else {
       assertx(ivl->spilled());
@@ -1967,10 +2143,10 @@ LiveRange Vxls::findBlockRange(unsigned pos) {
 enum Mode { Light, Heavy };
 template<class Pred>
 const char* draw(Interval* parent, unsigned pos, Mode m, Pred covers) {
-                               // Light     Heavy
-  static const char* top[]    = { "\u2575", "\u2579" };
-  static const char* bottom[] = { "\u2577", "\u257B" };
-  static const char* both[]   = { "\u2502", "\u2503" };
+                                  // Light     Heavy
+  static const char* top[]    = { u8"\u2575", u8"\u2579" };
+  static const char* bottom[] = { u8"\u2577", u8"\u257B" };
+  static const char* both[]   = { u8"\u2502", u8"\u2503" };
   static const char* empty[]  = { " ", " " };
   auto f = [&](unsigned pos) {
     for (auto ivl = parent; ivl; ivl = ivl->next) {
@@ -2010,13 +2186,17 @@ std::string Interval::toString() {
   delim = "";
   for (auto& u : uses) {
     if (u.pos == def_pos) {
-      out << delim << "@" << u.pos << "=";
-      if (u.hint.isValid()) out << show(u.hint);
-    } else {
       if (u.hint.isValid()) {
-        out << delim << show(u.hint) << "=@" << u.pos;
+        out << delim << "@" << u.pos << "=" << show(u.hint);
       } else {
-        out << delim << "=@" << u.pos;
+        out << delim << "@" << u.pos << "=";
+      }
+    } else {
+      auto hint_delim = u.kind == Constraint::CopySrc ? "=?" : "=@";
+      if (u.hint.isValid()) {
+        out << delim << show(u.hint) << hint_delim << u.pos;
+      } else {
+        out << delim << hint_delim << u.pos;
       }
     }
     delim = ",";

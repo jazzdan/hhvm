@@ -231,8 +231,20 @@ and hint_ p env = function
       env, Ttuple tyl
   | Hshape fdm ->
       let env, fdm = ShapeMap.map_env hint env fdm in
-      env, Tshape fdm
+      (* Fields are only partially known, because this shape type comes from
+       * type hint - shapes that contain listed fields can be passed here, but
+       * due to structural subtyping they can also contain other fields, that we
+       * don't know about. *)
+      env, Tshape (FieldsPartiallyKnown ShapeMap.empty, fdm)
 
 let hint_locl ?(ensure_instantiable=false) env h =
   let env, h = hint ~ensure_instantiable env h in
   Typing_phase.localize_with_self env h
+
+(*****************************************************************************)
+
+let open_class_hint = function
+  | r, Tapply (name, tparaml) -> r, name, tparaml
+  | _, (Tany | Tmixed | Tarray (_, _) | Tgeneric (_,_) | Toption _ | Tprim _
+  | Tfun _ | Ttuple _ | Tshape _ | Taccess (_, _) | Tthis) ->
+      assert false

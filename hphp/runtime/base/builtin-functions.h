@@ -75,6 +75,15 @@ inline bool is_empty_string(const Variant& v) {
 ///////////////////////////////////////////////////////////////////////////////
 // misc functions
 
+/*
+ * Semantics of is_callable defined here:
+ * http://docs.hhvm.com/manual/en/function.is-callable.php
+ */
+bool is_callable(const Variant& v, bool syntax_only, RefData* name);
+/*
+ * Equivalent to is_callable(v, false, nullptr)
+ */
+bool is_callable(const Variant& v);
 bool array_is_valid_callback(const Array& arr);
 
 const HPHP::Func*
@@ -105,6 +114,7 @@ Variant invoke_static_method(const String& s, const String& method,
 Variant o_invoke_failed(const char *cls, const char *meth,
                         bool fatal = true);
 
+bool is_constructor_name(const char* func);
 void throw_instance_method_fatal(const char *name);
 
 void throw_iterator_not_valid() ATTRIBUTE_NORETURN;
@@ -156,8 +166,8 @@ void handle_destructor_exception(const char* situation = "Destructor");
  * Don't use in new code.
  */
 void throw_bad_type_exception(const char *fmt, ...) ATTRIBUTE_PRINTF(1,2);
-void throw_expected_array_exception();
-void throw_expected_array_or_collection_exception();
+void throw_expected_array_exception(const char* fn = nullptr);
+void throw_expected_array_or_collection_exception(const char* fn = nullptr);
 void throw_invalid_argument(const char *fmt, ...) ATTRIBUTE_PRINTF(1,2)
    __attribute__((__cold__));
 

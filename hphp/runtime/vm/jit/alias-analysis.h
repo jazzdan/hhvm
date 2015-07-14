@@ -85,13 +85,21 @@ struct AliasAnalysis {
 
   /*
    * Several larger sets of locations, we have a set of all the ids assigned to
-   * properties, elemIs, and frame locals.  This is used by may_alias below.
+   * properties, elemIs, frame locals, etc.  This is used by may_alias below.
    */
   ALocBits all_props;
   ALocBits all_elemIs;
   ALocBits all_frame;
   ALocBits all_stack;
   ALocBits all_mistate;
+  ALocBits all_ref;
+  ALocBits all_iterPos;
+  ALocBits all_iterBase;
+
+  /*
+   * Return the number of distinct locations we're tracking by id
+   */
+  size_t count() const { return locations_inv.size(); }
 
   /*
    * Return a set of locations that we've assigned ids to that may alias a
